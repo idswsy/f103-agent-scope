@@ -1,0 +1,209 @@
+# 05 · 路线图与分工
+
+**原则：先让「无硬件也能开发」跑起来，再让硬件闭环，最后才做 AI。**
+
+每个阶段都有**可验收的产出**，不写"完成 XX 模块"这种没法验收的话。
+
+---
+
+## P0 · 协议闭环（无硬件）
+
+> **目标：不碰硬件，先把两端协议跑通。**
+
+| 交付物 | 位置 | 验收标准 |
+|---|---|---|
+| 协议规格 | `docs/03-protocol.md` | 命令表齐全，字段布局无歧义 |
+| C 端编解码 | `proto/protocol.{h,c}` | 纯 C，不依赖 HAL，`gcc` 可编译 |
+| Rust 端编解码 | `host/crates/proto/` | `cargo test -p scope-proto` 全绿 |
+| 黄金向量 | `proto/tests/vectors.json` | **C 与 Rust 两端产出逐字节相同的 `frame_hex`** |
+| CI | `.github/workflows/ci.yml` | 两端向量测试 + `cargo fmt`/`clippy` 门禁 |
+
+**验收命令**：
+
+```bash
+make -C proto test          # C 端向量测试
+cd host && cargo test       # Rust 端全部测试
+```
+
+**这一阶段的隐藏收益**：把「帧格式 / CRC / 粘包拆包 / 状态机」这些最容易埋雷的地方，在没有硬件干扰的情况下测透。
+
+---
+
+## P1 · 最简硬件闭环
+
+> **目标：F103 采到 2048 点 → 串口 → CLI 落 CSV → 能画出来。**
+
+| 交付物 | 位置 | 验收标准 |
+|---|---|---|
+| 时钟树 + ADC/DMA 采集 | `firmware/Hardware/adc_dma.c` | TIM3_TRGO → ADC1 → DMA1Ch1，857.143 kSPS 实测（用 `actual_hz` 校验） |
+| 串口链路 + 帧解析 | `firmware/App/proto_task.c` | `PING` / `ECHO` / `GET_INFO` 在真机上通过 |
+| 主机传输层 | `host/crates/transport-serial/` | 能枚举串口、连接、超时重试 |
+| CLI | `host/crates/cli/` | `scope-cli capture -o wave.csv` 能出图 |
+| 标定表 | `host/crates/core/src/calib.rs` | 用已知直流电压反推 LSB/V，写进配置文件 |
+
+**验收**：接一个 1 kHz 方波信号发生器，CLI 抓回来的波形用 Python 画出来，周期测量误差 < 2%。
+
+**注意**：这一阶段**先不要碰屏幕 UI**。屏幕是干扰项，先用串口把数据链路打通。
+
+---
+
+## P2 · 数字通路 I2C 解码 ★ 项目核心价值
+
+> **目标：真总线上抓 I2C，解码结果与逻辑分析仪逐帧一致。**
+
+| 交付物 | 位置 | 验收标准 |
+|---|---|---|
+| TIM 输入捕获 | `firmware/Hardware/tim_capture.c` | 13.9 ns 边沿时间戳，捕获缓冲区 |
+| I2C 解码器（C） | `firmware/App/i2c_decode.c` | START/重复START/地址/ACK/NACK/数据/STOP |
+| I2C 解码器（Rust） | `host/crates/core/src/i2c_decode.rs` | 与 C 端同一批测试向量（`i2c_vectors.json`）结果一致 |
+| 泳道渲染 | `host/crates/cli` 或 GUI | 复刻学长 exe 的规范：SCL/SDA 泳道、阈值、去抖、「共 N 帧」 |
+| 双通路时间对齐 | | ADC 波形与数字边沿在同一时间轴对齐（误差 < 1 µs） |
+
+**验收**：
+1. 抓一次 100 kHz / 400 kHz / 1 MHz 的 I2C 写操作，解码出的地址+数据与逻辑分析仪**完全一致**
+2. 制造一次 NACK，两边都能定位到同一个比特
+3. 抓一次时钟拉伸，数字通路正确识别
+
+**风险**：板子上只有一路 LM393。见 [`02-hardware.md`](02-hardware.md#待决策单通道-vs-双通道) 的待决策 —— 若走「纯数字双通路」需要加一颗比较器。
+
+---
+
+## P3 · MCP + Agent ★ 项目的"AI"部分
+
+> **目标：Agent 一句话完成一次真实的总线调试。**
+
+| 交付物 | 位置 | 验收标准 |
+|---|---|---|
+| 模拟器 | `host/crates/sim/` | 含 F103 真实档位表、触发语义、故障注入 |
+| MCP Server | `host/crates/mcp/` | 工具 schema 由 Rust 类型自动生成 |
+| 12 个粗粒度工具 | `docs/03-protocol.md` §MCP | 见下表 |
+| Agent 工作流 | `docs/` | 一段可复现的对话实录 |
+
+### MCP 工具清单（粗粒度，**14 个** Agent 意图）
+
+> 这份清单必须与 `host/crates/mcp/src/main.rs` 的 `TOOLS` 常量**逐字一致** ——
+> 那边是唯一真相源，本表是给人看的镜像。改一处必须改两处。
+
+| 工具 | 作用 | 对应协议命令 |
+|---|---|---|
+| `scope_list_devices()` | 枚举串口并短超时探测 | `GET_INFO` |
+| `scope_connect(port?, transport='sim')` | 连接 + 建上下文 | `GET_INFO` + `GET_CONFIG` |
+| `scope_disconnect()` | 停流并断开 | `STOP` |
+| `scope_status()` | 「现在什么情况」 | `GET_STATUS` |
+| `scope_configure(...)` | **一个工具替代 N 个 `set_*`**，返回 `applied` + `warnings` | `SET_*` |
+| `scope_capture(mode?, timeout_ms?)` | 阻塞到触发完成，默认回**统计量 + ≤256 点 minmax 预览** | `ARM` + `EVENT_TRIGGER` + `READ_BUFFER` |
+| `scope_read_waveform(capture_id, ...)` | 唯一按需拉分片入口，硬顶 4096 点，超出拒绝 | `READ_BUFFER` |
+| `scope_measure(capture_id, metrics)` | 纯数字 + 单位，无波形 | `MEASURE` 或主机侧算 |
+| `scope_i2c_decode(capture_id, ...)` | **解码 I2C 帧序列 + 信号质量评估**（本项目的招牌能力） | 主机侧解码 |
+| `scope_list_captures()` | 历史采集注册表（保留最近 16 次） | 无（本地） |
+| `scope_save_capture(capture_id, path)` | **全量数据只进磁盘，不进 LLM token** | 无（本地） |
+| `scope_watch(duration_ms?)` | start→收集→stop 一体化，返回滚动摘要 | 流模式分片 + `STOP` |
+| `scope_sim_set_scenario(...)` | 切换场景 / 注入故障。仅 `transport='sim'` 时注册 | 无（模拟器内部） |
+| `scope_debug_raw(...)` | 逃生门。仅 `SCOPE_MCP_DEBUG=1` 时注册 | 任意（含 `MEM_READ`） |
+
+**未列入但已规划**：`scope_autoset()`（主机侧复合算法，自动找时基/量程/触发）—— 属 **P4**，
+因为它依赖 `scope_configure` + `scope_capture` + `scope_measure` 三件套都稳定下来才有意义。
+
+### 三层 token 防护（硬性）
+
+1. `capture` / `watch` 默认只回**统计量 + ≤256 点 minmax 预览**
+2. `read_waveform` 分页、默认 512 点、硬顶 4096 点、超出拒绝并提示 `save_capture`
+3. **全量数据只进 capture store 和磁盘，不进上下文**
+
+**验收对话实录**（这就是 P3 的验收标准）：
+
+> **用户**：抓一下 I2C 总线上这次温湿度传感器的读操作，告诉我它有没有被正确应答。
+>
+> **Agent**：
+> 1. `scope_configure(trigger={mode:normal, edge:falling, level_v:1.65})`
+> 2. `scope_capture()` → 拿到 `capture_id`、触发位置、统计量
+> 3. `scope_measure(capture_id, ['freq','duty'])` → SCL ≈ 100 kHz
+> 4. `scope_i2c_decode(capture_id, scl_channel=0, sda_channel=1, vih_lsb=2866, vil_lsb=1228)`
+> 5. 回答：**「共 3 帧：写 0x44 地址 → ACK；写 0x00 寄存器 → ACK；读 0x44 → ACK，返回 2 字节 0x1A 0x2B。SCL 上升时间约 480 ns，在 4.7 kΩ 上拉下偏慢，建议换 2.2 kΩ。第 2 字节的 SDA 低电平只有 0.42 V，裕量偏小。」**
+
+---
+
+## P4 · 增强
+
+| 项 | 说明 | 优先级 |
+|---|---|---|
+| **双通道改板** | 加第二路模拟前端（见待决策） | 高（决定产品形态） |
+| 控制台/上位机 GUI | egui 0.29 + egui_plot（学长已验证可行的栈） | 高 |
+| 自动量程 | 需把 SW2/SW3 换成继电器/模拟开关 | 中（要改板） |
+| 等效时间采样 | 数字通路触发 + 帧平均，用于看边沿形状 | 中（**必须标注失效场景**） |
+| 其他协议解码 | UART / SPI 解码器 | 中 |
+| 屏幕 UI | 板载 1.8 寸 TFT 显示波形 + 状态 | 低（调试够用即可） |
+
+---
+
+## 团队分工（3 人）
+
+### 🧑💻 A — 固件
+
+| 负责 | 文件 |
+|---|---|
+| 时钟树 / ADC / DMA / 触发 | `firmware/Hardware/adc_dma.c`、`App/trigger.c` |
+| 协议解析与命令分发 | `firmware/App/proto_task.c`、`proto/protocol.c` |
+| 数字通路 I2C 解码 | `firmware/Hardware/tim_capture.c`、`App/i2c_decode.c` |
+| 屏幕 / 编码器 / 按键 | `firmware/Hardware/tft_st7735.c`、`App/ui.c` |
+
+**入口文档**：`04-performance.md` §1（采样率）、`03-protocol.md` §6（缓冲组织）
+
+---
+
+### 🧑💻 B — 上位机
+
+| 负责 | 文件 |
+|---|---|
+| 协议编解码（Rust 侧） | `host/crates/proto/` |
+| 命令层 / CommandBus / 状态缓存 | `host/crates/core/` |
+| 传输层 | `host/crates/transport-serial/` |
+| 模拟器 | `host/crates/sim/` |
+| CLI / 测量算法 / 标定 | `host/crates/cli/` |
+| I2C 解码器（Rust 侧） | `host/crates/core/src/i2c_decode.rs` |
+
+**入口文档**：`03-protocol.md` 全文（这是契约）、`01-architecture.md` §解耦点
+
+---
+
+### 🧑💻 C — Agent + 硬件
+
+| 负责 | 文件 |
+|---|---|
+| MCP Server + 工具设计 | `host/crates/mcp/` |
+| Agent 工作流与提示词 | `docs/` |
+| 改板设计（双通道前端） | `hardware/mods/` |
+| BOM / 采购 / 焊接 / 实测 | `hardware/` |
+| 性能实测与文档校正 | 回写 `04-performance.md` |
+
+**入口文档**：`04-performance.md` 全文、`02-hardware.md` 全文
+
+---
+
+## 协作纪律（三条硬规矩）
+
+1. **改协议 = 改四处 + 一次提交**
+   `docs/03-protocol.md` + `proto/protocol.h` + `host/crates/proto/src/lib.rs` + `proto/tests/vectors.json`
+   两端向量测试全绿才允许合并。
+
+2. **`App/` 层不许 `#include` HAL**
+   这是"无硬件也能开发"的根基。破坏了它，三个人就都得等板子。
+
+3. **文档里的每一个数字都要有出处**
+   要么来自数据手册（标注页码/表号），要么来自实测（标注日期与测试条件），要么标 `【推断】`。
+   **不许写没有依据的性能数字。**
+
+---
+
+## 里程碑节奏建议
+
+| 周 | 目标 |
+|---|---|
+| W1–W2 | P0 完成：两端向量测试全绿，模拟器能跑 capture |
+| W3–W4 | 硬件到货 + P1：真人拿到 1 kHz 方波波形 |
+| W5–W6 | P2：I2C 解码与逻辑分析仪对齐（**项目最关键的两周**） |
+| W7–W8 | P3：Agent 完成端到端调试对话 |
+| W9+ | P4：改板 / GUI / 参赛材料 |
+
+> **W5–W6 是项目成败点**。数字通路的 I2C 解码如果做不出来，这个项目就退化成一个普通的入门示波器 —— 而那个立创原工程已经有了。
+> 建议 3 人在 W5 集中攻坚解码器，不要分散。

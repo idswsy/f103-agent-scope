@@ -1,0 +1,84 @@
+# ── Rust / host ────────────────────────────────────────────────
+/host/target/
+**/*.rs.bk
+*.pdb
+
+# ── C / 固件构建产物 ────────────────────────────────────────────
+*.o
+*.obj
+*.d
+*.elf
+*.bin
+*.hex
+*.axf
+*.map
+*.lst
+*.crf
+*.dep
+*.htm
+*.build_log.htm
+*.uvguix.*
+*.uvoptx.bak
+JLinkLog.txt
+JLinkSettings.ini
+MDK-ARM/*/
+DebugConfig/
+RTE/
+Objects/
+Listings/
+
+# 注意：*.uvprojx / *.uvoptx / *.ioc 是工程定义文件，必须提交
+!*.uvprojx
+!*.uvoptx
+!*.ioc
+
+# ── 纯 C 协议测试 ──────────────────────────────────────────────
+# 注意：不要在这里写 `!host/target/` —— 那会取消上面的忽略规则，
+# 让 target/ 下无扩展名的构建产物（scope-cli、scope-mcp 等）被提交进仓库。
+proto/build/
+*.exe
+*.dll
+*.so
+*.dylib
+*.rlib
+
+# ── 编辑器 / 系统 ──────────────────────────────────────────────
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*~
+Thumbs.db
+Desktop.ini
+.history/
+
+# ── Python 工具 ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ── 仿真 / 抓包 ────────────────────────────────────────────────
+*.vcd
+*.sal
+*.pdsprj
+
+# ── 采集数据（体积大，不入库） ─────────────────────────────────
+/captures/
+*.csv
+*.npy
+*.npz
+!proto/tests/**/*.csv
+!**/testdata/**/*.csv
+
+# ── 上游原始资料（体积大，用脚本重新拉取，见 hardware/README.md）──
+hardware/upstream/downloads/
+
+# ── 密钥 / 本地配置 ────────────────────────────────────────────
+.env
+*.local.toml
+
+# ── 学长提供的参考二进制（第三方作品，不入库） ──────────────────
+reference/

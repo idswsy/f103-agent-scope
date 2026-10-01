@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/proto",
+    "crates/core",
+    "crates/transport-serial",
+    "crates/sim",
+    "crates/cli",
+    "crates/mcp",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.75"
+license      = "GPL-3.0"
+repository   = "https://github.com/OWNER/i2c-scope-f103"
+authors      = ["F103 Agent Scope Team"]
+
+[workspace.dependencies]
+scope-proto            = { path = "crates/proto" }
+scope-core             = { path = "crates/core" }
+scope-transport-serial = { path = "crates/transport-serial" }
+scope-sim              = { path = "crates/sim" }
+
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+thiserror   = "2"
+anyhow      = "1"
+
+[profile.release]
+lto       = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
+
+# 模拟器波形合成本身是热路径，跑 test 时也要够快
+[profile.dev.package."*"]
+opt-level = 2

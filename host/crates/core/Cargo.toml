@@ -1,0 +1,17 @@
+[package]
+name        = "scope-core"
+description = "命令层：DevicePort 抽象、CommandBus、采集存储、错误模型"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+scope-proto = { workspace = true }
+thiserror   = { workspace = true }
+serde       = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

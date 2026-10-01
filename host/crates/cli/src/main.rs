@@ -1,0 +1,468 @@
+//! # scope-cli —— 命令行上位机
+//!
+//! P1 阶段的验收工具：能接硬件抓波形落 CSV，也能对着模拟器开发。
+//!
+//! ```text
+//! # 没有硬件也能跑
+//! scope-cli sim info
+//! scope-cli sim capture --scenario sine_1k_3v3 -o wave.csv
+//!
+//! # 有硬件
+//! scope-cli serial ports
+//! scope-cli serial --port COM3 capture -n 2048 -o wave.csv
+//! ```
+
+#![deny(clippy::all)]
+
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand, ValueEnum};
+use scope_core::{Capture, CaptureStore, ChannelScale, CommandBus, DevicePort, State};
+use scope_sim::{Scenario, SimDevice};
+use scope_transport_serial::{baud, SerialDevice};
+use std::io::Write;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "scope-cli",
+    version,
+    about = "F103 Agent Scope 命令行上位机",
+    long_about = "可被 AI Agent 控制的数字示波器 / I2C 总线分析仪的调试工具。\n\
+                  不带硬件时用 `sim` 子命令，全部功能都可用。"
+)]
+struct Cli {
+    #[command(subcommand)]
+    target: Target,
+}
+
+#[derive(Subcommand, Debug)]
+enum Target {
+    /// 对着内置模拟器运行（**不需要硬件**）
+    Sim {
+        #[command(subcommand)]
+        action: Action,
+    },
+
+    /// 通过串口连接真实设备
+    Serial {
+        /// 端口名（如 COM3）
+        #[arg(long, default_value = "COM3")]
+        port: String,
+
+        /// 波特率
+        #[arg(long, default_value_t = baud::B_921600)]
+        baud: u32,
+
+        #[command(subcommand)]
+        action: Action,
+    },
+
+    /// 列出系统中可用的串口
+    Ports,
+}
+
+#[derive(Subcommand, Debug)]
+enum Action {
+    /// 读取设备信息与能力
+    Info,
+
+    /// 读取当前状态
+    Status,
+
+    /// 采集一次并落盘 / 打印摘要
+    Capture {
+        /// 波形场景（**仅模拟器有效**；接真机时忽略）
+        #[arg(long, value_enum, default_value_t = ScenarioArg::Sine1k3v3)]
+        scenario: ScenarioArg,
+
+        /// 采样点数（F103 上限 4096）
+        #[arg(short = 'n', long, default_value_t = 1024)]
+        samples: u16,
+
+        /// 采样率（Hz）。设备会量化到最近档位并回显实际值。
+        #[arg(long, default_value_t = 857_142)]
+        rate: u32,
+
+        /// 触发电平（ADC LSB，12-bit 范围 0..4095）
+        #[arg(long, default_value_t = 2048)]
+        level: u16,
+
+        /// 超时（毫秒）
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u64,
+
+        /// 输出 CSV 路径（省略则只打印摘要，不落盘）
+        #[arg(short = 'o', long)]
+        out: Option<String>,
+    },
+
+    /// 链路自检：PING 往返 + 吞吐
+    Ping,
+
+    /// 测量统计（对当前采集）
+    Measure,
+}
+
+impl Action {
+    /// 取出本动作隐含的场景（只有 `capture` 有）；其他动作返回默认场景。
+    ///
+    /// 模拟器需要在跑动作之前就把设备建出来，所以得先问动作要场景。
+    fn scenario_or_default(&self) -> ScenarioArg {
+        match self {
+            Action::Capture { scenario, .. } => *scenario,
+            _ => ScenarioArg::Sine1k3v3,
+        }
+    }
+}
+
+/// 场景名与 `Scenario::name()` 逐字一致 —— 文档、CLI、MCP 三处用同一套字符串，
+/// 免得用户照着文档敲却在 CLI 上报「invalid value」。
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum ScenarioArg {
+    #[value(name = "sine_1k_3v3")]
+    Sine1k3v3,
+    #[value(name = "square_50k")]
+    Square50k,
+    #[value(name = "pulse_glitch")]
+    PulseGlitch,
+    #[value(name = "noise")]
+    Noise,
+    #[value(name = "dc")]
+    Dc,
+    #[value(name = "am")]
+    Am,
+    #[value(name = "i2c_100k")]
+    I2c100k,
+    #[value(name = "i2c_400k")]
+    I2c400k,
+}
+
+impl From<ScenarioArg> for Scenario {
+    fn from(a: ScenarioArg) -> Scenario {
+        match a {
+            ScenarioArg::Sine1k3v3 => Scenario::Sine1k3v3,
+            ScenarioArg::Square50k => Scenario::Square50k,
+            ScenarioArg::PulseGlitch => Scenario::PulseGlitch,
+            ScenarioArg::Noise => Scenario::Noise,
+            ScenarioArg::Dc => Scenario::Dc,
+            ScenarioArg::Am => Scenario::Am,
+            ScenarioArg::I2c100k => Scenario::I2c100k,
+            ScenarioArg::I2c400k => Scenario::I2c400k,
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.target {
+        Target::Ports => {
+            let ports = scope_transport_serial::list_ports();
+            if ports.is_empty() {
+                println!("没有找到任何串口。");
+                println!("提示：插上板子后重试；或对着模拟器开发（不需要硬件）：");
+                println!("      scope-cli sim capture --scenario sine_1k_3v3 -n 1024 -o wave.csv");
+                return Ok(());
+            }
+            println!("{:<10} {:<40} 疑似目标", "端口", "描述");
+            println!("{}", "-".repeat(70));
+            for (name, desc, likely) in ports {
+                let mark = if likely { "是" } else { "" };
+                println!("{name:<10} {desc:<40} {mark}");
+            }
+            Ok(())
+        }
+
+        Target::Sim { action } => {
+            let mut dev = SimDevice::new(action.scenario_or_default().into());
+            println!("# 模拟器: {}", dev.describe());
+            run(&mut dev, action)
+        }
+
+        Target::Serial { port, baud, action } => {
+            let mut dev = SerialDevice::open(&port, baud, 5)?;
+            println!("# 链路: {}", dev.describe());
+            run(&mut dev, action)
+        }
+    }
+}
+
+fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
+    let mut bus = CommandBus::new(RefPort(port));
+
+    match action {
+        Action::Info => {
+            let info = bus.connect().context("连接失败（GET_INFO 无响应）")?;
+            println!("协议版本   : 0x{:02X}", info.proto_ver);
+            println!(
+                "固件版本   : {}.{}.{}",
+                (info.fw_ver >> 16) & 0xFF,
+                (info.fw_ver >> 8) & 0xFF,
+                info.fw_ver & 0xFF
+            );
+            println!("型号       : 0x{:04X}", info.model);
+            println!("UID        : {}", hex(&info.uid));
+            println!("ADC        : {} bit", info.adc_bits);
+            println!("通道数     : {}", info.ch_count);
+            println!(
+                "采样率范围 : {} .. {} Hz",
+                info.rate_min_hz, info.rate_max_hz
+            );
+            println!("单次上限   : {} 点", info.capture_max_samples);
+            println!(
+                "payload    : 上行 {} B / 下行 {} B",
+                info.max_rx_payload, info.max_tx_payload
+            );
+            println!("建议分片   : {} 点", info.preferred_chunk_samples);
+            println!("能力位     : 0x{:08X}", info.caps);
+
+            if info.rate_max_hz > scope_core::f103::MAX_INTERLEAVED_HZ {
+                println!();
+                println!("⚠ 设备上报的采样率上限超过 F103 的物理极限，可能是固件 bug。");
+            }
+            Ok(())
+        }
+
+        Action::Status => {
+            bus.connect()?;
+            let s = bus.get_status()?;
+            println!("状态: {} ({})", state_name(s), s as u8);
+            if let Some(cfg) = &bus.config {
+                println!("采样率: {} Hz", cfg.rate_hz);
+                println!(
+                    "采集模式: {} | 样点: {} | 格式: {} | 抽点: {}",
+                    cfg.acq_mode, cfg.capture_samples, cfg.format, cfg.decimation
+                );
+                println!(
+                    "触发: mode={} src={} edge={} level={} LSB",
+                    cfg.trigger_mode, cfg.trigger_source, cfg.trigger_edge, cfg.trigger_level_lsb
+                );
+            }
+            Ok(())
+        }
+
+        Action::Ping => {
+            bus.connect()?;
+            println!("PING 往返测试（10 次）");
+            let mut total = std::time::Duration::ZERO;
+            let mut ok = 0;
+            for i in 0..10u8 {
+                let payload = [i, i.wrapping_mul(7), i.wrapping_add(3)];
+                let (echoed, rtt) = bus.ping(&payload)?;
+                if echoed == payload {
+                    ok += 1;
+                    total += rtt;
+                    println!(
+                        "  #{} {:>8.2} ms  echo ✓",
+                        i + 1,
+                        rtt.as_secs_f64() * 1000.0
+                    );
+                } else {
+                    println!("  #{} 回显不符: {:?}", i + 1, echoed);
+                }
+            }
+            if ok > 0 {
+                println!(
+                    "平均往返: {:.2} ms",
+                    total.as_secs_f64() * 1000.0 / ok as f64
+                );
+            }
+            Ok(())
+        }
+
+        Action::Capture {
+            // 场景在 main() 里已经用来构造模拟器了，这里用不上
+            scenario: _,
+            samples,
+            rate,
+            level,
+            timeout_ms,
+            out,
+        } => {
+            let info = bus.connect()?;
+
+            let actual = bus.set_sample_rate(rate)?;
+            if actual != rate {
+                println!(
+                    "# 采样率被量化: {} Hz → {} Hz（时间轴以 {} Hz 为准）",
+                    rate, actual, actual
+                );
+            }
+
+            bus.set_trigger(1, 0, 0, level, (samples / 2).min(2048), 1000)?; // normal / ch0 / 上升沿
+            bus.set_acq(0, samples, 0, 1)?; // 单次 / RAW16 / 不抽点
+            bus.arm()?;
+
+            let ev = bus
+                .wait_trigger(std::time::Duration::from_millis(timeout_ms))
+                .context("等待触发事件失败")?;
+
+            let ev = match ev {
+                Some(e) => e,
+                None => {
+                    // 没触发不是崩溃 —— 给一条能自救的提示
+                    let _ = bus.stop();
+                    bail!(
+                        "{} ms 内没有触发。\n\
+                         可以试试：\n  \
+                         • 降低触发电平（当前 {} LSB）\n  \
+                         · 改用 auto 模式\n  \
+                         · 确认信号真的接在通道 0 上",
+                        timeout_ms,
+                        level
+                    );
+                }
+            };
+
+            let capture_id = u16::from_le_bytes([ev[0], ev[1]]);
+            let trigger_index = u32::from_le_bytes([ev[2], ev[3], ev[4], ev[5]]);
+            let trigger_tick = u32::from_le_bytes([ev[6], ev[7], ev[8], ev[9]]);
+            let rate_hz = u32::from_le_bytes([ev[10], ev[11], ev[12], ev[13]]);
+            let n_samples = u32::from_le_bytes([ev[14], ev[15], ev[16], ev[17]]);
+
+            println!(
+                "# 触发: capture_id={} index={} tick={} µs",
+                capture_id, trigger_index, trigger_tick
+            );
+
+            // 分片拉取
+            let ch_count = info.ch_count.max(1) as usize;
+            let mut capture = Capture::new(capture_id, rate_hz, ch_count, n_samples);
+            capture.trigger_index = Some(trigger_index);
+            capture.device_tick_us = trigger_tick;
+
+            // 一个分片最多装多少样点：payload 上限减掉 12 B 分片头，再按 u16 折半。
+            // 不能直接用 preferred_chunk_samples —— 固件报的值若大于物理上限，
+            // 设备端会回 BAD_PARAM。
+            let max_chunk_samples =
+                ((scope_proto::MAX_PAYLOAD_TX - scope_proto::CHUNK_HEADER_LEN) / 2) as u16;
+            let chunk = info
+                .preferred_chunk_samples
+                .min(max_chunk_samples)
+                .min(samples)
+                .max(1);
+            for ch in 0..ch_count {
+                let mut offset: u32 = 0;
+                while (offset as usize) < n_samples as usize {
+                    let want = chunk.min((n_samples - offset) as u16);
+                    let payload = bus.read_buffer(capture_id, offset, want, 0, ch as u8)?;
+
+                    let hdr =
+                        scope_proto::ChunkHeader::decode(&payload).context("分片头解析失败")?;
+                    if !hdr.is_valid() {
+                        capture.overrun = true;
+                    }
+
+                    for pair in payload[scope_proto::CHUNK_HEADER_LEN..].chunks_exact(2) {
+                        capture.channels[ch].push(u16::from_le_bytes([pair[0], pair[1]]));
+                    }
+
+                    offset += hdr.count as u32;
+
+                    if hdr.is_last() {
+                        break;
+                    }
+                    if hdr.count == 0 {
+                        break; // 防死循环
+                    }
+                }
+            }
+
+            // 摘要（这是 Agent 默认能看到的东西）
+            println!();
+            println!(
+                "采集摘要  capture_id={}  {} 点  {:.3} ms",
+                capture_id,
+                capture.len(),
+                capture.duration_us() as f64 / 1000.0
+            );
+            for ch in 0..ch_count {
+                if let Some(s) = capture.summary(ch) {
+                    // rms = 相对 ADC 零点的真 RMS；ac_rms = 扣除直流后的波动（标准差）
+                    println!(
+                        "  CH{}: min={} max={} pp={} mean={:.1} rms={:.1} ac_rms={:.1}  上升沿={} 下降沿={}",
+                        ch + 1,
+                        s.min_lsb,
+                        s.max_lsb,
+                        s.pp_lsb,
+                        s.mean_lsb,
+                        s.rms_lsb,
+                        s.ac_rms_lsb,
+                        s.rising_edges,
+                        s.falling_edges
+                    );
+                }
+            }
+
+            if let Some(path) = out {
+                let scales: Vec<ChannelScale> =
+                    (0..ch_count).map(|_| ChannelScale::default()).collect();
+                let csv = capture.to_csv(&scales);
+                let mut f =
+                    std::fs::File::create(&path).with_context(|| format!("无法创建 {path}"))?;
+                f.write_all(csv.as_bytes())?;
+                println!();
+                println!(
+                    "已写出 {} ({} 字节, {} 行)",
+                    path,
+                    csv.len(),
+                    capture.len() + 1
+                );
+                println!("提示：CSV 全量落盘，不进 LLM 上下文 —— 这是三层 token 防护的第三层。");
+            } else {
+                println!();
+                println!("提示：加 -o wave.csv 可导出全量数据供绘图或喂给解码器。");
+            }
+
+            let _ = bus.stop();
+            let mut store = CaptureStore::default();
+            store.push(capture);
+            Ok(())
+        }
+
+        Action::Measure => {
+            bus.connect()?;
+            println!("测量需要先有一次采集，见 `capture` 子命令。");
+            println!("（P2 会在这里接上主机侧的定点测量：freq / vpp / duty / rise_time）");
+            Ok(())
+        }
+    }
+}
+
+fn state_name(s: State) -> &'static str {
+    match s {
+        State::Idle => "空闲",
+        State::Armed => "已武装",
+        State::Streaming => "流推送中",
+        State::Done => "采集完成",
+        State::Fault => "故障",
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter()
+        .map(|x| format!("{x:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// 让 `run` 能接受 `&mut P` 而不是夺取所有权 ——
+/// 调用者（`main`）需要在 `run` 返回后继续持有设备。
+struct RefPort<'a, P: DevicePort>(&'a mut P);
+
+impl<P: DevicePort> DevicePort for RefPort<'_, P> {
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), scope_core::LinkError> {
+        self.0.write_all(bytes)
+    }
+    fn read_some(&mut self) -> Result<Vec<u8>, scope_core::LinkError> {
+        self.0.read_some()
+    }
+    fn describe(&self) -> String {
+        self.0.describe()
+    }
+    fn is_simulated(&self) -> bool {
+        self.0.is_simulated()
+    }
+    fn byte_rate(&self) -> u32 {
+        self.0.byte_rate()
+    }
+}

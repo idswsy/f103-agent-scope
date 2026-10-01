@@ -1,0 +1,15 @@
+[package]
+name        = "scope-proto"
+description = "F103 Agent Scope 线协议 —— Rust 端实现，与 proto/protocol.{h,c} 逐字节等价"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

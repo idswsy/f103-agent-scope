@@ -1,0 +1,21 @@
+[package]
+name        = "scope-cli"
+description = "命令行上位机：调试、抓波形、跑模拟器"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[[bin]]
+name = "scope-cli"
+path = "src/main.rs"
+
+[dependencies]
+scope-proto            = { workspace = true }
+scope-core             = { workspace = true }
+scope-sim              = { workspace = true }
+scope-transport-serial = { workspace = true }
+clap        = { version = "4", features = ["derive"] }
+anyhow      = { workspace = true }

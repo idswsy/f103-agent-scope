@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # ══════════════════════════════════════════════════════════════
+  # C 端协议测试 —— 保证固件侧的编解码与黄金向量一致
+  # ══════════════════════════════════════════════════════════════
+  proto-c:
+    name: C 协议向量测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 重新生成黄金向量并比对
+        run: |
+          python3 proto/tests/gen_vectors.py > /tmp/vectors_regen.json
+          if ! diff -q /tmp/vectors_regen.json proto/tests/vectors.json >/dev/null; then
+            echo "::error::vectors.json 与 gen_vectors.py 不同步！"
+            echo "本地跑：./proto/run_tests.sh --regen  然后提交"
+            diff /tmp/vectors_regen.json proto/tests/vectors.json | head -40
+            exit 1
+          fi
+          echo "✓ 黄金向量与生成脚本一致"
+
+      - name: 编译并运行 C 端测试
+        run: make -C proto test
+
+      # 协议真相源的四处同步检查 —— 这是本项目的核心纪律
+      - name: 检查协议四处同步
+        run: |
+          echo "协议契约的四个位置："
+          echo "  1. docs/03-protocol.md"
+          echo "  2. proto/protocol.h"
+          echo "  3. host/crates/proto/src/lib.rs"
+          echo "  4. proto/tests/vectors.json"
+
+          # 版本号必须一致
+          md_ver=$(grep -oP 'VER_MAJOR:?\s*[:=]?\s*\K\d+' proto/protocol.h | head -1)
+          rs_ver=$(grep -oP 'VER_MAJOR: u8 = \K\d+' host/crates/proto/src/lib.rs | head -1)
+          json_ver=$(python3 -c "import json;print(json.load(open('proto/tests/vectors.json'))['proto_ver'] >> 4)")
+
+          echo "proto.h=$md_ver lib.rs=$rs_ver vectors.json=$json_ver"
+          if [ "$md_ver" != "$rs_ver" ] || [ "$md_ver" != "$json_ver" ]; then
+            echo "::error::协议主版本号三处不一致"
+            exit 1
+          fi
+
+  # ══════════════════════════════════════════════════════════════
+  # Rust 上位机
+  # ══════════════════════════════════════════════════════════════
+  host-rust:
+    name: Rust 上位机测试
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: host
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 缓存依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host
+
+      # 串口 crate 在 Linux 上需要 libudev
+      - name: 安装系统依赖
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 测试（含黄金向量的跨语言一致性检查）
+        run: cargo test --all
+
+  # ══════════════════════════════════════════════════════════════
+  # 架构纪律 —— ADR-008：App/ 层不许依赖 HAL
+  # ══════════════════════════════════════════════════════════════
+  firmware-layering:
+    name: 固件分层纪律检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: App/ 层不得包含 HAL / 寄存器头文件
+        run: |
+          # ADR-008：App/ 必须能在 PC 上用 gcc 编译测试，
+          # 所以不许直接碰 HAL。破坏了这条，三个人就都得等板子。
+          if grep -rn --include='*.c' --include='*.h' \
+               -E '#include\s*[<"](stm32[a-z0-9]*|hal_[a-z]*|gd32[a-z0-9]*|HAL)\.?h?[>"]' \
+               firmware/App/ 2>/dev/null; then
+            echo "::error::firmware/App/ 出现了对 HAL/寄存器的直接依赖（违反 ADR-008）"
+            echo "硬件访问必须经 firmware/Hardware/ 的抽象接口"
+            exit 1
+          fi
+          echo "✓ App/ 层保持硬件无关"
+
+      - name: 检查关键文档存在
+        run: |
+          for f in docs/03-protocol.md docs/04-performance.md proto/tests/vectors.json; do
+            [ -f "$f" ] || { echo "::error::缺少 $f"; exit 1; }
+          done
+          echo "✓ 关键文档齐全"
+
+  # ══════════════════════════════════════════════════════════════
+  # 端到端冒烟 —— 对着模拟器跑一次完整采集
+  # ══════════════════════════════════════════════════════════════
+  e2e-smoke:
+    name: 端到端冒烟（模拟器）
+    runs-on: ubuntu-latest
+    needs: [host-rust]
+    defaults:
+      run:
+        working-directory: host
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+
+      - name: 采集一次并检查输出
+        run: |
+          cargo run -q -p scope-cli -- sim capture --scenario sine_1k_3v3 -n 1024 -o /tmp/wave.csv
+          test -s /tmp/wave.csv || { echo "::error::CSV 为空"; exit 1; }
+          lines=$(wc -l < /tmp/wave.csv)
+          [ "$lines" -eq 1025 ] || { echo "::error::CSV 行数应为 1025，实际 $lines"; exit 1; }
+          head -1 /tmp/wave.csv | grep -q 'Time(s)' || { echo "::error::CSV 表头错误"; exit 1; }
+          echo "✓ 端到端采集产出 1024 点"
+
+      - name: I2C 场景双通道
+        run: |
+          cargo run -q -p scope-cli -- sim capture --scenario i2c_100k -n 2048 -o /tmp/i2c.csv
+          test -s /tmp/i2c.csv || { echo "::error::I2C CSV 为空"; exit 1; }
+          head -1 /tmp/i2c.csv | grep -q 'CH2V' || { echo "::error::应为双通道"; exit 1; }
+          echo "✓ I2C 双通道采集成功"
+
+      - name: MCP 自检
+        run: cargo run -q -p scope-mcp -- --selftest

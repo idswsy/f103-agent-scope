@@ -1,0 +1,20 @@
+[package]
+name        = "scope-mcp"
+description = "MCP Server：把示波器能力暴露给 AI Agent（P3 阶段）"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[[bin]]
+name = "scope-mcp"
+path = "src/main.rs"
+
+[dependencies]
+scope-proto            = { workspace = true }
+scope-core             = { workspace = true }
+scope-sim              = { workspace = true }
+scope-transport-serial = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,490 @@
+//! 采集存储 —— MCP 三层 token 防护的执行者。
+//!
+//! **核心原则：全量波形永远不进 LLM 上下文。**
+//!
+//! 一次 4096 点采集 = 8192 字节 ≈ 4096 个 JSON 数字 ≈ 上万 token。
+//! 把它塞给 LLM 既贵又没用 —— Agent 要的是「这里面发生了什么」，
+//! 不是「第 2713 个样点是 2047」。
+//!
+//! 所以：
+//!
+//! | 出口 | 给谁 | 形态 |
+//! |---|---|---|
+//! | [`Capture::summary`] | Agent 默认 | 统计量，几十字节 |
+//! | [`Capture::preview`] | Agent 默认 | ≤256 点 minmax 降采样 |
+//! | [`Capture::samples`] | 测量算法 | 全速原始样点 |
+//! | [`Capture::to_csv`] | 用户 | 落盘，不进上下文 |
+
+use std::collections::VecDeque;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// 采集存储保留的历史条数。
+///
+/// Agent 可以「引用上一次采集」而不必重抓，但不会无限增长。
+pub const DEFAULT_HISTORY: usize = 16;
+
+/// 一次采集。
+#[derive(Debug, Clone)]
+pub struct Capture {
+    /// 采集编号（设备分配）。
+    pub id: u16,
+    /// 实际采样率。**时间轴以它为准**，不是请求值。
+    pub rate_hz: u32,
+    /// 每个通道的原始样点（12-bit，0..4095）。
+    pub channels: Vec<Vec<u16>>,
+    /// 触发点在窗内的相对样点号；`None` 表示软件触发或无触发。
+    pub trigger_index: Option<u32>,
+    /// 抓取时设备时钟（µs）。
+    pub device_tick_us: u32,
+    /// 抓取时的墙钟时间（Unix 秒），用于 `list_captures` 排序。
+    pub wall_time: u64,
+    /// 期间是否发生溢出 —— 有这个标志的数据**不能假装完整**。
+    pub overrun: bool,
+    /// 期望的样点数（用于识别缺口）。
+    pub expected_samples: u32,
+}
+
+impl Capture {
+    /// 创建一次空采集。
+    pub fn new(id: u16, rate_hz: u32, ch_count: usize, expected_samples: u32) -> Capture {
+        Capture {
+            id,
+            rate_hz,
+            channels: vec![Vec::with_capacity(expected_samples as usize); ch_count],
+            trigger_index: None,
+            device_tick_us: 0,
+            wall_time: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            overrun: false,
+            expected_samples,
+        }
+    }
+
+    /// 样点数（以第一个通道为准）。
+    pub fn len(&self) -> usize {
+        self.channels.first().map(|c| c.len()).unwrap_or(0)
+    }
+
+    /// 是否为空。
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// 时间跨度（µs）。
+    pub fn duration_us(&self) -> u64 {
+        if self.rate_hz == 0 {
+            return 0;
+        }
+        (self.len() as u64) * 1_000_000 / self.rate_hz as u64
+    }
+
+    /// 每个样点的间隔（µs）。
+    pub fn dt_us(&self) -> f64 {
+        if self.rate_hz == 0 {
+            0.0
+        } else {
+            1_000_000.0 / self.rate_hz as f64
+        }
+    }
+
+    /// 某通道的原始样点。
+    pub fn samples(&self, ch: usize) -> Option<&[u16]> {
+        self.channels.get(ch).map(|v| v.as_slice())
+    }
+
+    /// 统计量摘要 —— Agent 的默认出口。
+    pub fn summary(&self, ch: usize) -> Option<ChannelSummary> {
+        let s = self.samples(ch)?;
+        if s.is_empty() {
+            return None;
+        }
+
+        let mut min = u16::MAX;
+        let mut max = u16::MIN;
+        let mut sum: u64 = 0;
+        let mut sum_sq: u64 = 0; // 必须 u64：4095² × 4096 ≈ 2³⁶
+        let mut rising = 0u32;
+        let mut falling = 0u32;
+
+        let mid = 2048u16; // 12-bit 中点（未标定时只作过零参考）
+        let mut prev = s[0];
+
+        for &v in s {
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
+            sum += v as u64;
+            sum_sq += (v as u64) * (v as u64);
+
+            if prev < mid && v >= mid {
+                rising += 1;
+            } else if prev >= mid && v < mid {
+                falling += 1;
+            }
+            prev = v;
+        }
+
+        let n = s.len() as u64;
+        let mean = sum as f64 / n as f64;
+        let mean_sq = sum_sq as f64 / n as f64;
+
+        // 两个量名字相近但物理意义完全不同，**必须分开算、分开命名**：
+        //
+        //   rms_lsb     = sqrt(E[x²])          相对 ADC 零点 0 的**真 RMS**
+        //   ac_rms_lsb  = sqrt(E[x²] − E[x]²)  扣除直流分量后的 **AC RMS**（标准差）
+        //
+        // 回归：这里曾经用 sqrt(variance) 填进名叫 rms_lsb 的字段 ——
+        // 算的是标准差却叫 RMS，全 4095 的直流信号会报出 0。
+        // 当时的测试还把错误行为写成了期望值，属于测试把 bug 固化下来。
+        let rms = mean_sq.max(0.0).sqrt();
+        let ac_rms = (mean_sq - mean * mean).max(0.0).sqrt();
+
+        Some(ChannelSummary {
+            channel: ch as u8,
+            n_samples: s.len() as u32,
+            min_lsb: min,
+            max_lsb: max,
+            pp_lsb: max - min,
+            mean_lsb: mean,
+            rms_lsb: rms,
+            ac_rms_lsb: ac_rms,
+            rising_edges: rising,
+            falling_edges: falling,
+        })
+    }
+
+    /// minmax 降采样预览 —— 显示与 Agent 视觉化用的标准答案。
+    ///
+    /// 每个桶返回 `(min, max)`。桶大小 = `len / target_points`（至少 1）。
+    /// 这样任何尖峰都不会被平均掉 —— 这正是为什么示波器降采样用 minmax
+    /// 而不是简单抽取。
+    pub fn preview(&self, ch: usize, target_points: usize) -> Option<MinMaxPreview> {
+        let s = self.samples(ch)?;
+        if s.is_empty() || target_points == 0 {
+            return None;
+        }
+
+        let bucket = (s.len() / target_points).max(1);
+        let mut mins = Vec::with_capacity(s.len() / bucket + 1);
+        let mut maxs = Vec::with_capacity(s.len() / bucket + 1);
+
+        for chunk in s.chunks(bucket) {
+            let mut lo = u16::MAX;
+            let mut hi = u16::MIN;
+            for &v in chunk {
+                if v < lo {
+                    lo = v;
+                }
+                if v > hi {
+                    hi = v;
+                }
+            }
+            mins.push(lo);
+            maxs.push(hi);
+        }
+
+        Some(MinMaxPreview {
+            channel: ch as u8,
+            bucket,
+            dt_us: self.dt_us() * bucket as f64,
+            t0_us: 0.0,
+            y_min: mins,
+            y_max: maxs,
+        })
+    }
+
+    /// 导出 CSV —— **全量数据的唯一出口，且只落盘不进上下文**。
+    ///
+    /// 时间列用绝对秒，与学长的上位机（`Time(s),CH1V,CH2V` 格式）兼容。
+    pub fn to_csv(&self, scale: &[ChannelScale]) -> String {
+        let mut out = String::with_capacity(self.len() * 16 * self.channels.len().max(1));
+        let dt = self.dt_us() * 1e-6;
+
+        out.push_str("Time(s)");
+        for ch in 0..self.channels.len() {
+            out.push_str(&format!(",CH{}V", ch + 1));
+        }
+        out.push('\n');
+
+        for i in 0..self.len() {
+            out.push_str(&format!("{:.9}", i as f64 * dt));
+            for (ch, chan) in self.channels.iter().enumerate() {
+                let lsb = chan.get(i).copied().unwrap_or(0);
+                let volts = scale
+                    .get(ch)
+                    .map(|s| s.lsb_to_volts(lsb))
+                    .unwrap_or(lsb as f64);
+                out.push_str(&format!(",{:.6}", volts));
+            }
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// 单通道统计量。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChannelSummary {
+    /// 通道号（0 起）。
+    pub channel: u8,
+    /// 参与统计的样点数。
+    pub n_samples: u32,
+    /// 最小值（ADC LSB）。
+    pub min_lsb: u16,
+    /// 最大值（ADC LSB）。
+    pub max_lsb: u16,
+    /// 峰峰值（ADC LSB）。
+    pub pp_lsb: u16,
+    /// 均值（ADC LSB）。
+    pub mean_lsb: f64,
+    /// **真 RMS**（ADC LSB）：`sqrt(E[x²])`，相对 ADC 零点 0。
+    ///
+    /// 直流信号（例如全 4095）的 `rms_lsb` 等于它的电平本身。
+    pub rms_lsb: f64,
+    /// **AC RMS**（ADC LSB）：`sqrt(E[x²] − E[x]²)`，即标准差，已扣除直流分量。
+    ///
+    /// 衡量"信号波动多大"，与直流偏置无关。示波器上说的 "AC RMS" 就是它。
+    pub ac_rms_lsb: f64,
+    /// 上升沿数（以 2048 LSB 为参考）。
+    pub rising_edges: u32,
+    /// 下降沿数。
+    pub falling_edges: u32,
+}
+
+/// minmax 降采样预览。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MinMaxPreview {
+    /// 通道号。
+    pub channel: u8,
+    /// 每个桶包含的原始样点数。
+    pub bucket: usize,
+    /// 每个桶代表的时间跨度（µs）。
+    pub dt_us: f64,
+    /// 预览起始时间（µs）。
+    pub t0_us: f64,
+    /// 每桶最小值。
+    pub y_min: Vec<u16>,
+    /// 每桶最大值。
+    pub y_max: Vec<u16>,
+}
+
+/// 通道标定 —— 伏特换算**只在上位机做**，MCU 只认 LSB。
+#[derive(Debug, Clone, Copy)]
+pub struct ChannelScale {
+    /// 每 LSB 对应的伏特数。
+    pub volts_per_lsb: f64,
+    /// 零电平对应的 ADC LSB。
+    pub zero_lsb: f64,
+}
+
+impl Default for ChannelScale {
+    fn default() -> Self {
+        // 未标定的粗估：3.3 V / 4096 LSB，中点 2048
+        ChannelScale {
+            volts_per_lsb: 3.3 / 4096.0,
+            zero_lsb: 2048.0,
+        }
+    }
+}
+
+impl ChannelScale {
+    /// LSB → 伏特。
+    pub fn lsb_to_volts(&self, lsb: u16) -> f64 {
+        (lsb as f64 - self.zero_lsb) * self.volts_per_lsb
+    }
+
+    /// 伏特 → LSB。
+    pub fn volts_to_lsb(&self, v: f64) -> i32 {
+        (v / self.volts_per_lsb + self.zero_lsb).round() as i32
+    }
+}
+
+/// 采集存储：保留最近 N 次采集，供 Agent 引用而不必重抓。
+#[derive(Debug)]
+pub struct CaptureStore {
+    entries: VecDeque<Capture>,
+    capacity: usize,
+}
+
+impl Default for CaptureStore {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_HISTORY)
+    }
+}
+
+impl CaptureStore {
+    /// 创建指定容量的存储。
+    pub fn with_capacity(capacity: usize) -> Self {
+        CaptureStore {
+            entries: VecDeque::with_capacity(capacity),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// 存入一次采集；超出容量时淘汰最旧的。
+    pub fn push(&mut self, c: Capture) {
+        if self.entries.len() >= self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(c);
+    }
+
+    /// 按编号查找。
+    pub fn get(&self, id: u16) -> Option<&Capture> {
+        self.entries.iter().find(|c| c.id == id)
+    }
+
+    /// 最近一次采集。
+    pub fn latest(&self) -> Option<&Capture> {
+        self.entries.back()
+    }
+
+    /// 全部采集（旧 → 新）。
+    pub fn iter(&self) -> impl Iterator<Item = &Capture> {
+        self.entries.iter()
+    }
+
+    /// 条数。
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// 是否为空。
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_capture() -> Capture {
+        let mut c = Capture::new(1, 1_000_000, 1, 8);
+        c.channels[0] = vec![0, 1000, 2000, 3000, 4095, 3000, 2000, 1000];
+        c
+    }
+
+    #[test]
+    fn summary_computes_pp_and_edges() {
+        let c = mk_capture();
+        let s = c.summary(0).unwrap();
+        assert_eq!(s.min_lsb, 0);
+        assert_eq!(s.max_lsb, 4095);
+        assert_eq!(s.pp_lsb, 4095);
+        // 2048 为参考：0→1000→2000→3000 上穿一次；3000→2000→1000 下穿一次
+        assert_eq!(s.rising_edges, 1);
+        assert_eq!(s.falling_edges, 1);
+    }
+
+    #[test]
+    fn rms_and_ac_rms_are_different_quantities() {
+        // 回归：曾经把标准差（sqrt(variance)）填进名叫 rms_lsb 的字段，
+        // 于是全 4095 的直流信号报出 rms = 0 —— 名字与物理量不符。
+        // 4095² × 4096 ≈ 2³⁶ 也顺带验证 u64 累加不会溢出。
+        let mut c = Capture::new(1, 1_000_000, 1, 4096);
+        c.channels[0] = vec![4095u16; 4096];
+        let s = c.summary(0).unwrap();
+
+        assert!((s.mean_lsb - 4095.0).abs() < 1e-6);
+        assert!(
+            (s.rms_lsb - 4095.0).abs() < 1e-6,
+            "直流 4095 的真 RMS 就是 4095，得到 {}",
+            s.rms_lsb
+        );
+        assert!(
+            s.ac_rms_lsb.abs() < 1e-6,
+            "直流信号的 AC RMS（波动）应为 0，得到 {}",
+            s.ac_rms_lsb
+        );
+    }
+
+    #[test]
+    fn ac_rms_matches_known_square_wave() {
+        // 0/4095 各占一半的方波：
+        //   均值    = 2047.5
+        //   真 RMS  = sqrt((0² + 4095²)/2) = 4095/√2 ≈ 2895.6
+        //   AC RMS  = 扣掉均值后是 ±2047.5 的方波 → 2047.5
+        //
+        // 注意两者**不相等**：全 4095 的直流信号真 RMS 是 4095、AC RMS 是 0；
+        // 这个方波则分别是 2895.6 和 2047.5。名字相近，物理量不同。
+        let mut c = Capture::new(1, 1_000_000, 1, 4);
+        c.channels[0] = vec![0, 4095, 0, 4095];
+        let s = c.summary(0).unwrap();
+
+        let true_rms = 4095.0 / 2.0f64.sqrt(); // 2895.60
+        let ac_rms = 2047.5;
+
+        assert!(
+            (s.mean_lsb - 2047.5).abs() < 1e-6,
+            "均值应为 2047.5，得到 {}",
+            s.mean_lsb
+        );
+        assert!(
+            (s.rms_lsb - true_rms).abs() < 1.0,
+            "真 RMS 应约 {true_rms:.1}，得到 {:.1}",
+            s.rms_lsb
+        );
+        assert!(
+            (s.ac_rms_lsb - ac_rms).abs() < 1.0,
+            "AC RMS 应约 {ac_rms:.1}，得到 {:.1}",
+            s.ac_rms_lsb
+        );
+
+        // Parseval：真 RMS² = 均值² + AC RMS²
+        // 这是两者关系的硬约束，比上面的具体数值更能防住"把标准差当 RMS"这类错误
+        let lhs = s.rms_lsb * s.rms_lsb;
+        let rhs = s.mean_lsb * s.mean_lsb + s.ac_rms_lsb * s.ac_rms_lsb;
+        assert!(
+            (lhs - rhs).abs() < 1.0,
+            "Parseval 恒等式不成立：RMS²={lhs:.1} 应等于 mean²+ac²={rhs:.1}"
+        );
+    }
+
+    #[test]
+    fn preview_preserves_spikes() {
+        // 桶大小 4，中间有一个尖峰；minmax 必须保住它，简单抽取会丢
+        let mut c = Capture::new(1, 1_000_000, 1, 8);
+        c.channels[0] = vec![0, 0, 0, 4095, 0, 0, 0, 0];
+        let p = c.preview(0, 2).unwrap();
+        assert_eq!(p.bucket, 4);
+        assert_eq!(p.y_max[0], 4095, "尖峰必须出现在 max 里");
+        assert_eq!(p.y_min[0], 0);
+    }
+
+    #[test]
+    fn store_evicts_oldest() {
+        let mut st = CaptureStore::with_capacity(2);
+        for id in 1..=3u16 {
+            st.push(Capture::new(id, 1000, 1, 1));
+        }
+        assert_eq!(st.len(), 2);
+        assert!(st.get(1).is_none(), "最旧的应被淘汰");
+        assert!(st.get(3).is_some());
+    }
+
+    #[test]
+    fn csv_has_header_and_scaling() {
+        let c = mk_capture();
+        let csv = c.to_csv(&[ChannelScale::default()]);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "Time(s),CH1V");
+        assert_eq!(lines.len(), 9); // header + 8 samples
+    }
+
+    #[test]
+    fn scale_roundtrip() {
+        let s = ChannelScale {
+            volts_per_lsb: 1.0,
+            zero_lsb: 2048.0,
+        };
+        assert!((s.lsb_to_volts(2048) - 0.0).abs() < 1e-9);
+        assert!((s.lsb_to_volts(2148) - 100.0).abs() < 1e-9);
+        assert_eq!(s.volts_to_lsb(100.0), 2148);
+    }
+}

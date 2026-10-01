@@ -1,0 +1,39 @@
+{
+  "//": "为什么需要 CARGO_TARGET_DIR：项目路径含中文（I2C示波器）时，",
+  "//2": "MinGW 的 ld.exe 打不开 CJK 路径，链接阶段会报 cannot find *.rcgu.o。",
+  "//3": "把 target 指到纯 ASCII 路径即可绕开。详见 docs/07-dev-env.md 坑 #1。",
+  "rust-analyzer.cargo.extraEnv": {
+    "CARGO_TARGET_DIR": "${env:USERPROFILE}/.cargo-target/i2c-scope-f103"
+  },
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.cargo.targetDir": true,
+
+  "[rust]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  },
+  "[c]": {
+    "editor.tabSize": 4,
+    "editor.insertSpaces": true
+  },
+  "files.associations": {
+    "*.h": "c"
+  },
+  "C_Cpp.default.cStandard": "c11",
+  "C_Cpp.default.intelliSenseMode": "gcc-x64",
+
+  "files.exclude": {
+    "**/target": true,
+    "**/proto/build": true
+  },
+  "search.exclude": {
+    "**/target": true,
+    "**/proto/build": true,
+    "hardware/upstream/downloads": true
+  },
+
+  "//4": "黄金向量是协议契约，不要被格式化工具重排",
+  "[json]": {
+    "editor.formatOnSave": false
+  }
+}

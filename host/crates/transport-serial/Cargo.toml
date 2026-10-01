@@ -1,0 +1,17 @@
+[package]
+name        = "scope-transport-serial"
+description = "串口传输层：USB CDC / CH340 / CP2102 都走 COM 口"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+scope-core  = { workspace = true }
+scope-proto = { workspace = true }
+serialport  = "4"
+
+[dev-dependencies]
+scope-sim = { workspace = true }

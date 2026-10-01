@@ -1,0 +1,16 @@
+[package]
+name        = "scope-sim"
+description = "F103 示波器模拟器：完整设备模型 + 波形合成 + 故障注入"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+scope-proto = { workspace = true }
+scope-core  = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

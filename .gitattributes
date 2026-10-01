@@ -1,0 +1,46 @@
+# 统一换行符处理，避免 Windows/Linux 协作者互相污染 diff
+* text=auto eol=lf
+
+# 特定平台必须保持 CRLF 的文件
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Keil MDK 工程文件对换行敏感，保持原样
+*.uvprojx  text eol=crlf
+*.uvoptx   text eol=crlf
+
+# 二进制文件不做换行转换
+*.pdf   binary
+*.xlsx  binary
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.ico   binary
+*.zip   binary
+*.7z    binary
+*.exe   binary
+*.bin   binary
+*.hex   binary
+*.elf   binary
+
+# 原理图 / PCB / EDA 源文件
+*.SchDoc  binary
+*.PcbDoc  binary
+*.epro    binary
+*.eprj    binary
+
+# 让 3D / Gerber 资料在 GitHub 上按二进制统计
+*.gbr   binary
+*.drl   binary
+
+# diff 可读性：文档与波形数据
+*.md      text diff=markdown
+*.json    text
+*.toml    text
+# CSV 波形数据做成可 diff 的文本 —— 采样数据入不了库，
+# 入得了库的都是小样本，能看 diff 比省那点体积有用
+*.csv     text eol=lf
+
+# 让 golden vector 的 diff 有意义
+/proto/tests/vectors.json  text diff=json
