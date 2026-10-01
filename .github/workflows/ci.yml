@@ -83,11 +83,51 @@ jobs:
       - name: 格式检查
         run: cargo fmt --all -- --check
 
+      # GUI（scope-gui）单独一个 job：它拉 eframe/winit，Ubuntu 上要额外的
+      # 图形系统库，而且编译量大。排除它能让这个 job 保持快且稳。
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude scope-gui --all-targets -- -D warnings
 
       - name: 测试（含黄金向量的跨语言一致性检查）
-        run: cargo test --all
+        run: cargo test --workspace --exclude scope-gui
+
+  # ══════════════════════════════════════════════════════════════
+  # 桌面 GUI —— 单独一个 job，因为它要一整套图形系统库
+  # ══════════════════════════════════════════════════════════════
+  gui:
+    name: GUI 桌面上位机
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: host
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 缓存依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host
+
+      # eframe 官方给出的 Linux 依赖，加上串口要的 libudev
+      - name: 安装图形系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev pkg-config \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev
+
+      - name: Clippy
+        run: cargo clippy -p scope-gui --all-targets -- -D warnings
+
+      # 只跑单元测试，**不启动窗口** —— CI 是无头机，没有 DISPLAY，
+      # 任何 run_native 调用都会失败。视图模型的单测是纯函数，不需要 GUI。
+      - name: 视图模型单测（无头）
+        run: cargo test -p scope-gui
 
   # ══════════════════════════════════════════════════════════════
   # 架构纪律 —— ADR-008：App/ 层不许依赖 HAL

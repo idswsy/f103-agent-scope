@@ -1,0 +1,316 @@
+//! 视图模型 —— 把采集与解码结果翻译成**可绘制的数据**。
+//!
+//! # 为什么单独一层
+//!
+//! 这里的函数**不依赖 egui**，全是纯函数：输入 `Capture` / `I2cDecode`，
+//! 输出坐标数组和字符串。好处是它们能在没有显示器、没有 GPU 的环境里单测 ——
+//! 这是 CI 唯一能真正验证 GUI 逻辑的途径（CI 是 Ubuntu 无头机，
+//! 装不了、也不该装图形栈）。
+//!
+//! # 两条纪律在这里落地
+//!
+//! - **时间轴由 `capture.rate_hz` 推导**（设备回显的实际值），绝不用请求值，
+//!   也不用分片到达时刻。见 `docs/03-protocol.md`。
+//! - **伏特换算只发生在显示层**。控制链路和存储里全是 ADC LSB 整数，
+//!   `ChannelScale` 是唯一的换算点（ADR-006）。
+
+use scope_core::i2c_decode::{EventKind, I2cDecode};
+use scope_core::{Capture, ChannelScale};
+
+/// 一段带标注的时间区间，画在数字泳道上。
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventSpan {
+    /// 起始时间（µs，相对采集起点）。
+    pub t0_us: f64,
+    /// 结束时间（µs）。
+    pub t1_us: f64,
+    /// 这一段是什么。
+    pub kind: SpanKind,
+    /// 只有这一位是 NACK（要从视觉上区分出来）。
+    pub nack: bool,
+}
+
+/// 解码事件的分类 —— 决定泳道色块的颜色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanKind {
+    /// 起始位 / 重复起始位。
+    Start,
+    /// 地址字节。
+    Address,
+    /// 数据字节。
+    Data,
+    /// 停止位。
+    Stop,
+    /// 被采集窗口截断。
+    Truncated,
+}
+
+/// 采集的时间跨度（µs）。
+///
+/// 用 `rate_hz`（回显的实际采样率）换算 —— 请求值可能被定时器分频量化过。
+pub fn duration_us(cap: &Capture) -> f64 {
+    cap.duration_us() as f64
+}
+
+/// 把一个通道的画线坐标摊平。
+///
+/// 返回 `[[时间µs, 电压V], ...]`。**不做降采样** —— F103 的硬顶就是 4096 点，
+/// 直接画全量最诚实；minmax 抽点是给 Agent 省 token 用的，不是给人的。
+pub fn waveform_points(cap: &Capture, ch: usize, scale: &ChannelScale) -> Vec<[f64; 2]> {
+    let Some(samples) = cap.samples(ch) else {
+        return Vec::new();
+    };
+    if cap.rate_hz == 0 {
+        return Vec::new();
+    }
+    let dt_us = 1_000_000.0 / cap.rate_hz as f64;
+    samples
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| [i as f64 * dt_us, scale.lsb_to_volts(v)])
+        .collect()
+}
+
+/// 采样率档位菜单。
+///
+/// 用 `f103::nearest_achievable_rate` 把常用值**吸附到定时器真的能出的档位** ——
+/// 直接给整数会让用户选到设备根本做不到的值，然后被回显打脸。
+///
+/// 上限是 **857142**，不是 1000000。`docs/04-performance.md:35` 写死了
+/// 「任何文档、UI、宣传里都不许写 1 MSPS」。
+pub fn rate_choices() -> Vec<u32> {
+    const REQUESTED: &[u32] = &[
+        857_142, // 默认档：72 MHz / 84
+        600_000, 461_538, 292_683, 176_471, 47_619,
+    ];
+    let mut out: Vec<u32> = REQUESTED
+        .iter()
+        .map(|&r| scope_core::f103::nearest_achievable_rate(r))
+        .collect();
+    out.dedup();
+    out
+}
+
+/// 把一次解码拆成泳道上的色块。
+///
+/// 每个事件的结束时间是**下一个事件**的起点；最后一个事件延伸到最后
+/// （截断帧本来就没有终点）。
+pub fn event_spans(decode: &I2cDecode, total_us: f64) -> Vec<EventSpan> {
+    let mut flat: Vec<(f64, SpanKind, bool)> = Vec::new();
+    for tx in &decode.transactions {
+        for ev in &tx.events {
+            let t = ev.time_us as f64;
+            let (kind, nack) = match &ev.kind {
+                EventKind::Start | EventKind::RepeatedStart => (SpanKind::Start, false),
+                EventKind::Address(a) => (SpanKind::Address, !a.acked),
+                EventKind::Data { acked, .. } => (SpanKind::Data, !*acked),
+                EventKind::Stop => (SpanKind::Stop, false),
+                EventKind::Truncated => (SpanKind::Truncated, false),
+            };
+            flat.push((t, kind, nack));
+        }
+    }
+    flat.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    flat.iter()
+        .enumerate()
+        .map(|(i, &(t0, kind, nack))| {
+            let t1 = flat
+                .get(i + 1)
+                .map(|n| n.0)
+                .unwrap_or_else(|| total_us.max(t0));
+            EventSpan {
+                t0_us: t0,
+                // 保证宽度为正，否则 egui_plot 的多边形会退化
+                t1_us: t1.max(t0 + 0.001),
+                kind,
+                nack,
+            }
+        })
+        .collect()
+}
+
+/// 一行「帧 N @ x.xxx ms 地址 … 数据 …」的摘要，给交易表用。
+pub fn transaction_summary(decode: &I2cDecode) -> Vec<String> {
+    decode
+        .transactions
+        .iter()
+        .enumerate()
+        .map(|(i, tx)| {
+            let hex: Vec<String> = tx.bytes.iter().map(|b| format!("{b:02X}")).collect();
+            format!(
+                "帧 {:<3} @ {:>7.3} ms   {:<10} {:<7} {}{}",
+                i + 1,
+                tx.start_time_us as f64 / 1000.0,
+                tx.address_str(),
+                if tx.bytes.is_empty() {
+                    String::new()
+                } else {
+                    hex.join(" ")
+                },
+                if tx.has_nack() { "NACK" } else { "" },
+                if tx.complete { "" } else { "  (截断)" }
+            )
+        })
+        .collect()
+}
+
+/// 告警文案 —— 直接复用 core 里的 `I2cWarning::text()`，不在这里另写一份。
+pub fn warning_lines(decode: &I2cDecode) -> Vec<String> {
+    decode.warnings.iter().map(|w| w.text()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scope_core::i2c_decode::{I2cDecodeConfig, Levels};
+    use scope_core::Capture;
+
+    /// 造一份能解出确定内容的两通道采集（0x88 / 0x00 / 0x1A）。
+    fn sample_capture() -> Capture {
+        // 每个半周期 4 个样点 → 一个比特 8 个样点 → 100 kHz @ 800 kSPS
+        let rate = 800_000u32;
+        const HIGH: u16 = 4095;
+        const LOW: u16 = 0;
+
+        // 声明必须在宏**之前** —— macro_rules! 里的局部变量在定义处解析（卫生性），
+        // 宏体里的 `scl` 看不见定义之后才声明的同名变量。
+        let mut scl: Vec<u16> = Vec::new();
+        let mut sda: Vec<u16> = Vec::new();
+
+        // 用宏而不是闭包：闭包会各自可变借走 scl/sda，两个闭包共存时编译器不让过
+        macro_rules! hold {
+            ($sv:expr, $dv:expr, $n:expr) => {
+                for _ in 0..$n {
+                    scl.push($sv);
+                    sda.push($dv);
+                }
+            };
+        }
+        macro_rules! bit {
+            ($sv:expr) => {{
+                let d = if $sv { HIGH } else { LOW };
+                for _ in 0..4 {
+                    scl.push(LOW);
+                    sda.push(d);
+                }
+                for _ in 0..4 {
+                    scl.push(HIGH);
+                    sda.push(d);
+                }
+            }};
+        }
+
+        // START：SCL 高时 SDA 由高变低
+        hold!(HIGH, HIGH, 4);
+        hold!(HIGH, LOW, 4);
+        hold!(LOW, LOW, 4);
+        for b in [0x88u8, 0x00, 0x1A] {
+            for i in (0..8).rev() {
+                bit!((b >> i) & 1 == 1);
+            }
+            bit!(false); // ACK：SDA 拉低
+        }
+        // STOP：SCL 高时 SDA 由低变高
+        hold!(LOW, LOW, 4);
+        hold!(HIGH, LOW, 4);
+        hold!(HIGH, HIGH, 4);
+
+        let mut cap = Capture::new(1, rate, 2, scl.len() as u32);
+        cap.channels = vec![scl, sda];
+        cap
+    }
+
+    #[test]
+    fn duration_uses_the_echoed_rate_not_the_requested_one() {
+        let cap = sample_capture();
+        // START 12 + 3 字节 × 9 位 × 8 样点 = 216 + STOP 12 → 240
+        assert_eq!(cap.len(), 240, "构造的波形应有 240 个样点");
+        // 240 点 @ 800 kHz = 300 µs（若误用别的采样率，这个数会明显不同）
+        let d = duration_us(&cap);
+        assert!(
+            (d - 300.0).abs() < 1.0,
+            "时间轴必须按 rate_hz(=800000) 算，期望 300 µs，实测 {d} µs"
+        );
+    }
+
+    #[test]
+    fn rate_choices_never_exceed_the_f103_ceiling() {
+        // docs/04-performance.md:35 —— UI 里不许出现 1 MSPS
+        for r in rate_choices() {
+            assert!(
+                r <= scope_core::f103::MAX_SAMPLE_RATE_HZ,
+                "档位 {r} 超过了 F103 上限 857142"
+            );
+        }
+        assert_eq!(rate_choices()[0], 857_142, "默认档应是 857142");
+    }
+
+    #[test]
+    fn waveform_points_span_the_whole_capture() {
+        let cap = sample_capture();
+        let scale = ChannelScale::default();
+        let pts = waveform_points(&cap, 0, &scale);
+        assert_eq!(pts.len(), cap.len(), "不做降采样，应逐点摊平");
+        assert_eq!(pts[0][0], 0.0, "第一个点的时间应是 0");
+        let last = pts.last().unwrap()[0];
+        assert!(last > 0.0 && last < 4000.0);
+    }
+
+    #[test]
+    fn waveform_points_of_a_missing_channel_is_empty_not_panic() {
+        let cap = sample_capture();
+        assert!(waveform_points(&cap, 9, &ChannelScale::default()).is_empty());
+    }
+
+    #[test]
+    fn event_spans_cover_the_decode_in_order() {
+        let cap = sample_capture();
+        let d = scope_core::decode_capture(&cap, &I2cDecodeConfig::default()).unwrap();
+        assert_eq!(d.frame_count(), 1, "应解出 1 帧");
+
+        let spans = event_spans(&d, duration_us(&cap));
+        assert_eq!(spans.len(), d.transactions[0].events.len());
+        // 时间必须单调不减
+        for w in spans.windows(2) {
+            assert!(w[1].t0_us >= w[0].t0_us, "事件跨度必须按时间排好序");
+        }
+        // 宽度必须为正（egui_plot 的多边形不接受零宽/负宽）
+        for s in &spans {
+            assert!(s.t1_us > s.t0_us);
+        }
+        // 至少有一个地址段和一个数据段
+        assert!(spans.iter().any(|s| s.kind == SpanKind::Address));
+        assert!(spans.iter().any(|s| s.kind == SpanKind::Data));
+    }
+
+    #[test]
+    fn transaction_summary_reports_address_and_bytes() {
+        let cap = sample_capture();
+        let d = scope_core::decode_capture(&cap, &I2cDecodeConfig::default()).unwrap();
+        let lines = transaction_summary(&d);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("0x44 (W)"), "应显示地址: {}", lines[0]);
+        assert!(lines[0].contains("00 1A"), "应显示数据字节: {}", lines[0]);
+    }
+
+    #[test]
+    fn no_signal_produces_warnings_not_silent_success() {
+        let mut cap = Capture::new(1, 800_000, 2, 256);
+        cap.channels = vec![vec![0u16; 256], vec![0u16; 256]];
+        let d = scope_core::decode_capture(&cap, &I2cDecodeConfig::default()).unwrap();
+        assert!(d.is_empty());
+        assert!(
+            !warning_lines(&d).is_empty(),
+            "没信号必须给出告警，不能静默返回空结果"
+        );
+    }
+
+    #[test]
+    fn levels_default_is_the_documented_ratio() {
+        let l = Levels::default_ratio();
+        assert_eq!(l.vih_lsb, (4095.0f32 * 0.70).round() as u16);
+        assert_eq!(l.vil_lsb, (4095.0f32 * 0.30).round() as u16);
+        assert!(l.is_valid());
+    }
+}

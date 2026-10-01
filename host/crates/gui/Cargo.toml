@@ -1,0 +1,21 @@
+[package]
+name        = "scope-gui"
+description = "桌面上位机：波形与 I2C 解码的可视化界面（给人用的版本）"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+# 其余 crate 的 MSRV 是 workspace 的 1.75，但 eframe 0.36 要求 1.95。
+# 只抬高本 crate，不动别人的 —— 没有 GUI 的构建路径仍可用 1.75。
+rust-version = "1.95"
+
+[dependencies]
+scope-core             = { workspace = true }
+scope-sim              = { workspace = true }
+scope-transport-serial = { workspace = true }
+
+eframe    = { workspace = true }
+egui      = { workspace = true }
+egui_plot = { workspace = true }

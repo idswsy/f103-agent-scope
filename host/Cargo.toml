@@ -7,6 +7,7 @@ members = [
     "crates/sim",
     "crates/cli",
     "crates/mcp",
+    "crates/gui",
 ]
 
 [workspace.package]
@@ -25,8 +26,14 @@ scope-sim              = { path = "crates/sim" }
 
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
-thiserror   = "2"
+thiserror   = { version = "2" }
 anyhow      = "1"
+
+# GUI。渲染后端是 feature 开关（egui-wgpu / egui_glow 在 crate 元数据里都是
+# optional，只有 winit 是必需的），所以这里显式写死默认特性、不依赖隐式默认值。
+eframe      = "0.36.2"
+egui        = "0.36.2"
+egui_plot   = "0.37.0"
 
 [profile.release]
 lto       = true
