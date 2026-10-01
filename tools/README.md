@@ -10,14 +10,14 @@
 ### `i2c_decode/` —— 独立 I2C 解码器
 
 **为什么独立于 `scope-core`**：这个工具要能处理**别人的**数据 ——
-从任意示波器（Rigol / Keysight / 学长那个 exe）导出的 CSV，
+从任意示波器（Rigol / Keysight 等）导出的 CSV，
 不一定是我们的设备抓的。
 
-**行为规范**（继承自学长的 `I2C示波器_改良版.exe`，见 [`NOTICE.md`](../NOTICE.md) §4）：
+**行为规范**（出处见 [`NOTICE.md`](../NOTICE.md) §4）：
 
 | 特性 | 说明 |
 |---|---|
-| 通道选择 | 默认 `SCL = CH1`、`SDA = CH2`（学长的 exe 是 CH1/CH4，我们会自动检测） |
+| 通道选择 | 默认 `SCL = CH1`、`SDA = CH2`，其余通道组合自动检测（兼容 CH1/CH4 等） |
 | 阈值 | 可调，单位 V。**保留中间带为「未知」并报警**，不硬判 0/1 |
 | 去抖 | debounce 时间可配 |
 | 解码输出 | START / 重复START / 地址(7位+10位) / ACK / NACK / 数据 / STOP |
@@ -28,7 +28,7 @@
 **输入格式**：兼容两种 CSV
 
 ```csv
-# 格式 A：通用（我们和学长都用这个）
+# 格式 A：通用两通道格式
 Time(s),CH1V,CH2V
 0.000000000,0.000000,3.300000
 ...
@@ -72,7 +72,7 @@ python tools/csv_export/plot.py wave.csv --out wave.png --title "I2C 写时序"
 ```
 
 > `plot.py` 要处理中文字体（Windows 上 matplotlib 默认不显示中文）——
-> 从 `C:\Windows\Fonts\msyh.ttc` 加载，与学长 exe 的做法一致。
+> 从 `C:\Windows\Fonts\msyh.ttc` 加载。
 
 ---
 

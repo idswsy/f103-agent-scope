@@ -266,7 +266,7 @@ pub enum Bit {
 /// `START → 0x88(地址 0x44 写) + ACK → 0x00 + ACK → 0x1A + ACK → STOP`
 ///
 /// 之所以选 `0x44`：这是常见温湿度传感器（SHT/HTU 系列）的地址，
-/// 也是学长那个 I2C 解码器截图里出现的地址 —— 保持连续性。
+/// 也是 I2C 调试里最常抓到的事务之一，适合当示例。
 pub fn default_i2c_transaction() -> Vec<Bit> {
     transaction(&[0x88, 0x00, 0x1A])
 }

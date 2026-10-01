@@ -200,7 +200,7 @@ impl Capture {
 
     /// 导出 CSV —— **全量数据的唯一出口，且只落盘不进上下文**。
     ///
-    /// 时间列用绝对秒，与学长的上位机（`Time(s),CH1V,CH2V` 格式）兼容。
+    /// 时间列用绝对秒，与通用两通道 CSV 格式（`Time(s),CH1V,CH2V`）兼容。
     pub fn to_csv(&self, scale: &[ChannelScale]) -> String {
         let mut out = String::with_capacity(self.len() * 16 * self.channels.len().max(1));
         let dt = self.dt_us() * 1e-6;

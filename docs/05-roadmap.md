@@ -56,7 +56,7 @@ cd host && cargo test       # Rust 端全部测试
 | TIM 输入捕获 | `firmware/Hardware/tim_capture.c` | 13.9 ns 边沿时间戳，捕获缓冲区 |
 | I2C 解码器（C） | `firmware/App/i2c_decode.c` | START/重复START/地址/ACK/NACK/数据/STOP |
 | I2C 解码器（Rust） | `host/crates/core/src/i2c_decode.rs` | 与 C 端同一批测试向量（`i2c_vectors.json`）结果一致 |
-| 泳道渲染 | `host/crates/cli` 或 GUI | 复刻学长 exe 的规范：SCL/SDA 泳道、阈值、去抖、「共 N 帧」 |
+| 泳道渲染 | `host/crates/cli` 或 GUI | SCL/SDA 双泳道 + 阈值判定 + 去抖，「共 N 帧」统计 |
 | 双通路时间对齐 | | ADC 波形与数字边沿在同一时间轴对齐（误差 < 1 µs） |
 
 **验收**：
@@ -128,11 +128,26 @@ cd host && cargo test       # Rust 端全部测试
 | 项 | 说明 | 优先级 |
 |---|---|---|
 | **双通道改板** | 加第二路模拟前端（见待决策） | 高（决定产品形态） |
-| 控制台/上位机 GUI | egui 0.29 + egui_plot（学长已验证可行的栈） | 高 |
+| 控制台/上位机 GUI | egui 0.29 + egui_plot | 高 |
 | 自动量程 | 需把 SW2/SW3 换成继电器/模拟开关 | 中（要改板） |
 | 等效时间采样 | 数字通路触发 + 帧平均，用于看边沿形状 | 中（**必须标注失效场景**） |
 | 其他协议解码 | UART / SPI 解码器 | 中 |
 | 屏幕 UI | 板载 1.8 寸 TFT 显示波形 + 状态 | 低（调试够用即可） |
+
+---
+
+## P5 · 主板升级 STM32F407
+
+> **目标：解除 F103C8T6 这颗芯片带来的三条硬约束**（`00-origin.md` §四条约束）。项目本身的定位与接口不变。
+
+| 项 | 解锁什么 |
+|---|---|
+| 三 ADC 三重交替 | 采样率 → **7.2 MSPS**，模拟通路单独即可覆盖 400 kHz I2C |
+| FSMC | 深存储（外挂 SRAM），不再受 20 KB SRAM 限制 |
+| 以太网 MAC | 直接传原始波形，摆脱 92 KB/s ~ 900 KB/s 的链路预算 |
+
+**不变量**：协议层与上位机**一行都不用改** —— `DevicePort` / `GetCapabilities` / 分片策略都与链路和器件无关。
+**数字通路保留**：1 MHz I2C 下它仍是最可靠的解码路径（见 [ADR-005](06-decisions.md)）。
 
 ---
 
