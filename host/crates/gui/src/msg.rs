@@ -8,7 +8,7 @@
 //! 不需要超时兜底，也不会出现永远转圈的按钮。
 
 use scope_core::{Capture, DeviceConfig, DeviceInfo, State};
-use scope_sim::Scenario;
+use scope_sim::{FaultInjection, Scenario};
 
 /// 一次连接的传输选择。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +69,8 @@ pub enum Request {
     },
     /// 切换模拟器场景（仅模拟器连接有效）。
     SetScenario(Scenario),
+    /// 设置模拟器故障注入（仅模拟器连接有效）。
+    SetFaults(Box<FaultInjection>),
     /// `RESET` —— 从 `Fault` 态里出来的唯一办法。
     Reset,
     /// 让 worker 收尾退出。
@@ -90,6 +92,8 @@ pub enum Update {
         config: Option<DeviceConfig>,
         /// 设备当前状态。
         state: State,
+        /// 背后是不是模拟器 —— 决定「场景 / 故障注入」面板要不要出现。
+        simulated: bool,
     },
     /// 已断开。
     Disconnected,
@@ -123,6 +127,25 @@ pub enum Update {
 pub fn describe_error(e: &scope_core::ScopeError) -> (String, Option<String>) {
     use scope_core::ScopeError;
     match e {
+        // ⚠ 下面这四个变体的 `Display` **已经把 hint/reason 拼进正文了**
+        // （见 `core/src/error.rs` 的 `#[error(...)]`），再单独显示一次 hint，
+        // 同一句话就会在底栏出现两遍。所以这里自己拼一段**不带 hint** 的说明。
+        ScopeError::InvalidParam {
+            field,
+            value,
+            reason,
+        } => (format!("参数非法: {field} = {value}"), Some(reason.clone())),
+        ScopeError::BadState {
+            current,
+            action,
+            hint,
+        } => (
+            format!("当前状态 {current:?} 不允许执行 {action}"),
+            Some(hint.clone()),
+        ),
+        ScopeError::NoTrigger(ms, hint) => (format!("未在 {ms} ms 内触发"), Some(hint.clone())),
+        ScopeError::Unsupported(msg) => ("该功能在此硬件上不可用".to_string(), Some(msg.clone())),
+
         ScopeError::Device(d) => (d.to_string(), Some(d.hint().to_string())),
         ScopeError::Link(l) => {
             use scope_core::LinkError;
@@ -135,16 +158,12 @@ pub fn describe_error(e: &scope_core::ScopeError) -> (String, Option<String>) {
             };
             (l.to_string(), Some(hint.to_string()))
         }
-        ScopeError::BadState { hint, .. } => (e.to_string(), Some(hint.clone())),
-        ScopeError::InvalidParam { reason, .. } => (e.to_string(), Some(reason.clone())),
-        ScopeError::NoTrigger(_, hint) => (e.to_string(), Some(hint.clone())),
         ScopeError::NoSuchCapture(id) => (
             e.to_string(),
             Some(format!(
                 "采集 {id} 已被淘汰（历史只留最近 16 次），请重新采集"
             )),
         ),
-        ScopeError::Unsupported(msg) => (e.to_string(), Some(msg.clone())),
         ScopeError::Cancelled(_) => (e.to_string(), None),
     }
 }

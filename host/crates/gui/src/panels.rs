@@ -51,6 +51,15 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
         ui.checkbox(&mut app.show_volts, "显示电压")
             .on_hover_text("关闭则显示 ADC LSB 整数（控制链路的原生单位）");
 
+        ui.separator();
+        if ui
+            .selectable_label(app.show_help, "能力边界")
+            .on_hover_text("这台设备能做什么、做不到什么 —— 建议先看一眼")
+            .clicked()
+        {
+            app.show_help = !app.show_help;
+        }
+
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some(st) = app.state {
                 let color = match st {
@@ -289,6 +298,120 @@ pub fn config(app: &mut App, ui: &mut egui::Ui) {
 
 /// 配置面板里控件的统一宽度。
 const CTRL_W: f32 = 150.0;
+
+/// 左侧：模拟器故障注入。**只在真的连着模拟器时出现。**
+///
+/// 这些开关的价值在于：错误路径（丢帧、CRC 错、不触发、溢出）在真实硬件上
+/// 很难复现，而它们恰恰是最容易写错的地方。
+pub fn faults(app: &mut App, ui: &mut egui::Ui) {
+    ui.heading("故障注入");
+    ui.weak("模拟器专用。用来验证错误路径不会把界面卡死。");
+
+    let f = &mut app.faults;
+    egui::Grid::new("fault_grid")
+        .num_columns(2)
+        .spacing([10.0, 5.0])
+        .show(ui, |ui| {
+            ui.label("丢帧");
+            ui.add(
+                egui::DragValue::new(&mut f.drop_every_n_frames)
+                    .range(0..=100u32)
+                    .suffix(" 帧"),
+            );
+            ui.end_row();
+
+            ui.label("CRC 错");
+            ui.add(
+                egui::DragValue::new(&mut f.crc_err_every_n_frames)
+                    .range(0..=100u32)
+                    .suffix(" 帧"),
+            );
+            ui.end_row();
+
+            ui.label("延迟尖峰概率");
+            ui.add(egui::DragValue::new(&mut f.latency_spike_probability).range(0.0..=1.0));
+            ui.end_row();
+
+            ui.label("尖峰时长");
+            ui.add(
+                egui::DragValue::new(&mut f.latency_spike_ms)
+                    .range(0..=5000u64)
+                    .suffix(" ms"),
+            );
+            ui.end_row();
+        });
+
+    ui.checkbox(&mut f.no_trigger, "永不触发")
+        .on_hover_text("验证「等触发超时」这条路不会卡死界面");
+    ui.checkbox(&mut f.force_overrun, "强制溢出")
+        .on_hover_text("验证界面会如实标记数据不完整，而不是假装正常");
+
+    ui.horizontal(|ui| {
+        if ui.button("注入").clicked() {
+            app.worker
+                .send(Request::SetFaults(Box::new(app.faults.clone())));
+        }
+        if ui.button("清除全部").clicked() {
+            app.faults = scope_sim::FaultInjection::default();
+            app.worker
+                .send(Request::SetFaults(Box::new(app.faults.clone())));
+        }
+    });
+}
+
+/// 中央区：能力边界帮助页。
+///
+/// 文档明确要求这些限制「必须写进 UI 与文档预期」——
+/// 不写的话，用户会拿它去测它根本测不了的东西，然后以为是 bug。
+pub fn help_page(app: &mut App, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.heading("能力边界");
+        if ui.button("← 返回波形").clicked() {
+            app.show_help = false;
+        }
+    });
+    ui.separator();
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        ui.strong("能做");
+        for s in [
+            "I2C 协议解码：100 kHz / 400 kHz / 1 MHz（走数字通路，13.9 ns 边沿时间戳）",
+            "模拟观察：≤ 100 kHz（低频、电源纹波、音频、总线分析）",
+            "双通道同步采样：857 kSPS / 通道",
+            "单次采集：4096 点（8 KB 环，这是 F103 的物理上限）",
+            "高/低压两档（机械拨动开关切换）",
+        ] {
+            ui.label(format!("  ✅ {s}"));
+        }
+
+        ui.add_space(8.0);
+        ui.strong("做不到");
+        for s in [
+            "采样率上限是 857142 Hz，不是 1 MSPS —— 任何文档、界面、宣传里都不许写 1 MSPS",
+            "1 MSPS 与 USB 并存（链路带宽不够）",
+            "深存储 / 外扩 SRAM（C8 中容量型号没有 FSMC）",
+            "带宽 > 0.5 MHz",
+            "I2C 时序合规性验证（tSU;DAT / tr 的 ns 级判定）",
+            "计量级测量、THD / SFDR、12-bit 绝对精度",
+            "AI 程控量程（SW2/SW3 是手拨开关，要改板）",
+        ] {
+            ui.label(format!("  ❌ {s}"));
+        }
+
+        ui.add_space(8.0);
+        ui.strong("两个容易误读的地方");
+        ui.label("  · 电压是【未标定】的换算（占位值 3.3V/4096、零点 2048）。真机需按设备 uid 标定后才准。");
+        ui.label("  · 上升时间的分辨率下限是 1 个采样周期，比这更快的边沿测不出来。");
+
+        ui.add_space(8.0);
+        ui.strong("为什么 400k / 1M 也能解");
+        ui.label(
+            "857 kSPS 的 ADC 本身解不了 400 kHz I2C（需要 3.33 MSPS），
+             所以协议解码走的是板上那颗 LM393 比较器接定时器输入捕获的数字通路 ——
+             它是事件驱动的，与采样率无关。ADC 通路负责「信号好不好」，
+             数字通路负责「协议对不对」，两条互补。",
+        );
+    });
+}
 
 /// 左侧：历史采集（最近 16 次，容量由 core 的 CaptureStore 决定）。
 pub fn history(app: &mut App, ui: &mut egui::Ui) {

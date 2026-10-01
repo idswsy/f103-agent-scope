@@ -88,6 +88,12 @@ pub struct App {
     pub(crate) show_volts: bool,
     /// 泳道是否重叠显示（默认分开，即示波器的 stacked 模式）。
     pub(crate) lanes_overlap: bool,
+    /// 当前连接的是不是模拟器 —— 决定「故障注入」面板要不要出现。
+    pub(crate) simulated: bool,
+    /// 待注入的故障配置（UI 意图，点「注入」才生效）。
+    pub(crate) faults: scope_sim::FaultInjection,
+    /// 帮助页是否打开。
+    pub(crate) show_help: bool,
     /// `--demo` 的状态机：0=未开始 1=已发连接 2=已发采集。
     demo_stage: u8,
 }
@@ -138,6 +144,9 @@ impl App {
             fit_pending: false,
             show_volts: true,
             lanes_overlap: false,
+            simulated: false,
+            faults: scope_sim::FaultInjection::default(),
+            show_help: false,
             demo_stage: if demo { 0 } else { 3 },
         };
 
@@ -180,6 +189,7 @@ impl App {
                 info,
                 config,
                 state,
+                simulated,
             } => {
                 self.note(format!(
                     "已连接 {} 通道 / 上限 {} Hz",
@@ -189,12 +199,14 @@ impl App {
                 self.config = config;
                 self.state = Some(state);
                 self.connected = true;
+                self.simulated = simulated;
                 self.last_error = None;
             }
 
             Update::Disconnected => {
                 self.note("已断开");
                 self.connected = false;
+                self.simulated = false;
                 self.info = None;
                 self.config = None;
                 self.state = None;
@@ -363,6 +375,11 @@ impl eframe::App for App {
                     panels::config(self, ui);
                     ui.separator();
                     panels::history(self, ui);
+                    // 故障注入只在模拟器连接时才有意义 —— 真机上没有这个开关
+                    if self.simulated {
+                        ui.separator();
+                        panels::faults(self, ui);
+                    }
                     ui.separator();
                     panels::log(self, ui);
                 });
@@ -387,7 +404,14 @@ impl eframe::App for App {
                 });
         }
 
-        egui::CentralPanel::default().show(ui, |ui| panels::plot(self, ui));
+        egui::CentralPanel::default().show(ui, |ui| {
+            // 帮助页顶掉波形（不做成浮层 Window —— 0.36 的 Window API 我还没核实过）
+            if self.show_help {
+                panels::help_page(self, ui);
+            } else {
+                panels::plot(self, ui);
+            }
+        });
     }
 
     /// 收尾。注意签名**不带 `glow::Context`** —— eframe 0.36 的默认渲染后端是

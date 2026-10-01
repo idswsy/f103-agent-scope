@@ -212,6 +212,9 @@ impl WorkerState {
                             info,
                             config: bus.config.clone(),
                             state,
+                            // `is_simulated()` 由传输层如实回答（Transport 转发给 SimDevice）。
+                            // 漏转发的话这里会一直报 false，模拟器面板就永远不出现。
+                            simulated: bus.is_simulated(),
                         });
                         self.bus = Some(bus);
                     }
@@ -302,6 +305,22 @@ impl WorkerState {
                             "当前连接的不是模拟器，无法切换波形场景".into(),
                         )),
                     }
+                });
+                match r {
+                    Ok(()) => self.emit(Update::StateChanged(State::Idle)),
+                    Err(e) => self.fail(&e),
+                }
+            }
+
+            Request::SetFaults(faults) => {
+                let r = self.with_bus("注入故障", |bus| match bus.port_mut().sim_mut() {
+                    Some(sim) => {
+                        sim.faults = *faults;
+                        Ok(())
+                    }
+                    None => Err(ScopeError::Unsupported(
+                        "当前连接的不是模拟器，无法注入故障".into(),
+                    )),
                 });
                 match r {
                     Ok(()) => self.emit(Update::StateChanged(State::Idle)),
