@@ -86,11 +86,18 @@ pub struct App {
     pub(crate) fit_pending: bool,
     /// 显示电压还是 LSB。
     pub(crate) show_volts: bool,
+    /// `--demo` 的状态机：0=未开始 1=已发连接 2=已发采集。
+    demo_stage: u8,
 }
 
 impl App {
     /// 建一个 App 并挂上 worker。
-    pub fn new(ctx: &egui::Context, font: FontOutcome) -> App {
+    pub fn new(
+        ctx: &egui::Context,
+        font: FontOutcome,
+        demo: bool,
+        scenario: Option<Scenario>,
+    ) -> App {
         let worker = Worker::spawn(ctx.clone());
         // 首启预选模拟器 + I2C 场景 —— 零硬件的人双击就能看到东西
         worker.send(Request::ListPorts);
@@ -100,7 +107,7 @@ impl App {
             transport_kind: TransportKind::Sim,
             port: String::new(),
             baud: 921_600,
-            scenario: Scenario::I2c100k,
+            scenario: scenario.unwrap_or(Scenario::I2c100k),
             ports: Vec::new(),
 
             info: None,
@@ -128,6 +135,7 @@ impl App {
             font_notice: font.notice(),
             fit_pending: false,
             show_volts: true,
+            demo_stage: if demo { 0 } else { 3 },
         };
 
         // 字体去向写进日志 —— 加载成功也留一条，方便排查「为什么中文是方框」
@@ -215,6 +223,9 @@ impl App {
                     msg.push_str("  · 无触发点（软触发）");
                 }
                 self.note(msg);
+                // 这次采集成功了，上一次的错误就不再适用 —— 不清的话，
+                // 之前那条红字会一直挂在底栏
+                self.last_error = None;
                 self.fit_pending = true;
                 self.store.push(cap.clone());
                 self.capture = Some(cap);
@@ -245,6 +256,16 @@ impl App {
             self.decode = None;
             return;
         };
+
+        // I2C 解码至少要两条线。单通道采集（正弦 / 方波 / 直流…）**不是错误**，
+        // 只是这个场景没有 I2C 可解 —— 静默跳过。
+        // 回归：之前这里会一路走到 decode_capture 报 InvalidParam，
+        // 于是用户抓个正弦波都会看到一条红字错误。
+        if cap.channels.len() < 2 {
+            self.decode = None;
+            return;
+        }
+
         let cfg = I2cDecodeConfig {
             scl_channel: self.scl_channel,
             sda_channel: self.sda_channel,
@@ -289,6 +310,31 @@ impl eframe::App for App {
             }
         }
 
+        // --demo：先连模拟器，连上了再采一次。
+        // 用级联的 stage 而不是一个 bool —— 连接是异步的，得等回执。
+        match self.demo_stage {
+            0 if !self.is_busy() => {
+                self.demo_stage = 1;
+                self.worker.send(Request::Connect {
+                    transport: TransportKind::Sim,
+                    port: String::new(),
+                    baud: 921_600,
+                    scenario: self.scenario,
+                });
+            }
+            // 连接失败就一直停在 1 —— 不重试，免得每帧刷屏
+            1 if self.connected && !self.is_busy() => {
+                self.demo_stage = 2;
+                self.worker.send(Request::Acquire {
+                    samples: self.want_samples,
+                    rate_hz: self.want_rate,
+                    trigger_level_lsb: self.want_trigger_level,
+                    timeout_ms: 2000,
+                });
+            }
+            _ => {}
+        }
+
         self.refresh_decode();
     }
 
@@ -297,7 +343,8 @@ impl eframe::App for App {
         egui::Panel::bottom("statusbar").show(ui, |ui| panels::status_bar(self, ui));
         egui::Panel::left("side")
             .resizable(true)
-            .default_size(320.0)
+            .default_size(288.0)
+            .size_range(240.0..=460.0)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     panels::device(self, ui);
@@ -307,6 +354,19 @@ impl eframe::App for App {
                     panels::log(self, ui);
                 });
             });
+        // 解码区必须自己占一个面板。`Plot::show` 会**吃掉所有可用高度**，
+        // 直接跟在它后面的东西会被整个挤出屏幕 —— 交易表和色标就是这么消失的。
+        // 解码面板只在真有 I2C 可解的时候出现（≥2 通道）。单通道采集时它
+        // 占着 250px 却什么都做不了，白挤波形的高度。
+        let ch_count = self.capture.as_ref().map(|c| c.channels.len()).unwrap_or(0);
+        if ch_count >= 2 {
+            egui::Panel::bottom("decode")
+                .resizable(true)
+                .default_size(250.0)
+                .size_range(110.0..=520.0)
+                .show(ui, |ui| panels::decode_panel(self, ui));
+        }
+
         egui::CentralPanel::default().show(ui, |ui| panels::plot(self, ui));
     }
 

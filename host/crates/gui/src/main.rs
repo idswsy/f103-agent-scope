@@ -31,6 +31,8 @@
 #![deny(clippy::all)]
 #![warn(missing_docs)]
 
+use scope_sim::Scenario;
+
 mod app;
 mod font;
 mod msg;
@@ -48,6 +50,18 @@ fn main() -> eframe::Result<()> {
         .find(|w| w[0] == "--font")
         .map(|w| w[1].clone());
 
+    // --demo：启动后自动连模拟器并采一次。
+    // 用途一是给零硬件的人一个"打开就有东西看"的入口（也方便截图核对布局），
+    // 用途二是空状态和满状态的布局差很多，调界面时需要在两者之间切换。
+    let demo = args.iter().any(|a| a == "--demo");
+
+    // --scenario <name>：指定初始模拟器场景。
+    // 逐场景核对波形显示时用得上（界面上那个下拉框没法用脚本点）。
+    let scenario = args
+        .windows(2)
+        .find(|w| w[0] == "--scenario")
+        .and_then(|w| Scenario::parse(&w[1]));
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 760.0])
@@ -62,7 +76,12 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             // 字体必须在建 App 之前装好 —— 界面全是中文，缺字体就是满屏方框
             let outcome = font::install(&cc.egui_ctx, font_override.as_deref());
-            Ok(Box::new(app::App::new(&cc.egui_ctx, outcome)))
+            Ok(Box::new(app::App::new(
+                &cc.egui_ctx,
+                outcome,
+                demo,
+                scenario,
+            )))
         }),
     )
 }

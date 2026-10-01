@@ -14,7 +14,7 @@
 //! - **伏特换算只发生在显示层**。控制链路和存储里全是 ADC LSB 整数，
 //!   `ChannelScale` 是唯一的换算点（ADR-006）。
 
-use scope_core::i2c_decode::{EventKind, I2cDecode};
+use scope_core::i2c_decode::{EventKind, I2cDecode, I2cWarning};
 use scope_core::{Capture, ChannelScale};
 
 /// 一段带标注的时间区间，画在数字泳道上。
@@ -155,9 +155,53 @@ pub fn transaction_summary(decode: &I2cDecode) -> Vec<String> {
         .collect()
 }
 
-/// 告警文案 —— 直接复用 core 里的 `I2cWarning::text()`，不在这里另写一份。
+/// 面板上要显示的告警文案（复用 core 的 `I2cWarning::text()`，不另写一份）。
+///
+/// **滤掉 `TruncatedFrame`**：采集窗口切断最后一帧是**每次采集都必然发生**的
+/// —— I2C 总线一直在跑，4.778 ms 的窗口切在哪儿是随机的，切在两笔事务之间
+/// 才是小概率。把它标成黄色警告，等于一个天天亮着的警报，真正的问题
+/// （CRC 错、判决带告警）会被一起忽略。
+///
+/// 信息本身没丢：交易表里那一帧标着「(截断)」，图上那段也是灰色色块。
+///
+/// 注意 `I2cDecode::warnings` 里**仍然保留**这一条 —— MCP 侧的 Agent 需要它，
+/// 否则会把「共 16 帧」当成 16 笔完整事务来回答。
 pub fn warning_lines(decode: &I2cDecode) -> Vec<String> {
-    decode.warnings.iter().map(|w| w.text()).collect()
+    decode
+        .warnings
+        .iter()
+        .filter(|w| !matches!(w, I2cWarning::TruncatedFrame))
+        .map(|w| w.text())
+        .collect()
+}
+
+/// 没有 I2C 解码结果时，估一个合适的显示窗口。
+///
+/// 用 [`ChannelSummary::rising_edges`] 反推周期 —— 那个数 core 已经算好了，
+/// 不需要在这里重扫一遍样点。
+///
+/// 目标是「大约 4 个周期」：1 kHz 正弦能看全，50 kHz 方波也看得清沿。
+/// 没有边沿（直流）就全览；边沿太密（噪声，每个过零点都算一次）则退回 5% 打底，
+/// 否则会缩到只剩几十个样点，屏幕上什么也看不出。
+///
+/// [`ChannelSummary::rising_edges`]: scope_core::ChannelSummary
+pub fn suggest_span_us(cap: &Capture) -> f64 {
+    let total = duration_us(cap);
+    if total <= 0.0 {
+        return 1.0;
+    }
+
+    let edges = (0..cap.channels.len())
+        .filter_map(|ch| cap.summary(ch))
+        .map(|s| s.rising_edges)
+        .max()
+        .unwrap_or(0);
+
+    if edges < 2 {
+        return total; // 直流 / 几乎不变：全览
+    }
+    let period_us = total / edges as f64;
+    (period_us * 4.6).max(total / 20.0).min(total)
 }
 
 #[cfg(test)]
@@ -303,6 +347,68 @@ mod tests {
         assert!(
             !warning_lines(&d).is_empty(),
             "没信号必须给出告警，不能静默返回空结果"
+        );
+    }
+
+    #[test]
+    fn span_adapts_to_the_signal_frequency() {
+        // 低频信号（1 kHz 正弦，4.778 ms 里才 ~5 个周期）必须全览，
+        // 否则只看得到一小段单调上升的曲线 —— 这正是这个函数存在的理由。
+        let mut low = Capture::new(1, 857_142, 1, 4096);
+        low.channels = vec![vec![2048u16; 4096]];
+        // 手工塞 5 个上升沿：每 800 点翻越一次中点
+        for i in 0..4096 {
+            let seg = i / 800;
+            low.channels[0][i] = if seg % 2 == 0 { 3000 } else { 1000 };
+        }
+        let s = suggest_span_us(&low);
+        assert!(
+            (s - duration_us(&low)).abs() < 1.0,
+            "低频应全览，实测 {s} µs / 总长 {} µs",
+            duration_us(&low)
+        );
+
+        // 直流（无边沿）也应该是全览
+        let mut dc = Capture::new(1, 857_142, 1, 4096);
+        dc.channels = vec![vec![2048u16; 4096]];
+        assert!((suggest_span_us(&dc) - duration_us(&dc)).abs() < 1.0);
+
+        // 高频方波：应缩到几个周期，而不是全览
+        let mut fast = Capture::new(1, 857_142, 1, 4096);
+        fast.channels = vec![(0..4096)
+            .map(|i| if (i / 10) % 2 == 0 { 3000 } else { 1000 })
+            .collect()];
+        let sf = suggest_span_us(&fast);
+        assert!(
+            sf < duration_us(&fast) * 0.5,
+            "高频应放大到几个周期，实测 {sf} µs（总长 {}）",
+            duration_us(&fast)
+        );
+        assert!(sf > 1.0);
+    }
+
+    #[test]
+    fn truncated_frame_stays_in_core_but_is_hidden_from_the_panel() {
+        // 采集窗口切断最后一帧是**必然事件**（I2C 总线一直在跑，4.778 ms 的
+        // 窗口切在两笔事务之间才是小概率），所以面板上不该亮黄灯。
+        // 但 core 的 warnings 里必须留着 —— MCP 侧的 Agent 要靠它判断
+        // 「共 N 帧」里有几帧是不完整的。
+        let mut cap = sample_capture();
+        for ch in cap.channels.iter_mut() {
+            ch.truncate(200); // 砍在第三个字节中间，制造一次截断
+        }
+        let d = scope_core::decode_capture(&cap, &I2cDecodeConfig::default()).unwrap();
+
+        assert!(
+            d.warnings
+                .iter()
+                .any(|w| matches!(w, I2cWarning::TruncatedFrame)),
+            "core 的 warnings 不应滤掉 TruncatedFrame，Agent 需要它"
+        );
+        assert!(
+            !warning_lines(&d).iter().any(|l| l.contains("截断")),
+            "面板不应显示截断告警，实测 {:?}",
+            warning_lines(&d)
         );
     }
 
