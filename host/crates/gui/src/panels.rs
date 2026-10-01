@@ -359,10 +359,11 @@ pub fn faults(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
-/// 中央区：能力边界帮助页。
+/// 中央区：能力边界。
 ///
-/// 文档明确要求这些限制「必须写进 UI 与文档预期」——
-/// 不写的话，用户会拿它去测它根本测不了的东西，然后以为是 bug。
+/// 写成**规格文档**的样子，不是"给你讲解" —— 客观陈述、表格化、不用
+/// emoji、不用第二人称。文档要求这些限制「必须写进 UI 与预期」，
+/// 目的是让人查得到，不是让人读得感动。
 pub fn help_page(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.heading("能力边界");
@@ -371,46 +372,70 @@ pub fn help_page(app: &mut App, ui: &mut egui::Ui) {
         }
     });
     ui.separator();
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        ui.strong("能做");
-        for s in [
-            "I2C 协议解码：100 kHz / 400 kHz / 1 MHz（走数字通路，13.9 ns 边沿时间戳）",
-            "模拟观察：≤ 100 kHz（低频、电源纹波、音频、总线分析）",
-            "双通道同步采样：857 kSPS / 通道",
-            "单次采集：4096 点（8 KB 环，这是 F103 的物理上限）",
-            "高/低压两档（机械拨动开关切换）",
-        ] {
-            ui.label(format!("  ✅ {s}"));
-        }
 
-        ui.add_space(8.0);
-        ui.strong("做不到");
-        for s in [
-            "采样率上限是 857142 Hz，不是 1 MSPS —— 任何文档、界面、宣传里都不许写 1 MSPS",
-            "1 MSPS 与 USB 并存（链路带宽不够）",
-            "深存储 / 外扩 SRAM（C8 中容量型号没有 FSMC）",
-            "带宽 > 0.5 MHz",
-            "I2C 时序合规性验证（tSU;DAT / tr 的 ns 级判定）",
-            "计量级测量、THD / SFDR、12-bit 绝对精度",
-            "AI 程控量程（SW2/SW3 是手拨开关，要改板）",
-        ] {
-            ui.label(format!("  ❌ {s}"));
-        }
+    egui::ScrollArea::vertical()
+        .id_salt("help_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new("caps")
+                .num_columns(2)
+                .spacing([18.0, 4.0])
+                .show(ui, |ui| {
+                    ui.strong("测量能力");
+                    ui.label("");
+                    ui.end_row();
+                    for (k, v) in [
+                        ("I2C 协议解码", "100 kHz / 400 kHz / 1 MHz"),
+                        ("模拟带宽", "≤ 100 kHz"),
+                        ("采样率", "双通道同步 857 kSPS / 通道"),
+                        ("单次采集深度", "4096 点"),
+                        ("触发电平迟滞", "±16 LSB"),
+                    ] {
+                        ui.label(format!("    {k}"));
+                        ui.monospace(v);
+                        ui.end_row();
+                    }
+                });
 
-        ui.add_space(8.0);
-        ui.strong("两个容易误读的地方");
-        ui.label("  · 电压是【未标定】的换算（占位值 3.3V/4096、零点 2048）。真机需按设备 uid 标定后才准。");
-        ui.label("  · 上升时间的分辨率下限是 1 个采样周期，比这更快的边沿测不出来。");
+            ui.add_space(10.0);
+            ui.strong("不支持");
+            ui.add_space(2.0);
+            // 用普通列表而不是 Grid —— 这两列里第一列是空的，Grid 会把
+            // 各行的缩进按最宽单元格对齐，首行反而跟别的行对不齐。
+            for v in [
+                "1 MSPS 与 USB 并存",
+                "深存储 / 外扩 SRAM",
+                "带宽 > 0.5 MHz",
+                "I2C 时序合规性验证（tSU;DAT / tr 的 ns 级判定）",
+                "计量级测量、THD / SFDR、12-bit 绝对精度",
+                "程控量程（量程切换为机械开关）",
+            ] {
+                ui.label(format!("    {v}"));
+            }
 
-        ui.add_space(8.0);
-        ui.strong("为什么 400k / 1M 也能解");
-        ui.label(
-            "857 kSPS 的 ADC 本身解不了 400 kHz I2C（需要 3.33 MSPS），
-             所以协议解码走的是板上那颗 LM393 比较器接定时器输入捕获的数字通路 ——
-             它是事件驱动的，与采样率无关。ADC 通路负责「信号好不好」，
-             数字通路负责「协议对不对」，两条互补。",
-        );
-    });
+            ui.add_space(10.0);
+            ui.strong("注意事项");
+            ui.add_space(2.0);
+            // ⚠ 这些字符串**不要用 `\` 续行**：续行后源码里的缩进会原样
+            // 进到字符串里，渲染出来每句中间凭空多一大段空白。
+            let notes = [
+                "采样率上限为 857 142 Hz。设备按 72 MHz 定时器整数分频得到档位，请求值会被量化；时间轴一律以设备回显的实际值为准。",
+                "电压换算使用未标定的占位参数（3.3 V / 4096、零点 2048）。接入实机后需按设备 UID 标定。",
+                "上升时间的分辨率下限为 1 个采样周期，更快的边沿无法分辨。",
+                "频率与占空比已排除事务之间的空闲区间；非周期信号（如数据线）报出的是边沿速率。",
+                "协议解码走数字通路（LM393 比较器 + 定时器输入捕获，13.9 ns 分辨率），与 ADC 采样率无关；ADC 通路负责信号质量评估。两条通路互补：前者回答协议是否正确，后者回答信号是否良好。",
+            ];
+            for t in notes {
+                ui.label(format!("    · {t}"));
+            }
+
+            ui.add_space(14.0);
+            ui.separator();
+            ui.weak(format!(
+                "scope-gui {}  ·  协议 v1  ·  设计与性能数据见 docs/",
+                scope_core::VERSION
+            ));
+        });
 }
 
 /// 左侧：历史采集（最近 16 次，容量由 core 的 CaptureStore 决定）。

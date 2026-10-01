@@ -389,7 +389,9 @@ impl eframe::App for App {
         //
         // 有采集就显示：**测量对任何信号都适用**，不只是 I2C。里面的解码部分
         // 会自己在通道数 < 2 时让位。
-        if self.capture.is_some() {
+        // 看帮助时把详情面板收起来 —— 帮助页内容本来就长，再被底部占掉 270px
+        // 就只能滚动着看，没必要。
+        if self.capture.is_some() && !self.show_help {
             egui::Panel::bottom("detail")
                 .resizable(true)
                 .default_size(270.0)
