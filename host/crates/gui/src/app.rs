@@ -86,6 +86,8 @@ pub struct App {
     pub(crate) fit_pending: bool,
     /// 显示电压还是 LSB。
     pub(crate) show_volts: bool,
+    /// 泳道是否重叠显示（默认分开，即示波器的 stacked 模式）。
+    pub(crate) lanes_overlap: bool,
     /// `--demo` 的状态机：0=未开始 1=已发连接 2=已发采集。
     demo_stage: u8,
 }
@@ -135,6 +137,7 @@ impl App {
             font_notice: font.notice(),
             fit_pending: false,
             show_volts: true,
+            lanes_overlap: false,
             demo_stage: if demo { 0 } else { 3 },
         };
 
@@ -227,6 +230,14 @@ impl App {
                 // 之前那条红字会一直挂在底栏
                 self.last_error = None;
                 self.fit_pending = true;
+
+                // 通道数可能变少（比如从双通道场景切到单通道），
+                // 把通道选择夹回合法范围 —— 越界的话解码会直接报错。
+                let n = self.capture.as_ref().map(|c| c.channels.len()).unwrap_or(0);
+                if n > 0 {
+                    self.scl_channel = self.scl_channel.min(n - 1);
+                    self.sda_channel = self.sda_channel.min(n - 1);
+                }
                 self.store.push(cap.clone());
                 self.capture = Some(cap);
                 self.decode_dirty.store(true, Ordering::Relaxed);
@@ -351,20 +362,29 @@ impl eframe::App for App {
                     ui.separator();
                     panels::config(self, ui);
                     ui.separator();
+                    panels::history(self, ui);
+                    ui.separator();
                     panels::log(self, ui);
                 });
             });
-        // 解码区必须自己占一个面板。`Plot::show` 会**吃掉所有可用高度**，
+        // 详情面板必须自己占一个面板。`Plot::show` 会**吃掉所有可用高度**，
         // 直接跟在它后面的东西会被整个挤出屏幕 —— 交易表和色标就是这么消失的。
-        // 解码面板只在真有 I2C 可解的时候出现（≥2 通道）。单通道采集时它
-        // 占着 250px 却什么都做不了，白挤波形的高度。
-        let ch_count = self.capture.as_ref().map(|c| c.channels.len()).unwrap_or(0);
-        if ch_count >= 2 {
-            egui::Panel::bottom("decode")
+        //
+        // 有采集就显示：**测量对任何信号都适用**，不只是 I2C。里面的解码部分
+        // 会自己在通道数 < 2 时让位。
+        if self.capture.is_some() {
+            egui::Panel::bottom("detail")
                 .resizable(true)
-                .default_size(250.0)
-                .size_range(110.0..=520.0)
-                .show(ui, |ui| panels::decode_panel(self, ui));
+                .default_size(270.0)
+                .size_range(90.0..=560.0)
+                .show(ui, |ui| {
+                    // 内容可能比面板高（测量 + 色标 + 质量 + 交易表），
+                    // 没有这层 ScrollArea 的话超出的部分会被直接裁掉
+                    egui::ScrollArea::vertical()
+                        .id_salt("detail_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| panels::detail_panel(self, ui));
+                });
         }
 
         egui::CentralPanel::default().show(ui, |ui| panels::plot(self, ui));

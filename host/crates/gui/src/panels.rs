@@ -290,6 +290,40 @@ pub fn config(app: &mut App, ui: &mut egui::Ui) {
 /// 配置面板里控件的统一宽度。
 const CTRL_W: f32 = 150.0;
 
+/// 左侧：历史采集（最近 16 次，容量由 core 的 CaptureStore 决定）。
+pub fn history(app: &mut App, ui: &mut egui::Ui) {
+    ui.heading("历史采集");
+    if app.store.is_empty() {
+        ui.weak("还没有采集。采集一次后会留在这里，点一下就能回看。");
+        return;
+    }
+
+    let current = app.capture.as_ref().map(|c| c.id);
+    let entries: Vec<(u16, u32, u64, bool)> = app
+        .store
+        .iter()
+        .map(|c| (c.id, c.rate_hz, c.wall_time, c.overrun))
+        .collect();
+
+    egui::ScrollArea::vertical()
+        .id_salt("hist")
+        .max_height(120.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for (id, rate, _t, overrun) in entries {
+                let label = format!("#{id}  {} Hz{}", rate, if overrun { "  ⚠溢出" } else { "" });
+                if ui.selectable_label(current == Some(id), label).clicked() {
+                    // 回看历史：换掉当前采集并重算解码，**不重抓**
+                    if let Some(c) = app.store.get(id) {
+                        app.capture = Some(c.clone());
+                        app.mark_decode_dirty();
+                        app.fit_pending = true;
+                    }
+                }
+            }
+        });
+}
+
 /// 左侧：滚动日志。
 pub fn log(app: &mut App, ui: &mut egui::Ui) {
     ui.heading("日志");
@@ -375,12 +409,31 @@ pub fn plot(app: &mut App, ui: &mut egui::Ui) {
     let ch_count = cap.channels.len().max(1);
     let scale = ChannelScale::default();
 
+    // 操作提示与重置按钮。egui_plot 的缩放/平移是内置的，但**用户不知道** ——
+    // 不给提示的话没人会去滚轮。另外缩进去之后没有出口，得给个按钮。
+    ui.horizontal(|ui| {
+        if ui.small_button("重置缩放").clicked() {
+            app.fit_pending = true;
+        }
+        ui.checkbox(&mut app.lanes_overlap, "泳道重叠")
+            .on_hover_text("打开后两条泳道同基线，看时序错开更直观");
+        ui.weak("· 滚轮缩放 · 拖拽平移 · 双击重置");
+    });
+
     // ── 布局常量（虚拟 y 坐标，不是电压）──
     const LANE_H: f64 = 3.2; // 一条泳道的高度（信号本身 0~2.8V，留点余量）
     const LANE_GAP: f64 = 0.7; // 泳道间隔
     const DECODE_H: f64 = 1.7; // 底部解码带的高度
 
-    let lane_bottom = |i: usize| -> f64 { -(i as f64) * (LANE_H + LANE_GAP) };
+    // 重叠模式：所有泳道同基线 —— 看两路信号**时序上的错开**更直观
+    // （比如 SDA 在 SCL 高电平期间变化 = START/STOP）。
+    // 分开模式：纵向错开，看各自的波形形状更清楚。
+    let lane_step = if app.lanes_overlap {
+        0.0
+    } else {
+        LANE_H + LANE_GAP
+    };
+    let lane_bottom = |i: usize| -> f64 { -(i as f64) * lane_step };
     // 解码带要贴在**最后一条泳道的下方**。
     // 回归：这里曾经写成 `lane_bottom(ch_count)`，那是"再往下一条泳道"的位置，
     // 于是 2 通道时中间凭空多出 4.9 个单位的空白。
@@ -442,7 +495,14 @@ pub fn plot(app: &mut App, ui: &mut egui::Ui) {
         } else {
             format!("CH{}", ch + 1)
         };
-        lane_labels.push((span_txt, base + LANE_H * 0.5));
+        // 重叠模式下所有泳道同基线，标签会叠在同一个位置互相盖住 ——
+        // 按通道号纵向错开。分开模式下各泳道本来就不在一处，居中即可。
+        let label_y = if app.lanes_overlap {
+            LANE_H * (0.42 - ch as f64 * 0.20)
+        } else {
+            base + LANE_H * 0.5
+        };
+        lane_labels.push((span_txt, label_y));
 
         series.push((format!("CH{}", ch + 1), pts, palette[ch % palette.len()]));
     }
@@ -672,7 +732,99 @@ fn span_color(kind: SpanKind, nack: bool) -> egui::Color32 {
 }
 
 /// 底部面板：解码结果（参数、质量、告警、交易表）。
-pub fn decode_panel(app: &mut App, ui: &mut egui::Ui) {
+pub fn detail_panel(app: &mut App, ui: &mut egui::Ui) {
+    measure_section(app, ui);
+    ui.separator();
+    decode_panel(app, ui);
+}
+
+/// 测量结果 —— 每个通道一行。
+fn measure_section(app: &mut App, ui: &mut egui::Ui) {
+    let Some(cap) = app.capture.clone() else {
+        return;
+    };
+    let scale = ChannelScale::default();
+
+    ui.horizontal(|ui| {
+        ui.strong("测量");
+        if ui
+            .button("导出 CSV")
+            .on_hover_text("全量样点落盘（不进界面、不占内存）")
+            .clicked()
+        {
+            let path = capture_path(&cap, "csv");
+            let scales: Vec<ChannelScale> = (0..cap.channels.len()).map(|_| scale).collect();
+            match std::fs::write(&path, cap.to_csv(&scales)) {
+                Ok(()) => app.note(format!("已写出 {path}")),
+                Err(e) => app.note(format!("✗ 写 CSV 失败：{e}")),
+            }
+        }
+        if app.decode.is_some() && ui.button("导出解码结果").clicked() {
+            let text = app.decode.as_ref().map(|d| d.to_text()).unwrap_or_default();
+            let path = capture_path(&cap, "i2c.txt");
+            match std::fs::write(&path, text) {
+                Ok(()) => app.note(format!("已写出 {path}")),
+                Err(e) => app.note(format!("✗ 写解码结果失败：{e}")),
+            }
+        }
+    });
+
+    for ch in 0..cap.channels.len() {
+        let Some(m) = vmodel::measure(&cap, ch, &scale) else {
+            continue;
+        };
+        let freq = m
+            .freq_hz
+            .map(|f| format!("{:.1} kHz", f / 1000.0))
+            .unwrap_or_else(|| "—".into());
+        let duty = m
+            .duty_pct
+            .map(|d| format!("{d:.1}%"))
+            .unwrap_or_else(|| "—".into());
+        let rise = m
+            .rise_ns
+            .map(|r| format!("{r:.0} ns"))
+            .unwrap_or_else(|| "—".into());
+        ui.monospace(format!(
+            "CH{:<2}  Vpp {:>6.2} V   均值 {:>6.2} V   有效值 {:>6.2} V   频率 {:>10}   占空比 {:>6}   上升 {:>8}",
+            ch + 1,
+            m.vpp,
+            m.mean,
+            m.ac_rms,
+            freq,
+            duty,
+            rise
+        ));
+    }
+    // 这几个边界必须写出来，否则数字会被过度解读：
+    // 「有效值」是扣除直流后的 RMS（交流信号看这个）；频率/占空比排除了
+    // 事务间的空闲（否则 100 kHz 会被算成 95 kHz）；上升时间受采样率限制；
+    // 数据线的「频率」只是跳变速率，不是时钟。
+    let dt_ns = if cap.rate_hz > 0 {
+        1e9 / cap.rate_hz as f64
+    } else {
+        0.0
+    };
+    ui.weak(format!(
+        "有效值 = 扣除直流后的 RMS · 占空比按 min/max 中值判定（与解码门限无关）\
+         · 频率与占空比已排除事务间空闲 · 上升时间分辨率下限 1 个采样周期（{dt_ns:.0} ns）\
+         · 非周期信号（数据线）的「频率」只是边沿速率，参考意义有限"
+    ));
+}
+
+/// 生成导出路径：`<当前目录>/captures/<时间>_<id>.<后缀>`。
+///
+/// 不用文件对话框（`rfd` 在 Linux 上要拖 GTK 进 CI）；固定目录 + 把完整路径
+/// 写进日志，用户知道文件去哪了。
+fn capture_path(cap: &scope_core::Capture, ext: &str) -> String {
+    let dir = std::path::PathBuf::from("captures");
+    let _ = std::fs::create_dir_all(&dir);
+    // 用采集编号 + 采样率命名，不用墙钟（避免依赖时间函数，也便于复现）
+    let name = format!("cap{}_{}Hz.{}", cap.id, cap.rate_hz, ext);
+    dir.join(name).to_string_lossy().into_owned()
+}
+
+fn decode_panel(app: &mut App, ui: &mut egui::Ui) {
     // ★ 色标的**唯一**一份在这里。
     // 不要同时在 `plot()` 末尾再画一次：`Plot::show` 会吃掉所有可用高度，
     // 那一份会被压成零高、只漏出一排残影，看起来像界面错位了。
@@ -684,27 +836,58 @@ pub fn decode_panel(app: &mut App, ui: &mut egui::Ui) {
         let has_cap = app.capture.is_some();
         let ch_count = app.capture.as_ref().map(|c| c.channels.len()).unwrap_or(0);
 
-        // ⚠ 上下限不能用 `ch_count - 1` 直接算：还没有采集时 ch_count = 0，
-        // 范围就成了 0..=0，`DragValue` 会**静默把 sda_channel 从 1 夹成 0**
-        // ——`add_enabled(false)` 挡不住这个。结果两条线都指向通道 0，解码出 0 帧。
-        // 所以没数据时给一个宽松范围，只做显示、不做约束。
-        let ch_max = if ch_count > 0 {
-            (ch_count - 1) as u32
-        } else {
-            3
-        };
-
         ui.separator();
+        // 用下拉框而不是 `DragValue`。后者有个坑：它的 range 在**渲染时就会夹值**，
+        // 而 `add_enabled(false)` 挡不住 —— 没采集时 ch_count=0，范围算成 0..=0，
+        // 会把 sda_channel 从 1 悄悄夹成 0，两条线都指向同一条通道，
+        // 界面看着正常却永远解不出东西。下拉框只可能设成合法值，从根上没有这个问题。
+        let names: Vec<String> = (0..ch_count.max(1))
+            .map(|i| format!("CH{}", i + 1))
+            .collect();
+        let label_of =
+            |idx: usize| -> String { names.get(idx).cloned().unwrap_or_else(|| "—".into()) };
+
         ui.label("SCL");
-        ui.add_enabled(
-            has_cap,
-            egui::DragValue::new(&mut app.scl_channel).range(0..=ch_max as usize),
-        );
+        ui.add_enabled_ui(has_cap, |ui| {
+            egui::ComboBox::from_id_salt("scl_ch")
+                .width(64.0)
+                .selected_text(label_of(app.scl_channel))
+                .show_ui(ui, |ui| {
+                    for (i, n) in names.iter().enumerate() {
+                        ui.selectable_value(&mut app.scl_channel, i, n);
+                    }
+                });
+        });
         ui.label("SDA");
-        ui.add_enabled(
-            has_cap,
-            egui::DragValue::new(&mut app.sda_channel).range(0..=ch_max as usize),
-        );
+        ui.add_enabled_ui(has_cap, |ui| {
+            egui::ComboBox::from_id_salt("sda_ch")
+                .width(64.0)
+                .selected_text(label_of(app.sda_channel))
+                .show_ui(ui, |ui| {
+                    for (i, n) in names.iter().enumerate() {
+                        ui.selectable_value(&mut app.sda_channel, i, n);
+                    }
+                });
+        });
+
+        if ui
+            .add_enabled(ch_count >= 2, egui::Button::new("自动检测"))
+            .on_hover_text("按边沿密度判断哪条是 SCL —— 通道接反时用")
+            .clicked()
+        {
+            let picked = app.capture.as_ref().and_then(|cap| {
+                scope_core::detect_channels(cap, app.decode_cfg.levels, app.decode_cfg.debounce_ns)
+            });
+            match picked {
+                Some((a, b)) => {
+                    app.scl_channel = a;
+                    app.sda_channel = b;
+                    app.mark_decode_dirty();
+                    app.note(format!("自动检测：SCL=CH{} SDA=CH{}", a + 1, b + 1));
+                }
+                None => app.note("自动检测失败：两条线都没有边沿"),
+            }
+        }
         ui.label("去抖");
         ui.add(
             egui::DragValue::new(&mut app.decode_cfg.debounce_ns)

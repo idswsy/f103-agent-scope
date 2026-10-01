@@ -66,7 +66,8 @@ venv/
 *.pdsprj
 
 # ── 采集数据（体积大，不入库） ─────────────────────────────────
-/captures/
+# 不带前导斜杠：GUI 从 host/ 目录启动时导出到 host/captures/，也要盖住
+captures/
 *.csv
 *.npy
 *.npz
