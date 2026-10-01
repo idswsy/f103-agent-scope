@@ -113,6 +113,13 @@ pub enum ScopeError {
     /// 未在预期时间内触发。
     #[error("未在 {0} ms 内触发；{1}")]
     NoTrigger(u64, String),
+
+    /// 操作被本地取消（用户在等待期间按了停止）。
+    ///
+    /// 与 [`NoTrigger`](Self::NoTrigger) 分开：那是「设备没触发」，
+    /// 这是「人不想等了」—— 两种情况的 UI 提示完全不同。
+    #[error("已取消：{0}")]
+    Cancelled(&'static str),
 }
 
 /// 结果别名。

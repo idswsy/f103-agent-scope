@@ -17,7 +17,8 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use scope_core::{
-    Capture, CaptureStore, ChannelScale, CommandBus, DevicePort, I2cDecodeConfig, Levels, State,
+    AcquireParams, Capture, CaptureStore, ChannelScale, CommandBus, DevicePort, I2cDecodeConfig,
+    Levels, State,
 };
 use scope_sim::{Scenario, SimDevice};
 use scope_transport_serial::{baud, SerialDevice};
@@ -489,94 +490,40 @@ fn capture_once<D: DevicePort>(
     level: u16,
     timeout_ms: u64,
 ) -> Result<Capture> {
-    let info = bus.connect()?;
+    bus.connect()?;
 
-    let actual = bus.set_sample_rate(rate)?;
-    if actual != rate {
+    // 采集编排在 core 里（`scope_core::acquire`）—— 它替我们处理了
+    // EVENT_TRIGGER 的 18 字节解析、分片上限、以及「没有触发点」的哨兵映射。
+    // CLI / GUI / MCP 三端共用这一份，不各写一遍。
+    let params = AcquireParams {
+        samples,
+        rate_hz: rate,
+        trigger_level_lsb: level,
+        timeout: std::time::Duration::from_millis(timeout_ms),
+    };
+    let capture = scope_core::acquire(bus, &params)?;
+
+    if capture.rate_hz != rate {
         println!(
             "# 采样率被量化: {} Hz → {} Hz（时间轴以 {} Hz 为准）",
-            rate, actual, actual
+            rate, capture.rate_hz, capture.rate_hz
         );
     }
-
-    bus.set_trigger(1, 0, 0, level, (samples / 2).min(2048), 1000)?; // normal / ch0 / 上升沿
-    bus.set_acq(0, samples, 0, 1)?; // 单次 / RAW16 / 不抽点
-    bus.arm()?;
-
-    let ev = bus
-        .wait_trigger(std::time::Duration::from_millis(timeout_ms))
-        .context("等待触发事件失败")?;
-
-    let ev = match ev {
-        Some(e) => e,
-        None => {
-            // 没触发不是崩溃 —— 给一条能自救的提示
-            let _ = bus.stop();
-            bail!(
-                "{} ms 内没有触发。\n\
-                 可以试试：\n  \
-                 • 降低触发电平（当前 {} LSB）\n  \
-                 · 改用 auto 模式\n  \
-                 · 确认信号真的接在通道 0 上",
-                timeout_ms,
-                level
-            );
-        }
-    };
-
-    let capture_id = u16::from_le_bytes([ev[0], ev[1]]);
-    let trigger_index = u32::from_le_bytes([ev[2], ev[3], ev[4], ev[5]]);
-    let trigger_tick = u32::from_le_bytes([ev[6], ev[7], ev[8], ev[9]]);
-    let rate_hz = u32::from_le_bytes([ev[10], ev[11], ev[12], ev[13]]);
-    let n_samples = u32::from_le_bytes([ev[14], ev[15], ev[16], ev[17]]);
-
-    println!(
-        "# 触发: capture_id={} index={} tick={} µs",
-        capture_id, trigger_index, trigger_tick
-    );
-
-    let ch_count = info.ch_count.max(1) as usize;
-    let mut capture = Capture::new(capture_id, rate_hz, ch_count, n_samples);
-    capture.trigger_index = Some(trigger_index);
-    capture.device_tick_us = trigger_tick;
-
-    // 一个分片最多装多少样点：payload 上限减掉 12 B 分片头，再按 u16 折半。
-    // 不能直接用 preferred_chunk_samples —— 固件报的值若大于物理上限，
-    // 设备端会回 BAD_PARAM。
-    let max_chunk_samples =
-        ((scope_proto::MAX_PAYLOAD_TX - scope_proto::CHUNK_HEADER_LEN) / 2) as u16;
-    let chunk = info
-        .preferred_chunk_samples
-        .min(max_chunk_samples)
-        .min(samples)
-        .max(1);
-    for ch in 0..ch_count {
-        let mut offset: u32 = 0;
-        while (offset as usize) < n_samples as usize {
-            let want = chunk.min((n_samples - offset) as u16);
-            let payload = bus.read_buffer(capture_id, offset, want, 0, ch as u8)?;
-
-            let hdr = scope_proto::ChunkHeader::decode(&payload).context("分片头解析失败")?;
-            if !hdr.is_valid() {
-                capture.overrun = true;
-            }
-
-            for pair in payload[scope_proto::CHUNK_HEADER_LEN..].chunks_exact(2) {
-                capture.channels[ch].push(u16::from_le_bytes([pair[0], pair[1]]));
-            }
-
-            offset += hdr.count as u32;
-
-            if hdr.is_last() {
-                break;
-            }
-            if hdr.count == 0 {
-                break; // 防死循环
-            }
-        }
+    match capture.trigger_index {
+        Some(i) => println!(
+            "# 触发: capture_id={} index={} tick={} µs",
+            capture.id, i, capture.device_tick_us
+        ),
+        // 软触发 / 未找到触发点时设备发哨兵 0xFFFF_FFFF —— core 已映射成 None
+        None => println!(
+            "# 触发: capture_id={} **无触发点**（软触发或未找到）tick={} µs",
+            capture.id, capture.device_tick_us
+        ),
     }
 
-    let _ = bus.stop();
+    if capture.overrun {
+        println!("⚠ 采集期间发生溢出 —— 这份数据不完整，不能当作完整波形用");
+    }
     Ok(capture)
 }
 

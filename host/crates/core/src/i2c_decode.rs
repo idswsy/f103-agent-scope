@@ -468,6 +468,17 @@ impl I2cDecode {
     }
 }
 
+impl I2cWarning {
+    /// 给人看的一句话说明。
+    ///
+    /// 放在方法里而不是 pub 自由函数：可发现性更好，也不往 crate 根命名空间里
+    /// 再塞一个名字（那里已经 re-export 了十几个）。CLI / GUI / MCP 共用这一份，
+    /// 避免文案在三处漂移 —— 跟「协议四处同步」是同一条纪律。
+    pub fn text(&self) -> String {
+        warning_text(self)
+    }
+}
+
 fn warning_text(w: &I2cWarning) -> String {
     match w {
         I2cWarning::NoSignal => "两条线都没有跳变，没有信号".to_string(),

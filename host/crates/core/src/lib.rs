@@ -31,18 +31,20 @@
 #![deny(clippy::all)]
 #![warn(missing_docs)]
 
+pub mod acquire;
 pub mod capture;
 pub mod command;
 pub mod device;
 pub mod error;
 pub mod i2c_decode;
 
+pub use acquire::{acquire, acquire_cancellable, AcquireParams, TriggerEvent};
 pub use capture::{
     Capture, CaptureStore, ChannelScale, ChannelSummary, MinMaxPreview, DEFAULT_HISTORY,
 };
 pub use command::{
-    CommandBus, DeviceConfig, DeviceInfo, Response, RetryPolicy, TIMEOUT_CONTROL, TIMEOUT_PING,
-    TIMEOUT_TRIGGER,
+    state_name, CommandBus, DeviceConfig, DeviceInfo, Response, RetryPolicy, TIMEOUT_CONTROL,
+    TIMEOUT_PING, TIMEOUT_TRIGGER,
 };
 pub use device::{DevicePort, FrameReader};
 pub use error::{DeviceError, LinkError, Result, ScopeError};

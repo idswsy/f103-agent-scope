@@ -565,6 +565,59 @@ impl<P: DevicePort> CommandBus<P> {
         Ok(())
     }
 
+    /// `SET_CHANNEL`。
+    ///
+    /// 电平与偏移**一律用 ADC LSB 整数**，i16 所以负偏移合法（把波形挪进屏幕）。
+    /// 伏特换算、量程衰减、AC/DC 校正全部留在显示层（ADR-006）。
+    pub fn set_channel(
+        &mut self,
+        ch: u8,
+        enable: bool,
+        range_idx: u8,
+        coupling: u8,
+        offset_lsb: i16,
+    ) -> Result<()> {
+        self.guard_config_allowed("SET_CHANNEL")?;
+
+        let ch_count = self.info.as_ref().map(|i| i.ch_count).unwrap_or(1);
+        if ch >= ch_count {
+            return Err(ScopeError::InvalidParam {
+                field: "ch",
+                value: ch.to_string(),
+                reason: format!("该设备只有 {ch_count} 个通道（以 GET_INFO 上报为准）"),
+            });
+        }
+
+        let mut p = Vec::with_capacity(6);
+        p.push(ch);
+        p.push(u8::from(enable));
+        p.push(range_idx);
+        p.push(coupling);
+        p.extend_from_slice(&offset_lsb.to_le_bytes());
+        let _ = self.transaction(Cmd::SetChannel, p, TIMEOUT_CONTROL)?;
+
+        if let Some(cfg) = &mut self.config {
+            cfg.ch0_enable = u8::from(enable);
+            cfg.ch0_coupling = coupling;
+        }
+        Ok(())
+    }
+
+    /// `RESET` —— 设备回到上电初始态。
+    ///
+    /// **这是从 [`State::Fault`] 里出来的唯一办法。** `cmd_allowed` 规定 Fault 态下
+    /// 只接受 Reset，其余命令一律被拒 —— 没有这个方法，设备一旦进 Fault，
+    /// 上位机就彻底够不着它了（CLI 和 GUI 都够不着，只能重启板子）。
+    ///
+    /// 副作用是配置全部回出厂值，所以顺手重取一次 `GET_CONFIG`，
+    /// 免得缓存里留着已经不成立的旧值。
+    pub fn reset(&mut self) -> Result<()> {
+        let _ = self.transaction(Cmd::Reset, Vec::new(), TIMEOUT_CONTROL)?;
+        self.state = Some(State::Idle);
+        self.config = Some(self.get_config()?);
+        Ok(())
+    }
+
     /// `ARM`。**非幂等** —— 内部靠设备侧 seq 去重缓存保证重试安全。
     pub fn arm(&mut self) -> Result<()> {
         if let Some(state) = self.state {
@@ -662,6 +715,19 @@ impl<P: DevicePort> CommandBus<P> {
             }
         }
         Ok(())
+    }
+}
+
+/// 设备状态的中文名。
+///
+/// CLI / GUI / MCP 共用一份 —— 三处各写一份必然漂移。
+pub fn state_name(s: State) -> &'static str {
+    match s {
+        State::Idle => "空闲",
+        State::Armed => "已武装",
+        State::Streaming => "流推送中",
+        State::Done => "采集完成",
+        State::Fault => "故障",
     }
 }
 
