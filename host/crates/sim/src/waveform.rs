@@ -123,12 +123,17 @@ pub const FULL_SCALE_LSB: u16 = 4095;
 impl WaveformGen {
     /// 创建发生器。
     pub fn new(scenario: Scenario, seed: u64) -> WaveformGen {
-        WaveformGen {
+        let mut g = WaveformGen {
             scenario,
             rng: Rng::new(seed),
             sample_index: 0,
             i2c: I2cBus::new(100_000),
-        }
+        };
+        // 回归：这里曾经只写死 100 kHz 而**不调用** `set_scenario`，
+        // 于是 `Scenario::I2c400k` 标签下跑的是 100 kHz 的波形 ——
+        // 任何「对着 400k 场景验证解码器」的测试其实都在验 100k。
+        g.set_scenario(scenario);
+        g
     }
 
     /// 当前场景。
@@ -183,8 +188,12 @@ impl WaveformGen {
 
         let rate = rate_hz.max(1) as u64;
         let t = self.sample_index as f64 / rate as f64;
-        // 整数微秒时间戳：I2C 相位用它算，避免浮点累积漂移
-        let t_us = self.sample_index.saturating_mul(1_000_000) / rate;
+        // 整数**纳秒**时间戳：I2C 相位用它算，避免浮点累积漂移。
+        //
+        // 必须是 ns 而不是 µs —— 857 kHz 下采样间隔是 1.167 µs，
+        // 用 µs 会让相邻样点落在同一个微秒里、边沿位置糊成一团，
+        // 400 kHz（比特时隙 2.5 µs）的相位就完全不可信了。
+        let t_ns = self.sample_index.saturating_mul(1_000_000_000) / rate;
 
         let v = match self.scenario {
             Sine1k3v3 => {
@@ -230,7 +239,7 @@ impl WaveformGen {
             }
 
             I2c100k | I2c400k => {
-                let (scl, sda) = self.i2c.levels_at_us(t_us);
+                let (scl, sda) = self.i2c.levels_at_ns(t_ns);
                 level_to_lsb(if ch == 0 { scl } else { sda })
             }
         };
@@ -286,15 +295,30 @@ pub fn transaction(bytes: &[u8]) -> Vec<Bit> {
     bits
 }
 
+/// 一个 SCL 比特时隙的纳秒数。
+///
+/// **用 ns 而不是 µs**：400 kHz 的比特时隙是 2.5 µs，整数微秒表示不了 ——
+/// 截到 2 µs 会变成 500 kHz，进位到 3 µs 会变成 333 kHz，误差 20~25%。
+/// 而 400 kHz 正是「双通路设计到底值不值」的关键场景，不能有这种系统性偏差。
+fn ns_per_bit(scl_hz: u64) -> u64 {
+    if scl_hz == 0 {
+        return 1;
+    }
+    (1_000_000_000 / scl_hz).max(1)
+}
+
 /// I2C 总线电平发生器。
 ///
-/// 输入是**采样时刻（µs）**而不是样点序号 —— 这样同一个发生器可以
+/// 输入是**采样时刻（ns）**而不是样点序号 —— 这样同一个发生器可以
 /// 服务任意采样率，且相位由物理时间决定，不会随采样率漂移。
+///
+/// 为什么精确到 ns：857 kHz 下采样间隔是 1.167 µs，若时间戳只有 µs 分辨率，
+/// 相邻样点会落在同一个微秒里，边沿位置糊成一团 —— 400 kHz 的相位就不可信了。
 #[derive(Debug, Clone)]
 pub struct I2cBus {
     bits: Vec<Bit>,
-    /// 一个比特时隙的长度（µs）。
-    bit_us: u64,
+    /// 一个比特时隙的长度（ns）。
+    bit_ns: u64,
 }
 
 impl I2cBus {
@@ -302,10 +326,7 @@ impl I2cBus {
     pub fn new(scl_hz: u64) -> I2cBus {
         I2cBus {
             bits: default_i2c_transaction(),
-            // 关键：kHz 转的是**周期微秒**，不是把 Hz 当微秒用。
-            // 100 kHz → 10 µs；400 kHz → 2.5 µs（向上取整到 2 µs 时
-            // 会用 2.5 的话需要浮点，这里统一用乘法避免整数除法损失）
-            bit_us: (1_000_000 / scl_hz).max(1),
+            bit_ns: ns_per_bit(scl_hz),
         }
     }
 
@@ -313,42 +334,42 @@ impl I2cBus {
     pub fn with_transaction(scl_hz: u64, bytes: &[u8]) -> I2cBus {
         I2cBus {
             bits: transaction(bytes),
-            bit_us: (1_000_000 / scl_hz).max(1),
+            bit_ns: ns_per_bit(scl_hz),
         }
     }
 
-    /// 一个完整事务占用的时间（µs）。
-    pub fn frame_us(&self) -> u64 {
-        self.bits.len() as u64 * self.bit_us
+    /// 一个完整事务占用的时间（ns）。
+    pub fn frame_ns(&self) -> u64 {
+        self.bits.len() as u64 * self.bit_ns
     }
 
     /// 取某一时刻两条线的电平，返回 `(scl_high, sda_high)`。
     ///
-    /// 用整数运算：`t_us % period` 而不是浮点 —— 保证长时间运行时
+    /// 用整数运算：`t_ns % period` 而不是浮点 —— 保证长时间运行时
     /// 相位不会因为浮点累积误差而漂移。
-    pub fn levels_at_us(&self, t_us: u64) -> (bool, bool) {
-        let frame = self.frame_us();
+    pub fn levels_at_ns(&self, t_ns: u64) -> (bool, bool) {
+        let frame = self.frame_ns();
         if frame == 0 {
             return (true, true);
         }
-        let t = t_us % frame;
-        let idx = (t / self.bit_us) as usize;
-        let in_bit = t % self.bit_us;
+        let t = t_ns % frame;
+        let idx = (t / self.bit_ns) as usize;
+        let in_bit = t % self.bit_ns;
 
         let bit = self.bits.get(idx).copied().unwrap_or(Bit::Idle);
 
         match bit {
             Bit::Start => {
                 // SCL 全程高；SDA 在前半段高、后半段低
-                (true, in_bit < self.bit_us / 2)
+                (true, in_bit < self.bit_ns / 2)
             }
             Bit::Stop => {
                 // SCL 全程高；SDA 在前半段低、后半段高
-                (true, in_bit >= self.bit_us / 2)
+                (true, in_bit >= self.bit_ns / 2)
             }
             Bit::Data(level) => {
                 // SCL 前半低、后半高；SDA 整段恒定
-                (in_bit >= self.bit_us / 2, level)
+                (in_bit >= self.bit_ns / 2, level)
             }
             Bit::Idle => (true, true),
         }
@@ -632,21 +653,46 @@ mod tests {
     fn i2c_bit_period_matches_configured_rate() {
         // 100 kHz → 10 µs/bit；400 kHz → 2 µs/bit（整数微秒取整）
         let bus100 = I2cBus::new(100_000);
-        assert_eq!(bus100.bit_us, 10);
+        assert_eq!(bus100.bit_ns, 10_000);
 
         let bus400 = I2cBus::new(400_000);
-        assert_eq!(bus400.bit_us, 2, "400 kHz 应为 2.5 µs，整数取整到 2");
+        // 400 kHz 的比特时隙是 2.5 µs = 2500 ns，必须**精确**表示。
+        // 回归：这里曾经用整数微秒，2.5 被截成 2，于是「400 kHz 场景」
+        // 实际生成的是 500 kHz 波形；而这条断言还把这个错误固化成了期望
+        // （原文写着「整数取整到 2」）。
+        assert_eq!(bus400.bit_ns, 2_500);
+
+        // 1 MHz 也要精确
+        assert_eq!(I2cBus::new(1_000_000).bit_ns, 1_000);
 
         // 一帧 = START + 9×3 位 + STOP + 2 空闲 = 31 位
-        assert_eq!(bus100.frame_us(), 31 * 10);
+        assert_eq!(bus100.frame_ns(), 31 * 10_000);
+    }
+
+    #[test]
+    fn wavegen_constructor_honours_the_scenario() {
+        // 回归：WaveformGen::new 曾经硬编码 I2cBus::new(100_000) 且从不调用
+        // set_scenario —— 于是 I2c400k 场景下跑的是 100 kHz 波形。
+        // 这会让任何「对着 400k 场景验证解码器」的测试变成自欺欺人。
+        let g100 = WaveformGen::new(Scenario::I2c100k, 1);
+        let g400 = WaveformGen::new(Scenario::I2c400k, 1);
+        assert_eq!(g100.i2c.bit_ns, 10_000, "i2c_100k 场景应是 10 µs 比特时隙");
+        assert_eq!(g400.i2c.bit_ns, 2_500, "i2c_400k 场景应是 2.5 µs 比特时隙");
+
+        // 而且两条波形必须真的不一样
+        let mut a = WaveformGen::new(Scenario::I2c100k, 1);
+        let mut b = WaveformGen::new(Scenario::I2c400k, 1);
+        let wa = a.generate_multi(2, 512, 857_142);
+        let wb = b.generate_multi(2, 512, 857_142);
+        assert_ne!(wa, wb, "100k 与 400k 两个场景不能产出相同的波形");
     }
 
     #[test]
     fn i2c_frame_levels_are_well_formed() {
         let bus = I2cBus::new(100_000);
         // 第 0 位是 START：SCL 恒高，SDA 前半高后半低
-        let (scl_a, sda_a) = bus.levels_at_us(0);
-        let (scl_b, sda_b) = bus.levels_at_us(9);
+        let (scl_a, sda_a) = bus.levels_at_ns(0);
+        let (scl_b, sda_b) = bus.levels_at_ns(9_000);
         assert!(scl_a && scl_b, "START 期间 SCL 必须保持高");
         assert!(sda_a, "START 前半段 SDA 应为高");
         assert!(!sda_b, "START 后半段 SDA 应变低");
