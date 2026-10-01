@@ -16,7 +16,9 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use scope_core::{Capture, CaptureStore, ChannelScale, CommandBus, DevicePort, State};
+use scope_core::{
+    Capture, CaptureStore, ChannelScale, CommandBus, DevicePort, I2cDecodeConfig, Levels, State,
+};
 use scope_sim::{Scenario, SimDevice};
 use scope_transport_serial::{baud, SerialDevice};
 use std::io::Write;
@@ -95,6 +97,49 @@ enum Action {
         out: Option<String>,
     },
 
+    /// 抓一次总线并解码出 I2C 帧序列
+    I2c {
+        /// 波形场景（**仅模拟器有效**）
+        #[arg(long, value_enum, default_value_t = ScenarioArg::I2c100k)]
+        scenario: ScenarioArg,
+
+        /// 采样点数（F103 上限 4096）
+        #[arg(short = 'n', long, default_value_t = 4096)]
+        samples: u16,
+
+        /// 采样率（Hz）
+        #[arg(long, default_value_t = 857_142)]
+        rate: u32,
+
+        /// SCL 通道（0 起）。与 --sda 一起省略时自动判定
+        #[arg(long)]
+        scl: Option<usize>,
+
+        /// SDA 通道（0 起）
+        #[arg(long)]
+        sda: Option<usize>,
+
+        /// 高电平门限（ADC LSB）。省略用 0.7·VDD
+        #[arg(long)]
+        vih: Option<u16>,
+
+        /// 低电平门限（ADC LSB）。省略用 0.3·VDD
+        #[arg(long)]
+        vil: Option<u16>,
+
+        /// 去抖时间（ns）
+        #[arg(long, default_value_t = 50)]
+        debounce_ns: u32,
+
+        /// 超时（毫秒）
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u64,
+
+        /// 输出解码文本路径（`i2c_decode.txt`）
+        #[arg(short = 'o', long)]
+        out: Option<String>,
+    },
+
     /// 链路自检：PING 往返 + 吞吐
     Ping,
 
@@ -103,12 +148,12 @@ enum Action {
 }
 
 impl Action {
-    /// 取出本动作隐含的场景（只有 `capture` 有）；其他动作返回默认场景。
+    /// 取出本动作隐含的场景；其他动作返回默认场景。
     ///
     /// 模拟器需要在跑动作之前就把设备建出来，所以得先问动作要场景。
     fn scenario_or_default(&self) -> ScenarioArg {
         match self {
-            Action::Capture { scenario, .. } => *scenario,
+            Action::Capture { scenario, .. } | Action::I2c { scenario, .. } => *scenario,
             _ => ScenarioArg::Sine1k3v3,
         }
     }
@@ -278,94 +323,9 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
             timeout_ms,
             out,
         } => {
-            let info = bus.connect()?;
-
-            let actual = bus.set_sample_rate(rate)?;
-            if actual != rate {
-                println!(
-                    "# 采样率被量化: {} Hz → {} Hz（时间轴以 {} Hz 为准）",
-                    rate, actual, actual
-                );
-            }
-
-            bus.set_trigger(1, 0, 0, level, (samples / 2).min(2048), 1000)?; // normal / ch0 / 上升沿
-            bus.set_acq(0, samples, 0, 1)?; // 单次 / RAW16 / 不抽点
-            bus.arm()?;
-
-            let ev = bus
-                .wait_trigger(std::time::Duration::from_millis(timeout_ms))
-                .context("等待触发事件失败")?;
-
-            let ev = match ev {
-                Some(e) => e,
-                None => {
-                    // 没触发不是崩溃 —— 给一条能自救的提示
-                    let _ = bus.stop();
-                    bail!(
-                        "{} ms 内没有触发。\n\
-                         可以试试：\n  \
-                         • 降低触发电平（当前 {} LSB）\n  \
-                         · 改用 auto 模式\n  \
-                         · 确认信号真的接在通道 0 上",
-                        timeout_ms,
-                        level
-                    );
-                }
-            };
-
-            let capture_id = u16::from_le_bytes([ev[0], ev[1]]);
-            let trigger_index = u32::from_le_bytes([ev[2], ev[3], ev[4], ev[5]]);
-            let trigger_tick = u32::from_le_bytes([ev[6], ev[7], ev[8], ev[9]]);
-            let rate_hz = u32::from_le_bytes([ev[10], ev[11], ev[12], ev[13]]);
-            let n_samples = u32::from_le_bytes([ev[14], ev[15], ev[16], ev[17]]);
-
-            println!(
-                "# 触发: capture_id={} index={} tick={} µs",
-                capture_id, trigger_index, trigger_tick
-            );
-
-            // 分片拉取
-            let ch_count = info.ch_count.max(1) as usize;
-            let mut capture = Capture::new(capture_id, rate_hz, ch_count, n_samples);
-            capture.trigger_index = Some(trigger_index);
-            capture.device_tick_us = trigger_tick;
-
-            // 一个分片最多装多少样点：payload 上限减掉 12 B 分片头，再按 u16 折半。
-            // 不能直接用 preferred_chunk_samples —— 固件报的值若大于物理上限，
-            // 设备端会回 BAD_PARAM。
-            let max_chunk_samples =
-                ((scope_proto::MAX_PAYLOAD_TX - scope_proto::CHUNK_HEADER_LEN) / 2) as u16;
-            let chunk = info
-                .preferred_chunk_samples
-                .min(max_chunk_samples)
-                .min(samples)
-                .max(1);
-            for ch in 0..ch_count {
-                let mut offset: u32 = 0;
-                while (offset as usize) < n_samples as usize {
-                    let want = chunk.min((n_samples - offset) as u16);
-                    let payload = bus.read_buffer(capture_id, offset, want, 0, ch as u8)?;
-
-                    let hdr =
-                        scope_proto::ChunkHeader::decode(&payload).context("分片头解析失败")?;
-                    if !hdr.is_valid() {
-                        capture.overrun = true;
-                    }
-
-                    for pair in payload[scope_proto::CHUNK_HEADER_LEN..].chunks_exact(2) {
-                        capture.channels[ch].push(u16::from_le_bytes([pair[0], pair[1]]));
-                    }
-
-                    offset += hdr.count as u32;
-
-                    if hdr.is_last() {
-                        break;
-                    }
-                    if hdr.count == 0 {
-                        break; // 防死循环
-                    }
-                }
-            }
+            let capture = capture_once(&mut bus, samples, rate, level, timeout_ms)?;
+            let ch_count = capture.channels.len();
+            let capture_id = capture.id;
 
             // 摘要（这是 Agent 默认能看到的东西）
             println!();
@@ -419,6 +379,96 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
             Ok(())
         }
 
+        Action::I2c {
+            scenario: _,
+            samples,
+            rate,
+            scl,
+            sda,
+            vih,
+            vil,
+            debounce_ns,
+            timeout_ms,
+            out,
+        } => {
+            let capture = capture_once(&mut bus, samples, rate, 2048, timeout_ms)?;
+
+            // I2C 解码至少要两条线。单通道场景（如 dc / sine_1k_3v3）在这里
+            // 就要说清楚，而不是等 decode_capture 报一个「通道越界」让人猜。
+            if capture.channels.len() < 2 {
+                bail!(
+                    "I2C 解码需要至少 2 个通道，当前场景只有 {} 个。\n\
+                     可以试试：\n  \
+                     • 换用双通道场景：--scenario i2c_100k 或 i2c_400k\n  \
+                     · 接真机时确认 GET_INFO 上报的 ch_count ≥ 2",
+                    capture.channels.len()
+                );
+            }
+
+            let levels = match (vih, vil) {
+                (Some(h), Some(l)) => Levels {
+                    vih_lsb: h,
+                    vil_lsb: l,
+                },
+                (Some(h), None) => Levels {
+                    vih_lsb: h,
+                    vil_lsb: Levels::default_ratio().vil_lsb,
+                },
+                (None, Some(l)) => Levels {
+                    vih_lsb: Levels::default_ratio().vih_lsb,
+                    vil_lsb: l,
+                },
+                (None, None) => Levels::default_ratio(),
+            };
+            println!(
+                "# 门限: VIH={} VIL={} LSB（判决带内不硬判 0/1）",
+                levels.vih_lsb, levels.vil_lsb
+            );
+
+            // 通道：显式指定优先；都省略时自动判定，并把判定结果告诉用户
+            let (scl_ch, sda_ch) = match (scl, sda) {
+                (Some(a), Some(b)) => (a, b),
+                (Some(a), None) => (a, if a == 0 { 1 } else { 0 }),
+                (None, Some(b)) => (if b == 0 { 1 } else { 0 }, b),
+                (None, None) => match scope_core::detect_channels(&capture, levels, debounce_ns) {
+                    Some((a, b)) => {
+                        println!("# 自动判定: SCL=CH{}  SDA=CH{}", a + 1, b + 1);
+                        (a, b)
+                    }
+                    None => {
+                        println!("# 自动判定失败（两条线都没有边沿）；按默认 CH1=SCL CH2=SDA 继续");
+                        (0, 1)
+                    }
+                },
+            };
+
+            let cfg = I2cDecodeConfig {
+                scl_channel: scl_ch,
+                sda_channel: sda_ch,
+                levels,
+                debounce_ns,
+            };
+            let result = scope_core::decode_capture(&capture, &cfg)?;
+
+            println!();
+            print!("{}", result.to_text());
+
+            let bytes = result.all_bytes();
+            if !bytes.is_empty() {
+                let hex: Vec<String> = bytes.iter().map(|b| format!("0x{b:02X}")).collect();
+                println!("\n数据字节: [{}]", hex.join(", "));
+            }
+
+            if let Some(path) = out {
+                let text = result.to_text();
+                std::fs::write(&path, text.as_bytes())
+                    .with_context(|| format!("无法写入 {path}"))?;
+                println!("已写出 {path}");
+            }
+
+            Ok(())
+        }
+
         Action::Measure => {
             bus.connect()?;
             println!("测量需要先有一次采集，见 `capture` 子命令。");
@@ -426,6 +476,108 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// 跑一次完整采集：连接 → 配置 → 武装 → 等触发 → 分片拉取。
+///
+/// `capture` 与 `i2c` 两个动作共用 —— 采集逻辑只写一遍，
+/// 免得解码那条路上的分片处理与落盘那条路走出两个版本的 bug。
+fn capture_once<D: DevicePort>(
+    bus: &mut CommandBus<D>,
+    samples: u16,
+    rate: u32,
+    level: u16,
+    timeout_ms: u64,
+) -> Result<Capture> {
+    let info = bus.connect()?;
+
+    let actual = bus.set_sample_rate(rate)?;
+    if actual != rate {
+        println!(
+            "# 采样率被量化: {} Hz → {} Hz（时间轴以 {} Hz 为准）",
+            rate, actual, actual
+        );
+    }
+
+    bus.set_trigger(1, 0, 0, level, (samples / 2).min(2048), 1000)?; // normal / ch0 / 上升沿
+    bus.set_acq(0, samples, 0, 1)?; // 单次 / RAW16 / 不抽点
+    bus.arm()?;
+
+    let ev = bus
+        .wait_trigger(std::time::Duration::from_millis(timeout_ms))
+        .context("等待触发事件失败")?;
+
+    let ev = match ev {
+        Some(e) => e,
+        None => {
+            // 没触发不是崩溃 —— 给一条能自救的提示
+            let _ = bus.stop();
+            bail!(
+                "{} ms 内没有触发。\n\
+                 可以试试：\n  \
+                 • 降低触发电平（当前 {} LSB）\n  \
+                 · 改用 auto 模式\n  \
+                 · 确认信号真的接在通道 0 上",
+                timeout_ms,
+                level
+            );
+        }
+    };
+
+    let capture_id = u16::from_le_bytes([ev[0], ev[1]]);
+    let trigger_index = u32::from_le_bytes([ev[2], ev[3], ev[4], ev[5]]);
+    let trigger_tick = u32::from_le_bytes([ev[6], ev[7], ev[8], ev[9]]);
+    let rate_hz = u32::from_le_bytes([ev[10], ev[11], ev[12], ev[13]]);
+    let n_samples = u32::from_le_bytes([ev[14], ev[15], ev[16], ev[17]]);
+
+    println!(
+        "# 触发: capture_id={} index={} tick={} µs",
+        capture_id, trigger_index, trigger_tick
+    );
+
+    let ch_count = info.ch_count.max(1) as usize;
+    let mut capture = Capture::new(capture_id, rate_hz, ch_count, n_samples);
+    capture.trigger_index = Some(trigger_index);
+    capture.device_tick_us = trigger_tick;
+
+    // 一个分片最多装多少样点：payload 上限减掉 12 B 分片头，再按 u16 折半。
+    // 不能直接用 preferred_chunk_samples —— 固件报的值若大于物理上限，
+    // 设备端会回 BAD_PARAM。
+    let max_chunk_samples =
+        ((scope_proto::MAX_PAYLOAD_TX - scope_proto::CHUNK_HEADER_LEN) / 2) as u16;
+    let chunk = info
+        .preferred_chunk_samples
+        .min(max_chunk_samples)
+        .min(samples)
+        .max(1);
+    for ch in 0..ch_count {
+        let mut offset: u32 = 0;
+        while (offset as usize) < n_samples as usize {
+            let want = chunk.min((n_samples - offset) as u16);
+            let payload = bus.read_buffer(capture_id, offset, want, 0, ch as u8)?;
+
+            let hdr = scope_proto::ChunkHeader::decode(&payload).context("分片头解析失败")?;
+            if !hdr.is_valid() {
+                capture.overrun = true;
+            }
+
+            for pair in payload[scope_proto::CHUNK_HEADER_LEN..].chunks_exact(2) {
+                capture.channels[ch].push(u16::from_le_bytes([pair[0], pair[1]]));
+            }
+
+            offset += hdr.count as u32;
+
+            if hdr.is_last() {
+                break;
+            }
+            if hdr.count == 0 {
+                break; // 防死循环
+            }
+        }
+    }
+
+    let _ = bus.stop();
+    Ok(capture)
 }
 
 fn state_name(s: State) -> &'static str {

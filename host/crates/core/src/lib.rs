@@ -35,6 +35,7 @@ pub mod capture;
 pub mod command;
 pub mod device;
 pub mod error;
+pub mod i2c_decode;
 
 pub use capture::{
     Capture, CaptureStore, ChannelScale, ChannelSummary, MinMaxPreview, DEFAULT_HISTORY,
@@ -45,6 +46,10 @@ pub use command::{
 };
 pub use device::{DevicePort, FrameReader};
 pub use error::{DeviceError, LinkError, Result, ScopeError};
+pub use i2c_decode::{
+    decode, decode_capture, detect_channels, Address, Event, EventKind, I2cDecode, I2cDecodeConfig,
+    I2cWarning, Levels, SignalQuality, Transaction,
+};
 
 // 重导出协议类型，让上层不必直接依赖 scope-proto
 pub use scope_proto::{
