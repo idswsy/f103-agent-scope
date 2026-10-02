@@ -245,11 +245,33 @@ impl Transaction {
         }
     }
 
-    /// 有没有 NACK（地址或数据）。
+    /// 有没有**从机拒绝**（地址或数据没被应答）。
+    ///
+    /// ⚠ 读事务里，主机在**最后一个字节**回 NACK 是**正常的收尾** ——
+    /// 它表达的意思正是「我读够了，不用再给下一个字节了」。那不是故障。
+    ///
+    /// 回归：从前这里把所有 `!acked` 一视同仁，于是「写寄存器 → 读回」
+    /// 这种最常见的 I2C 时序里，**读帧永远显示 `nack: true`**。
+    /// 一份完全健康的读数看起来像出了错，一个 Agent 几乎必然会据此
+    /// 报出一个不存在的问题。
     pub fn has_nack(&self) -> bool {
-        self.events.iter().any(|e| match &e.kind {
+        // 读事务才可能由主机发收尾 NACK
+        let reading = matches!(&self.address, Some(a) if a.read);
+        // 最后一个数据字节的下标
+        let last_data = self
+            .events
+            .iter()
+            .rposition(|e| matches!(&e.kind, EventKind::Data { .. }));
+
+        self.events.iter().enumerate().any(|(i, e)| match &e.kind {
             EventKind::Address(a) => !a.acked,
-            EventKind::Data { acked, .. } => !*acked,
+            EventKind::Data { acked, .. } => {
+                if *acked {
+                    false
+                } else {
+                    !(reading && Some(i) == last_data)
+                }
+            }
             _ => false,
         })
     }
@@ -704,7 +726,17 @@ pub fn decode(
                 // 于是背靠背的每一笔事务都被误标成了重复起始。
                 let repeated = cur.is_some();
                 if let Some(tx) = cur.take() {
-                    transactions.push(finish(tx, false, to_us));
+                    // `complete = true` —— 走到这里说明**上一帧没有 STOP 就
+                    // 重新起始**，那正是重复起始（`repeated` 的判据就是它）。
+                    // 以 Sr 收尾的帧是**正常结束**的，只是它的后半截在下一帧里。
+                    //
+                    // 回归：这里从前传的是 `false`，而 `complete` 的语义是
+                    // 「有没有被采集窗口截断」。于是「写寄存器 → 读回」这种
+                    // 最常见的 I2C 时序里，**写帧永远显示 complete=false** ——
+                    // 一个 Agent 会把它读成「这一帧没读完」，从而报出一个
+                    // 根本不存在的问题。（`false` 只该留给窗口截断，
+                    // 见下面 ── 3) 收尾 ── 那一处。）
+                    transactions.push(finish(tx, true, to_us));
                 }
                 cur = Some(PendingTx {
                     start_sample: idx,
@@ -1142,7 +1174,77 @@ mod tests {
         assert!(r.transactions[1].repeated, "第二帧应标记为重复起始");
         assert_eq!(r.transactions[1].bytes, vec![0x1A, 0x2B]);
         assert!(r.transactions[1].address.as_ref().unwrap().read);
-        assert!(r.transactions[1].has_nack(), "最后一字节是 NACK");
+
+        // 最后一字节的应答位确实是 NACK（主机发的）……
+        let last_acked = r.transactions[1]
+            .events
+            .iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                EventKind::Data { acked, .. } => Some(*acked),
+                _ => None,
+            });
+        assert_eq!(last_acked, Some(false), "最后一字节的应答位应当是 NACK");
+
+        // ……但那是**正常的读收尾**（「我读够了」），不是故障。
+        //
+        // 回归：这条断言从前写的是 `assert!(has_nack())` —— 它把
+        // 「最后一字节的 ack 位」和「这一帧出了错」当成了同一件事。
+        // 于是每一笔「写寄存器 → 读回」的读帧都被报成 `nack: true`，
+        // 一份健康的读数看起来像坏了。
+        assert!(
+            !r.transactions[1].has_nack(),
+            "主机在读事务末字节回 NACK 是正常收尾，不该报成故障"
+        );
+    }
+
+    #[test]
+    fn a_slave_nack_is_still_reported() {
+        // 上一条把「主机的读收尾 NACK」排除掉了 —— 这里守住另一边：
+        // **从机**拒绝应答必须照实报出来，不能一起被滤掉。
+        let mut b = Builder::new();
+        b.start(4);
+        b.byte(0x88, true, 4); // 地址被应答：器件在总线上
+        b.byte(0x00, false, 4); // 这一笔写被从机 NACK
+        b.stop(4);
+
+        let r = decode(&b.scl, &b.sda, 857_142, levels(), 50);
+        assert_eq!(r.frame_count(), 1);
+        assert!(r.transactions[0].has_nack(), "从机拒绝应答必须被报出来");
+        assert!(
+            r.transactions[0].address.as_ref().unwrap().acked,
+            "地址是通过的"
+        );
+    }
+
+    #[test]
+    fn a_frame_ended_by_a_repeated_start_is_complete() {
+        // `complete` 的语义是「没被采集窗口截断」，**不是**「以 STOP 收尾」。
+        // 以重复起始结束的写帧是正常结束的，它的后半截就在下一帧里。
+        //
+        // 回归：从前这条路径传 `false`，于是「写寄存器 → 读回」里
+        // 写帧永远显示 `complete: false`，看起来像被截断了。
+        let mut b = Builder::new();
+        b.start(4);
+        b.byte(0x88, true, 4);
+        b.byte(0x00, true, 4);
+        b.repeated_start(4);
+        b.byte(0x89, true, 4);
+        b.byte(0x2B, false, 4);
+        b.stop(4);
+
+        let r = decode(&b.scl, &b.sda, 857_142, levels(), 50);
+        assert!(
+            r.transactions[0].complete,
+            "以重复起始结束的帧是完整的，只是后半截在下一帧"
+        );
+
+        // 对照组：真的被窗口截断的那种，`complete` 必须是 false
+        let mut b2 = Builder::new();
+        b2.start(4);
+        b2.byte(0x88, true, 4);
+        let r2 = decode(&b2.scl, &b2.sda, 857_142, levels(), 50);
+        assert!(!r2.transactions[0].complete, "被截断的帧不该算完整");
     }
 
     #[test]

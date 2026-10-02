@@ -29,6 +29,13 @@ pub enum Scenario {
     I2c100k,
     /// 400 kHz I2C —— 用于验证「模拟通路解不了、数字通路能解」的边界。
     I2c400k,
+    /// 一条**有器件不应答**的 I2C 总线：地址被应答，但随后的一笔写被 NACK。
+    ///
+    /// 存在的理由是具体的：README 给 P3 定的验收场景是「抓一次 I2C 写时序
+    /// 并告诉我**为什么 NACK**」，而在此之前模拟器**造不出 NACK** ——
+    /// `transaction()` 把应答位写死在每个字节后面。一条验收标准，
+    /// 内容正好是它演示不了的那件事。
+    I2cNack,
 }
 
 impl Scenario {
@@ -40,7 +47,7 @@ impl Scenario {
     /// 从前 `parse` 与 `name` 是**两份各写一遍的 match** —— 给某个场景改名时
     /// 只改一处，`parse` 认的名字与 `name()` 报出的名字就会悄悄分家，
     /// 而两边都编译得过。现在 `parse` 是从 `name()` 反向推出来的，分不了家。
-    pub const ALL: [Scenario; 8] = [
+    pub const ALL: [Scenario; 9] = [
         Scenario::Sine1k3v3,
         Scenario::Square50k,
         Scenario::PulseGlitch,
@@ -49,6 +56,7 @@ impl Scenario {
         Scenario::Am,
         Scenario::I2c100k,
         Scenario::I2c400k,
+        Scenario::I2cNack,
     ];
 
     /// 从字符串解析（供 CLI / MCP 使用）。
@@ -71,6 +79,7 @@ impl Scenario {
             Scenario::Am => "am",
             Scenario::I2c100k => "i2c_100k",
             Scenario::I2c400k => "i2c_400k",
+            Scenario::I2cNack => "i2c_nack",
         }
     }
 
@@ -85,7 +94,7 @@ impl Scenario {
     /// 该场景需要几个通道。
     pub fn channel_count(self) -> usize {
         match self {
-            Scenario::I2c100k | Scenario::I2c400k => 2,
+            Scenario::I2c100k | Scenario::I2c400k | Scenario::I2cNack => 2,
             _ => 1,
         }
     }
@@ -189,6 +198,8 @@ impl WaveformGen {
         match s {
             Scenario::I2c100k => self.i2c = I2cBus::new(100_000),
             Scenario::I2c400k => self.i2c = I2cBus::new(400_000),
+            // 同样 100 kHz，但总线上的事务带一个 NACK
+            Scenario::I2cNack => self.i2c = I2cBus::with_bits(100_000, nacked_i2c_transaction()),
             _ => {}
         }
     }
@@ -280,7 +291,7 @@ impl WaveformGen {
                 MID_LSB as f64 + 1500.0 * envelope * carrier
             }
 
-            I2c100k | I2c400k => {
+            I2c100k | I2c400k | I2cNack => {
                 let (scl, sda) = self.i2c.levels_at_ns(t_ns);
                 level_to_lsb(if ch == 0 { scl } else { sda })
             }
@@ -303,10 +314,26 @@ impl WaveformGen {
 /// I2C 帧里的一个比特时隙。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bit {
-    /// 起始条件：SCL 保持高，SDA 在高电平期间由高变低。
+    /// 起始条件（含重复起始）：SCL 保持高，SDA 在高电平期间由高变低。
     Start,
-    /// 数据位（含 ACK/NACK）：SCL 前半段低、后半段高，SDA 在整个时隙内恒定。
+    /// 数据位（含应答位）：SCL 前半段低、后半段高，SDA 在整个时隙内恒定。
+    ///
+    /// **第 9 个时钟位上，这个位同时表示 ACK 和 NACK** —— 两者在总线上
+    /// 只差一个电平：SDA 低是从机应答（ACK），SDA 高是没有应答（NACK）。
     Data(bool),
+    /// 重复起始的**建立时隙**：SCL 全程低，SDA 在前半段低、后半段高。
+    ///
+    /// 为什么不直接连发两个 [`Bit::Start`]：上一个应答位结束时 SDA 是低的，
+    /// 紧接着抬高会在 **SCL 仍为高** 的时候产生一个上升沿 —— 解码器会把它
+    /// 读成 STOP。真实的重复起始必须先在 SCL 为低的窗口里把 SDA 释放成高，
+    /// 再拉高 SCL、再让 SDA 下降。
+    Setup,
+    /// 停止条件的**建立时隙**：SCL 全程低，SDA 前半段高、后半段低。
+    ///
+    /// 与 [`Bit::Setup`] 对称：一个在拉高 SCL 之前把 SDA 放到**高**（准备
+    /// 重复起始），一个放到**低**（准备 STOP）。两个的 SDA 变化都发生在
+    /// SCL 为低的窗口里，所以不构成任何条件。
+    PreStop,
     /// 停止条件：SCL 保持高，SDA 在高电平期间由低变高。
     Stop,
     /// 总线空闲：两线都被上拉。
@@ -319,22 +346,117 @@ pub enum Bit {
 /// 之所以选 `0x44`：这是常见温湿度传感器（SHT/HTU 系列）的地址，
 /// 也是 I2C 调试里最常抓到的事务之一，适合当示例。
 pub fn default_i2c_transaction() -> Vec<Bit> {
-    transaction(&[0x88, 0x00, 0x1A])
+    // 一条**完整的**「写寄存器指针 → 重复起始 → 读数据」，两笔都在：
+    //
+    //   S · 0x88(W) · ACK · 0x00 · ACK · Sr · 0x89(R) · ACK · 01 · ACK · 2C · NACK · P
+    //
+    //   地址 0x44：写方向 0x88 / 读方向 0x89
+    //   先写寄存器指针 0x00，再重复起始、读回两个字节 0x01 0x2C
+    //   （凑成 0x012C = 300，按 0.1 °C/LSB 就是 30.0 °C —— 一个像样的传感器读数）
+    //   最后一个字节由**主机**回 NACK，表示"读够了"，随后 STOP。
+    //
+    // 回归：从前这里是 `transaction(&[0x88, 0x00, 0x1A])` —— **只有写、没有读**
+    // 的单向循环。后果很实在：一个被要求排查「读出来全是 0」的 Agent，
+    // 会得出「总线上根本没有读事务」的诊断。那诊断在模拟器上是对的，
+    // 对一条真实总线却是它推出来的 —— **场景本身不是一份像样的总线快照**。
+    Tx::new()
+        .byte(0x88, true) // 地址 0x44 + 写
+        .byte(0x00, true) // 寄存器指针
+        .repeated_start() // Sr：不放开总线，直接换方向
+        .byte(0x89, true) // 地址 0x44 + 读
+        .byte(0x01, true) // 数据高字节（主机回 ACK = 还要）
+        .byte(0x2C, false) // 数据低字节（主机回 NACK = 读够了）
+        .stop()
+        .build()
+}
+
+/// 「从机不应答」的事务 —— NACK 场景用。
+///
+/// 地址被正常应答，但寄存器指针那一笔被**拒绝**。这是 I2C 调试里
+/// 最常见的两种故障之一（另一种是地址就没应答）：从机在总线上、
+/// 地址也对，但这一笔写它不收 —— 典型原因是写保护、寄存器不存在、
+/// 或者器件正忙。
+pub fn nacked_i2c_transaction() -> Vec<Bit> {
+    Tx::new()
+        .byte(0x88, true) // 地址 0x44 + 写：从机应答了，器件是在的
+        .byte(0x00, false) // 寄存器指针：**被 NACK** —— 这一笔它不收
+        .stop()
+        .build()
+}
+
+/// I2C 事务构造器。
+///
+/// 存在的理由很具体：`transaction()` 从前把 ACK **写死在每个字节后面**，
+/// 于是模拟器**造不出 NACK**。而 NACK 恰恰是 I2C 调试里最常要查的东西
+/// （器件不在、地址错、写保护，全表现为 NACK）—— 项目给自己定的 P3 验收
+/// 场景就是「告诉我为什么 NACK」，却演示不出来。
+#[derive(Debug, Default, Clone)]
+pub struct Tx {
+    bits: Vec<Bit>,
+}
+
+impl Tx {
+    /// 从起始条件开始。
+    pub fn new() -> Tx {
+        Tx {
+            bits: vec![Bit::Start],
+        }
+    }
+
+    /// 追加一个字节，以及第 9 个时钟上的应答位。
+    ///
+    /// `acked = false` 就是 NACK。写事务里这个位由从机给，
+    /// 读事务里由主机给（读到最后一个字节时主机回 NACK）。
+    /// **两者在总线上是同一种东西**，所以这里不区分方向。
+    #[must_use]
+    pub fn byte(mut self, b: u8, acked: bool) -> Tx {
+        for i in (0..8).rev() {
+            self.bits.push(Bit::Data((b >> i) & 1 == 1));
+        }
+        // 第 9 拍：SDA 低 = 应答，高 = 不应答
+        self.bits.push(Bit::Data(!acked));
+        self
+    }
+
+    /// 重复起始（`Sr`）：不产生 STOP，直接把总线重新拉起来。
+    #[must_use]
+    pub fn repeated_start(mut self) -> Tx {
+        self.bits.push(Bit::Setup);
+        self.bits.push(Bit::Start);
+        self
+    }
+
+    /// 停止条件 + 两个空闲位，让帧之间有可见的间隙。
+    ///
+    /// ⚠ 那个 `PreStop` **不能省**：如果最后一个字节是被 NACK 的（SDA 停在
+    /// 高电平），直接发 `Stop`（它要求 SDA 从**低**升到高）就会先产生一个
+    /// 「SDA 高→低」的下降沿 —— 而那时 SCL 是高，于是被解码成**一个假的
+    /// START**。一次事务里凭空多出一个起始条件，`START != STOP`。
+    ///
+    /// 回归：这个 bug 是被 `generated_i2c_is_actually_decodable` 那句
+    /// 「START/STOP 应成对」当场抓住的（28 vs 9），不是靠读代码看出来的。
+    #[must_use]
+    pub fn stop(mut self) -> Tx {
+        self.bits.push(Bit::PreStop);
+        self.bits.push(Bit::Stop);
+        self.bits.push(Bit::Idle);
+        self.bits.push(Bit::Idle);
+        self
+    }
+
+    /// 取出位序列。
+    pub fn build(self) -> Vec<Bit> {
+        self.bits
+    }
 }
 
 /// 用给定的字节序列构造一次 I2C 事务（每个字节后自动补一个 ACK 位）。
 pub fn transaction(bytes: &[u8]) -> Vec<Bit> {
-    let mut bits = vec![Bit::Start];
+    let mut t = Tx::new();
     for &b in bytes {
-        for i in (0..8).rev() {
-            bits.push(Bit::Data((b >> i) & 1 == 1));
-        }
-        bits.push(Bit::Data(false)); // ACK（从机拉低）
+        t = t.byte(b, true); // 每个字节都被应答
     }
-    bits.push(Bit::Stop);
-    bits.push(Bit::Idle);
-    bits.push(Bit::Idle);
-    bits
+    t.stop().build()
 }
 
 /// 一个 SCL 比特时隙的纳秒数。
@@ -374,8 +496,13 @@ impl I2cBus {
 
     /// 用自定义事务构造。
     pub fn with_transaction(scl_hz: u64, bytes: &[u8]) -> I2cBus {
+        I2cBus::with_bits(scl_hz, transaction(bytes))
+    }
+
+    /// 用一串现成的位构造 —— 需要重复起始或 NACK 时走这个。
+    pub fn with_bits(scl_hz: u64, bits: Vec<Bit>) -> I2cBus {
         I2cBus {
-            bits: transaction(bytes),
+            bits,
             bit_ns: ns_per_bit(scl_hz),
         }
     }
@@ -412,6 +539,21 @@ impl I2cBus {
             Bit::Data(level) => {
                 // SCL 前半低、后半高；SDA 整段恒定
                 (in_bit >= self.bit_ns / 2, level)
+            }
+            // 两个建立时隙都做成跟 `Data` 一样的 SCL 形状（前半低、后半高），
+            // SDA 的跳变放在 **SCL 为低的窗口里**（1/4 处）。
+            //
+            // 为什么不把 SCL 整拍拉低：那会让 SCL 周期多出一整拍，
+            // 于是「100 kHz 场景」实测出来是 96.9 kHz —— 一个 Agent 量到
+            // 这个数字会以为自己发现了问题，其实是我们造波形造错了。
+            // SCL 的形状必须**逐拍一致**，乱掉的只能是 SDA。
+            Bit::Setup => {
+                // SDA 低 → 高，跳变发生在 SCL 尚为低的时候
+                (in_bit >= self.bit_ns / 2, in_bit >= self.bit_ns / 4)
+            }
+            Bit::PreStop => {
+                // SDA 高 → 低，同样落在 SCL 为低的窗口里
+                (in_bit >= self.bit_ns / 2, in_bit < self.bit_ns / 4)
             }
             Bit::Idle => (true, true),
         }
@@ -484,7 +626,7 @@ mod tests {
         // 数量写死是有意的：它逼你在加变体时回来把数字和 `ALL` 一起改。
         assert_eq!(
             Scenario::ALL.len(),
-            8,
+            9,
             "场景数变了 —— 请同步更新 Scenario::ALL 和这个数字"
         );
 
@@ -646,26 +788,35 @@ mod tests {
 
         let (bytes, starts, stops) = decode_i2c(&scl, &sda);
 
-        assert!(starts >= 3, "4096 点应覆盖多次事务，实际 START={starts}");
-        // 最后一个事务可能被采集窗口截断 —— 此时 START 比 STOP 多一个，是正常的。
-        // 但绝不允许反过来（有 STOP 却没有配对的 START），那才是真的解错了。
+        assert!(stops >= 3, "4096 点应覆盖多次事务，实际 STOP={stops}");
+        // 每笔事务是「写寄存器指针 → **重复起始** → 读两个字节」，
+        // 所以天然有 **2 个起始条件**（初始 START + 重复起始）和 1 个 STOP。
+        //
+        // 回归：这条断言从前写的是 `starts == stops || starts == stops + 1` ——
+        // 那个等式只在「只有写、没有读」的单向事务下成立。场景里补上读事务
+        // 之后它当场变红，提醒的是：**断言里编码的是旧的事务形状**。
         assert!(
-            starts == stops || starts == stops + 1,
-            "START/STOP 应成对（允许末尾截断一帧）：START={starts} STOP={stops}"
+            starts >= 2 * stops && starts <= 2 * stops + 1,
+            "每笔事务应有 2 个起始条件（初始 + 重复起始），末尾可能多一个截断帧：             START={starts} STOP={stops}"
         );
 
-        // 内容必须确定：每帧都是 0x88 0x00 0x1A
+        // 内容必须确定。每笔事务 5 个字节：
+        //   0x88 = 地址 0x44 + 写        0x00 = 寄存器指针
+        //   0x89 = 地址 0x44 + 读        0x01 0x2C = 读回的两个字节
         assert!(!bytes.is_empty(), "应解出字节");
-        for (i, chunk) in bytes.chunks(3).enumerate() {
-            if chunk.len() < 3 {
+        let mut full = 0;
+        for (i, chunk) in bytes.chunks(5).enumerate() {
+            if chunk.len() < 5 {
                 break; // 尾部截断的半帧，忽略
             }
             assert_eq!(
                 chunk,
-                &[0x88, 0x00, 0x1A],
-                "第 {i} 帧内容不符（解码器或模拟器有 bug）"
+                &[0x88, 0x00, 0x89, 0x01, 0x2C],
+                "第 {i} 笔事务内容不符（解码器或模拟器有 bug）"
             );
+            full += 1;
         }
+        assert!(full >= 3, "应至少解出 3 笔完整事务，实际 {full}");
     }
 
     #[test]
@@ -705,7 +856,12 @@ mod tests {
         // 且 SDA 在该点为 0/1 之一 —— 两者必须来自同一时刻。
         let (bytes, starts, _stops) = decode_i2c(&chans[0], &chans[1]);
         assert!(starts >= 1, "对齐后应能解出帧");
-        assert_eq!(&bytes[..3], &[0x88, 0x00, 0x1A], "两路对齐后应解出正确内容");
+        // 对齐的直接证据：两路解出的字节序列完全一致且内容正确
+        assert_eq!(
+            &bytes[..5],
+            &[0x88, 0x00, 0x89, 0x01, 0x2C],
+            "两路对齐后应解出正确内容"
+        );
     }
 
     #[test]
@@ -756,8 +912,20 @@ mod tests {
         // 1 MHz 也要精确
         assert_eq!(I2cBus::new(1_000_000).bit_ns, 1_000);
 
-        // 一帧 = START + 9×3 位 + STOP + 2 空闲 = 31 位
-        assert_eq!(bus100.frame_ns(), 31 * 10_000);
+        // 一笔事务的位数（见 `default_i2c_transaction`）：
+        //   1  START
+        //   9  地址 0x88 + 应答
+        //   9  寄存器指针 0x00 + 应答
+        //   1  Setup（重复起始的建立时隙）
+        //   1  Start（重复起始）
+        //   9  地址 0x89 + 应答
+        //   9  数据 0x01 + 主机应答
+        //   9  数据 0x2C + 主机**不**应答
+        //   1  PreStop（停止的建立时隙）
+        //   1  Stop
+        //   2  Idle
+        //  ── 共 52 位
+        assert_eq!(bus100.frame_ns(), 52 * 10_000);
     }
 
     #[test]
