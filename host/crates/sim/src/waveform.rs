@@ -32,22 +32,35 @@ pub enum Scenario {
 }
 
 impl Scenario {
+    /// 全部场景。
+    ///
+    /// **新增场景时这里和 [`Scenario::name`] 都要动**：`name()` 是穷尽 match，
+    /// 加了变体不给名字编译不过；本数组则是 `all_names()` 与测试的依据。
+    ///
+    /// 从前 `parse` 与 `name` 是**两份各写一遍的 match** —— 给某个场景改名时
+    /// 只改一处，`parse` 认的名字与 `name()` 报出的名字就会悄悄分家，
+    /// 而两边都编译得过。现在 `parse` 是从 `name()` 反向推出来的，分不了家。
+    pub const ALL: [Scenario; 8] = [
+        Scenario::Sine1k3v3,
+        Scenario::Square50k,
+        Scenario::PulseGlitch,
+        Scenario::Noise,
+        Scenario::Dc,
+        Scenario::Am,
+        Scenario::I2c100k,
+        Scenario::I2c400k,
+    ];
+
     /// 从字符串解析（供 CLI / MCP 使用）。
+    ///
+    /// 只认 [`Scenario::name`] 给出的那些名字 —— 两者同源，不可能是两套。
     pub fn parse(s: &str) -> Option<Scenario> {
-        Some(match s {
-            "sine_1k_3v3" => Scenario::Sine1k3v3,
-            "square_50k" => Scenario::Square50k,
-            "pulse_glitch" => Scenario::PulseGlitch,
-            "noise" => Scenario::Noise,
-            "dc" => Scenario::Dc,
-            "am" => Scenario::Am,
-            "i2c_100k" => Scenario::I2c100k,
-            "i2c_400k" => Scenario::I2c400k,
-            _ => return None,
-        })
+        Self::ALL.into_iter().find(|c| c.name() == s)
     }
 
     /// 场景名。
+    ///
+    /// 穷尽 match：加变体会编译不过，逼你顺手给它起名字。
     pub fn name(self) -> &'static str {
         match self {
             Scenario::Sine1k3v3 => "sine_1k_3v3",
@@ -59,6 +72,14 @@ impl Scenario {
             Scenario::I2c100k => "i2c_100k",
             Scenario::I2c400k => "i2c_400k",
         }
+    }
+
+    /// 全部场景名。
+    ///
+    /// MCP 工具 schema 里 `sim_scenario` 的 `enum` 直接用它生成 ——
+    /// 于是「schema 列出的场景」与「`parse` 认的场景」是同一份清单。
+    pub fn all_names() -> impl Iterator<Item = &'static str> {
+        Self::ALL.into_iter().map(|c| c.name())
     }
 
     /// 该场景需要几个通道。
@@ -77,10 +98,20 @@ impl Scenario {
 #[derive(Debug, Clone)]
 pub struct Rng(u64);
 
+/// xorshift 零状态的替代种子。
+///
+/// 零是吸收态（xorshift 从 0 出发永远出 0），必须避开；但**不能像从前那样
+/// 用 `seed | 1`** —— 那会把每一对相邻种子折成同一个（2 与 3 都变成 3），
+/// 于是「换个种子看看」有一半的概率拿到一模一样的波形。
+const NONZERO_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
 impl Rng {
     /// 用给定种子创建。
+    ///
+    /// 只有 `0` 会被替换成 [`NONZERO_SEED`]，其余原样 —— 相邻种子必须
+    /// 给出不同的波形序列。
     pub fn new(seed: u64) -> Rng {
-        Rng(seed | 1) // 避免 0 种子
+        Rng(if seed == 0 { NONZERO_SEED } else { seed })
     }
 
     /// 下一个 u64。
@@ -139,6 +170,17 @@ impl WaveformGen {
     /// 当前场景。
     pub fn scenario(&self) -> Scenario {
         self.scenario
+    }
+
+    /// 换随机种子。
+    ///
+    /// **只有 [`Scenario::Noise`] 会用到 rng**，所以换种子只对它有影响 ——
+    /// 其余场景要么是纯解析式，要么（[`Scenario::PulseGlitch`]）刻意做成
+    /// 确定性的，好让 minmax 预览里那个尖峰落在可断言的位置。
+    ///
+    /// **不动样点计数** —— 相位保持连续，不会因为换了种子就让波形跳一下。
+    pub fn set_seed(&mut self, seed: u64) {
+        self.rng = Rng::new(seed);
     }
 
     /// 切换场景（保留样点计数，相位连续）。
@@ -408,17 +450,66 @@ mod tests {
     }
 
     #[test]
+    fn set_seed_changes_the_waveform_without_resetting_phase() {
+        // MCP 的 scope_sim_set_scenario 会把 seed 透传到这里。换种子必须
+        // 真的换掉波形（否则工具是个摆设），同时**不动样点计数** ——
+        // 相位跳变会让「换种子」看起来像「总线重启」。
+        let mut g = WaveformGen::new(Scenario::Noise, 1);
+        let before = g.generate(0, 64, 1_000_000);
+
+        let mut same = WaveformGen::new(Scenario::Noise, 1);
+        let _ = same.generate(0, 64, 1_000_000);
+        same.set_seed(9);
+        let after = same.generate(0, 64, 1_000_000);
+        assert_ne!(after, before, "换了种子波形应当不同");
+
+        // 相位连续：换种子后再跑一段正弦，不该出现第一个样点突然归零之类的跳变
+        let mut s = WaveformGen::new(Scenario::Sine1k3v3, 1);
+        let a = s.generate(0, 1, 857_142);
+        s.set_seed(12345);
+        let b = s.generate(0, 1, 857_142);
+        let step = (a[0] as i32 - b[0] as i32).abs();
+        assert!(
+            step < 500,
+            "换种子不该让相位跳变（相邻样点差 {step}，正弦 1 kHz 时每步只该走十几 LSB）"
+        );
+    }
+
+    #[test]
+    fn every_variant_is_listed_in_all() {
+        // `ALL` 是 `all_names()` 与 MCP schema enum 的依据。加变体却忘了
+        // 往 `ALL` 里加，`name()` 那边编译得过（穷尽 match 只管名字），
+        // 于是新场景对 MCP 与 CLI **完全不可见** —— 这个测试就是防这个。
+        //
+        // 数量写死是有意的：它逼你在加变体时回来把数字和 `ALL` 一起改。
+        assert_eq!(
+            Scenario::ALL.len(),
+            8,
+            "场景数变了 —— 请同步更新 Scenario::ALL 和这个数字"
+        );
+
+        for s in Scenario::ALL {
+            assert_eq!(
+                Scenario::parse(s.name()),
+                Some(s),
+                "{} 不能往返 —— parse 与 name 分家了",
+                s.name()
+            );
+        }
+        assert_eq!(Scenario::all_names().count(), Scenario::ALL.len());
+    }
+
+    #[test]
+    fn parse_rejects_names_that_are_not_in_all() {
+        assert_eq!(Scenario::parse("i2c_999k"), None);
+        // 大小写不敏感是有意的「不做」：名字要精确，免得 Agent 以为
+        // `I2C_100K` 能用而实际拿到另一回事。
+        assert_eq!(Scenario::parse("I2C_100K"), None);
+    }
+
+    #[test]
     fn all_samples_stay_in_12bit_range() {
-        for sc in [
-            Scenario::Sine1k3v3,
-            Scenario::Square50k,
-            Scenario::PulseGlitch,
-            Scenario::Noise,
-            Scenario::Dc,
-            Scenario::Am,
-            Scenario::I2c100k,
-            Scenario::I2c400k,
-        ] {
+        for sc in Scenario::ALL {
             for seed in [1u64, 7, 99] {
                 let mut g = WaveformGen::new(sc, seed);
                 for ch in 0..sc.channel_count() {

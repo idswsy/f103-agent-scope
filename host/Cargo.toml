@@ -31,6 +31,16 @@ serde_json  = "1"
 thiserror   = { version = "2" }
 anyhow      = "1"
 
+# MCP 工具 schema。**唯一用途**：把参数类型直接生成 JSON Schema，替掉
+# 手写的 `input_schema` 字符串 —— 手写的那份与实现之间没有任何机制保证一致。
+#
+# MSRV：schemars 与它带进来的 6 个包最高声明 1.74，**没有**抬门槛。
+# ⚠ 但 `thiserror 2.0.21`（早就锁在 Cargo.lock 里）要求 rustc ≥ 1.77，
+# 而本文件写的是 1.75 —— 这条违约在加 schemars **之前**就存在，
+# CI 用的是 stable 所以一直没暴露。要么把它降到 1.75 能用，要么把
+# `rust-version` 改成 1.77。属既有问题，别记在这次改动头上。
+schemars    = { version = "1.2", default-features = false, features = ["derive", "std"] }
+
 # GUI。渲染后端是 feature 开关（egui-wgpu / egui_glow 在 crate 元数据里都是
 # optional，只有 winit 是必需的），所以这里显式写死默认特性、不依赖隐式默认值。
 eframe      = "0.36.2"

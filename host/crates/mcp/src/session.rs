@@ -17,6 +17,12 @@
 //! 所以直接同步处理即可 —— GUI 那边需要 worker 线程是因为绘制不能阻塞，
 //! 这里没有这个问题。
 
+use crate::params::{
+    defaults, AcqMode, CaptureArgs, ConfigureArgs, ConnectArgs, DebugRawArgs, I2cDecodeArgs,
+    MeasureArgs, MetricKind, ReadWaveformArgs, SampleFormat, SaveCaptureArgs, SaveFormat,
+    SimSetScenarioArgs, TransportArg, TriggerEdge, TriggerMode, WatchArgs,
+};
+use scope_core::acquire::MAX_TIMEOUT_MS;
 use scope_core::i2c_decode::{decode_capture, detect_channels, I2cDecodeConfig, Levels};
 use scope_core::{
     acquire_cancellable, state_name, AcquireParams, Capture, CaptureStore, ChannelScale, Cmd,
@@ -28,17 +34,15 @@ use serde_json::{json, Value};
 use std::sync::atomic::AtomicBool;
 
 /// 预览点数上限 —— 三层防护第一层。
-const PREVIEW_MAX: usize = 256;
-/// `read_waveform` 的默认点数与硬顶 —— 第二层。
-const READ_DEFAULT: usize = 512;
-const READ_HARD_CAP: usize = 4096;
+const PREVIEW_MAX: u64 = defaults::PREVIEW_POINTS;
+/// `read_waveform` 的硬顶 —— 第二层。
+const READ_HARD_CAP: u64 = 4096;
 
-/// 可选场景清单。
-///
-/// 抽成常量：之前两处各写一遍，其中一处用 `\` 续行时把源码缩进写进了字符串，
-/// 渲染出来中间一大段空白（这个坑在帮助页上也踩过一次）。
-const SCENARIO_LIST: &str =
-    "sine_1k_3v3 / square_50k / pulse_glitch / noise / dc / am / i2c_100k / i2c_400k";
+/// 判为「高/低」的门限上界（12-bit ADC）。
+const LEVEL_MAX_LSB: u64 = 4095;
+
+/// `SET_ACQ.mode` 的单次采集取值（见 `proto/protocol.h`）。
+const ACQ_MODE_SINGLE: u8 = 0;
 
 /// 一次 MCP 会话。
 pub struct Session {
@@ -88,20 +92,124 @@ impl From<anyhow::Error> for ToolError {
 
 type R = std::result::Result<Value, ToolError>;
 
-/// 取 `capture_id`。
-fn req_capture_id(p: &Value) -> std::result::Result<u16, ToolError> {
-    p.get("capture_id")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| ToolError {
-            message: "缺少 capture_id".into(),
-            hint: Some("先 scope_capture，或用 scope_list_captures 看现存采集".into()),
-        })
-        .and_then(|raw| {
-            u16::try_from(raw).map_err(|_| ToolError {
-                message: format!("capture_id={raw} 超出范围（有效值 0..=65535）"),
-                hint: Some("用 scope_list_captures 看现存采集的 id".into()),
-            })
-        })
+/// 把 schema 里的整数收窄到实现要用的宽度，越界时给一句带「怎么办」的中文。
+///
+/// 参数 schema 里所有整数一律是 `u64`（见 `params.rs` 的模块注释），
+/// 真实边界靠这里把关。**不能靠 serde 的类型来把关** —— 它只会说
+/// `invalid value: integer 65537, expected u16`，既没有边界也没有「怎么办」。
+fn narrow<T>(
+    v: u64,
+    min: u64,
+    max: u64,
+    field: &str,
+    hint: &str,
+) -> std::result::Result<T, ToolError>
+where
+    T: TryFrom<u64>,
+{
+    // ⚠ 这一步是**真的在检查**，不是只把边界写进错误消息。
+    // `T::try_from` 本身只挡住「超出目标类型」的值 —— 它放行 0，
+    // 也放行 4096（当目标类型是 u16 时）。只靠它会漏掉所有
+    // 「类型装得下、但语义上越界」的输入。
+    if v < min || v > max {
+        return Err(ToolError {
+            message: format!("{field}={v} 超出范围（{min}..={max}）"),
+            hint: Some(hint.into()),
+        });
+    }
+    // 走到这里 v 一定在 T 的范围内（各调用点给的 max 都不超过目标类型的上界），
+    // 这个分支只是不 panic 的兜底。
+    T::try_from(v).map_err(|_| ToolError {
+        message: format!("{field}={v} 超出内部上限 {max}"),
+        hint: Some(hint.into()),
+    })
+}
+
+/// 把 schema 里的 `capture_id`（u64）收成 store 用的 `u16`。
+fn capture_id(raw: u64) -> std::result::Result<u16, ToolError> {
+    narrow(
+        raw,
+        0,
+        65_535,
+        "capture_id",
+        "用 scope_list_captures 看现存采集的 id",
+    )
+}
+
+/// 时间长度（ms）必须落在 `1..=MAX_TIMEOUT_MS`。
+///
+/// 这是**一条真正的防线**，不是参数洁癖：`Duration::from_millis(u64::MAX)`
+/// 交给 `Instant::now() + total` 之后，调用会**永久挂住且不报错** ——
+/// 实测一次 `scope_watch` 就能让整个 MCP server 从此不再响应任何请求，
+/// 只能杀进程重启，在途请求连同后续的全部丢失。
+fn check_timeout(ms: u64, field: &str) -> std::result::Result<(), ToolError> {
+    if ms == 0 || ms > MAX_TIMEOUT_MS {
+        return Err(ToolError {
+            message: format!("{field}={ms} 超出范围（1..={MAX_TIMEOUT_MS} 毫秒）"),
+            hint: Some(format!(
+                "{} 毫秒是上限（{} 分钟）。LLM 常拿大整数当「无限」，但那会让调用永久挂住而不是超时 —— \
+                 要长时间观察请分多次调用",
+                MAX_TIMEOUT_MS,
+                MAX_TIMEOUT_MS / 60_000
+            )),
+        });
+    }
+    Ok(())
+}
+
+/// 把 12-bit 门限收成 `u16`。
+///
+/// schema 已经写了 `range(0..=4095)`，这里再拦一道是因为 **`as u16` 会把
+/// 65536 静默回绕成 0** —— 一个「门限 = 0」的判决带能让整条总线看起来
+/// 全是高电平，而解码器照样返回一份像是成功的结果。
+fn level_lsb(
+    raw: Option<u64>,
+    default: u16,
+    field: &'static str,
+) -> std::result::Result<u16, ToolError> {
+    match raw {
+        None => Ok(default),
+        Some(v) => narrow(
+            v,
+            0,
+            LEVEL_MAX_LSB,
+            field,
+            "电平一律用 ADC LSB 整数（0..=4095）；伏特换算只在显示层做",
+        ),
+    }
+}
+
+/// 把收到的通道配置描述成人话，用在「尚未接线」的警告里。
+///
+/// 从前那条警告是一句固定的「channel 配置暂未接线上层」，不看内容 ——
+/// Agent 无法从响应里看出自己的参数到底有没有被读到。
+fn describe_channel(c: &crate::params::ChannelArgs) -> String {
+    let mut parts = Vec::new();
+    if let Some(v) = c.ch {
+        parts.push(format!("ch={v}"));
+    }
+    if let Some(v) = c.enable {
+        parts.push(format!("enable={v}"));
+    }
+    if let Some(v) = c.range_idx {
+        parts.push(format!("range_idx={v}"));
+    }
+    if let Some(v) = c.coupling {
+        parts.push(format!("coupling={}", v.name()));
+    }
+    if let Some(v) = c.offset_lsb {
+        parts.push(format!("offset_lsb={v}"));
+    }
+    if parts.is_empty() {
+        "(空对象)".into()
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// 收窄成 `u8` —— 通道号、量程档位这类。
+fn u8_field(v: u64, field: &str) -> std::result::Result<u8, ToolError> {
+    narrow(v, 0, 255, field, "取值范围 0..=255")
 }
 
 impl Session {
@@ -143,15 +251,16 @@ impl Session {
     }
 
     /// `scope_connect` —— 连接设备。
-    pub fn connect(&mut self, p: &Value) -> R {
-        let kind = match p.get("transport").and_then(|v| v.as_str()) {
-            Some(s) => TransportKind::parse(s).ok_or_else(|| ToolError {
-                message: format!("transport 只接受 \"serial\" 或 \"sim\"，收到 {s:?}"),
-                hint: Some("省略 transport 与 port 即使用模拟器".into()),
-            })?,
+    pub fn connect(&mut self, p: &ConnectArgs) -> R {
+        let kind = match p.transport {
+            // 只认 schema 里那两个名字 —— `TransportKind::parse` 还接受
+            // `simulator` / `uart` / `port` 这些别名（给人用的 CLI 走那条路），
+            // 但 MCP 这层要对齐 schema，否则 schema 又成了一句空话。
+            Some(TransportArg::Serial) => TransportKind::Serial,
+            Some(TransportArg::Sim) => TransportKind::Sim,
             // 没给 transport：给了 port 就当串口，否则模拟器
             None => {
-                if p.get("port").and_then(|v| v.as_str()).is_some() {
+                if p.port.is_some() {
                     TransportKind::Serial
                 } else {
                     TransportKind::Sim
@@ -159,17 +268,15 @@ impl Session {
             }
         };
 
-        let port = p.get("port").and_then(|v| v.as_str()).unwrap_or("");
-        let baud = p.get("baud").and_then(|v| v.as_u64()).unwrap_or(921_600) as u32;
+        let port = p.port.as_deref().unwrap_or("");
+        let baud = p.baud.unwrap_or(921_600);
         // 拼错了要报错，不能静默换成默认场景 —— 否则 Agent 以为连的是自己
-        // 指定的波形，实际是另一回事。
-        let scenario = match p.get("sim_scenario").and_then(|v| v.as_str()) {
-            Some(name) => Scenario::parse(name).ok_or_else(|| ToolError {
-                message: format!("未知场景 {name:?}"),
-                hint: Some(format!("可选：{SCENARIO_LIST}")),
-            })?,
-            None => Scenario::I2c100k,
-        };
+        // 指定的波形，实际是另一回事。`ScenarioArg` 的反序列化已经挡了
+        // 一层（错误里直接列出可选清单），这里只是把它变成默认值。
+        let scenario = p
+            .sim_scenario
+            .map(Scenario::from)
+            .unwrap_or(Scenario::I2c100k);
 
         if kind == TransportKind::Serial && port.trim().is_empty() {
             return Err(ToolError {
@@ -240,14 +347,28 @@ impl Session {
     }
 
     /// `scope_configure` —— 一个工具替代 N 个 `set_*`。
-    pub fn configure(&mut self, p: &Value) -> R {
+    pub fn configure(&mut self, p: &ConfigureArgs) -> R {
         let bus = self.bus("配置设备")?;
         let mut applied = serde_json::Map::new();
         let mut warnings: Vec<String> = Vec::new();
 
-        if let Some(hz) = p.get("sample_rate_hz").and_then(|v| v.as_u64()) {
-            let actual = bus.set_sample_rate(hz as u32).map_err(ToolError::from)?;
-            if actual as u64 != hz {
+        if let Some(hz) = p.sample_rate_hz {
+            // 先收窄再下发 —— `as u32` 会把 4294967297 变成 1，
+            // 于是「把采样率调到最大」变成「调到 1 Hz」还返回成功
+            // 上界必须与 schema 里 `range(max = MAX_SAMPLE_RATE_HZ)` 一致。
+            // 回归：这里曾用 `MAX_INTERLEAVED_HZ`(1714285) —— 那是「双 ADC
+            // 交织」的理论值、文档明说**只用于显示**，于是 1000000 这种
+            // 值能通过收窄、撞到核心层才失败，而 schema 和错误提示互相矛盾。
+            let hz32 = narrow::<u32>(
+                hz,
+                1,
+                u64::from(scope_core::f103::MAX_SAMPLE_RATE_HZ),
+                "sample_rate_hz",
+                "F103 单 ADC 的采样率上限是 857142 Hz（1714285 Hz 是双 ADC 交织的\
+                 理论上限，只用于显示、不可作测量依据）",
+            )?;
+            let actual = bus.set_sample_rate(hz32).map_err(ToolError::from)?;
+            if u64::from(actual) != hz {
                 // 回显值是唯一真值 —— 定时器只能出整数分频的档位
                 warnings.push(format!(
                     "请求采样率 {hz} Hz 被量化为 {actual} Hz，时间轴以 {actual} Hz 为准"
@@ -256,135 +377,199 @@ impl Session {
             applied.insert("sample_rate_hz".into(), json!(actual));
         }
 
-        if let Some(m) = p.get("mode").and_then(|v| v.as_str()) {
-            match m {
-                "single" => {
-                    applied.insert("mode".into(), json!("single"));
-                }
-                // 流模式固件侧还没实现（P1 之后的事）。明确说清楚，
-                // 而不是静默按单次跑 —— Agent 会以为拿到的是流数据。
-                "stream" => warnings.push(
+        // 采集方式。`stream` 尚未实现（固件侧 STREAMING 属 P1+），只警告、
+        // **不**把它算作「要下发 SET_ACQ」的理由 —— 否则就是回显一个
+        // 设备上根本没生效的值。
+        let want_acq_mode: Option<u8> = match p.mode {
+            None => None,
+            Some(AcqMode::Single) => Some(ACQ_MODE_SINGLE),
+            Some(AcqMode::Stream) => {
+                warnings.push(
                     "流模式尚未实现（固件侧 STREAMING 状态属 P1+），本次仍按单次采集处理".into(),
-                ),
-                other => {
-                    return Err(ToolError {
-                        message: format!("未知 mode {other:?}"),
-                        hint: Some("可选 single / stream".into()),
-                    })
-                }
+                );
+                None
             }
-        }
+        };
 
-        // 采集三件套（点数 / 格式 / 抽点）一起下发 —— `SET_ACQ` 是一条命令，
-        // 分三次调只会互相覆盖。缺省项沿用设备当前配置，不是硬编码的 0/1。
-        let cur_samples = bus.config.as_ref().map(|c| c.capture_samples as u64);
-        let cur_decim = bus.config.as_ref().map(|c| c.decimation as u64);
+        // 采集四件套（模式 / 点数 / 格式 / 抽点）一起下发 —— `SET_ACQ` 是一条
+        // 命令，分三次调只会互相覆盖。缺省项沿用设备当前配置，不是硬编码的 0/1。
+        //
+        // ⚠ `mode` 曾经**不在**这个条件里：单独调 `configure {mode:"single"}`
+        // 会回显 `applied.mode = "single"`，而设备一条命令都没收到 ——
+        // 一个「说生效了、其实没下发」的字段。工具描述还写着「返回实际生效值」。
+        let cur_samples = bus.config.as_ref().map(|c| u64::from(c.capture_samples));
+        let cur_decim = bus.config.as_ref().map(|c| u64::from(c.decimation));
         let cur_format = bus.config.as_ref().map(|c| c.format);
-        let want_samples = p.get("capture_samples").and_then(|v| v.as_u64());
-        let want_decim = p.get("decimation").and_then(|v| v.as_u64());
-        let want_format = p.get("format").and_then(|v| v.as_str());
-        if want_samples.is_some() || want_decim.is_some() || want_format.is_some() {
+        let cur_acq_mode = bus
+            .config
+            .as_ref()
+            .map(|c| c.acq_mode)
+            .unwrap_or(ACQ_MODE_SINGLE);
+        if want_acq_mode.is_some()
+            || p.capture_samples.is_some()
+            || p.decimation.is_some()
+            || p.format.is_some()
+        {
             // 先校验再转换 —— `as u16` 会把 65537 变成 1、131072 变成 0，
             // 后者还会让之后每次采集都「成功但空」。
-            let max = scope_core::f103::MAX_CAPTURE_SAMPLES as u64;
-            let samples = want_samples.or(cur_samples).unwrap_or(4096);
-            if samples == 0 || samples > max {
-                return Err(ToolError {
-                    message: format!("capture_samples={samples} 超出范围（1..={max}）"),
-                    hint: Some("8 KB 环按 u16 折半就是 4096 点，这是 F103 的物理上限".into()),
-                });
-            }
-            let decimation = want_decim.or(cur_decim).unwrap_or(1);
-            if decimation == 0 || decimation > 256 {
-                return Err(ToolError {
-                    message: format!("decimation={decimation} 超出范围（1..=256）"),
-                    hint: None,
-                });
-            }
-            let (fmt_name, fmt_id) = match want_format {
+            let max = u64::from(scope_core::f103::MAX_CAPTURE_SAMPLES);
+            let samples = p.capture_samples.or(cur_samples).unwrap_or(max);
+            let samples = narrow::<u16>(
+                samples,
+                1,
+                max,
+                "capture_samples",
+                "8 KB 环按 u16 折半就是 4096 点，这是 F103 的物理上限",
+            )?;
+            let max_decim = u64::from(scope_core::f103::MAX_DECIMATION);
+            let decimation = narrow::<u16>(
+                p.decimation.or(cur_decim).unwrap_or(1),
+                1,
+                max_decim,
+                "decimation",
+                "抽点倍数上界来自协议：SET_ACQ.decimation 是 1..=256",
+            )?;
+            let (fmt_name, fmt_id) = match p.format {
                 None => ("(未改)", cur_format.unwrap_or(0)),
-                Some("raw") => ("raw", 0),
-                Some("packed12") => ("packed12", 1),
-                Some("minmax") => ("minmax", 2),
-                Some(other) => {
-                    return Err(ToolError {
-                        message: format!("未知 format {other:?}"),
-                        hint: Some("可选 raw / packed12 / minmax".into()),
-                    })
-                }
+                Some(SampleFormat::Raw) => ("raw", 0),
+                Some(SampleFormat::Packed12) => ("packed12", 1),
+                Some(SampleFormat::Minmax) => ("minmax", 2),
             };
-            bus.set_acq(0, samples as u16, fmt_id, decimation as u16)
+            // 采集模式：显式给了就用它，否则沿用现值 —— 从前这里写死 0，
+            // 会把设备上的采集模式悄悄改回「单次」
+            let acq_mode = want_acq_mode.unwrap_or(cur_acq_mode);
+            bus.set_acq(acq_mode, samples, fmt_id, decimation)
                 .map_err(ToolError::from)?;
             applied.insert("capture_samples".into(), json!(samples));
             applied.insert("decimation".into(), json!(decimation));
             if fmt_name != "(未改)" {
                 applied.insert("format".into(), json!(fmt_name));
             }
+            // 只有真下发了才回显 —— 这条插入从前在 `set_acq` 之外无条件执行
+            if want_acq_mode.is_some() {
+                applied.insert("mode".into(), json!("single"));
+            }
         }
 
-        if let Some(t) = p.get("trigger") {
-            let mode = t.get("mode").and_then(|v| v.as_str()).unwrap_or("normal");
+        if let Some(t) = &p.trigger {
+            // 省略的子项**沿用设备当前值** —— 与上面采集三件套同一套语义。
+            //
+            // 回归：从前这里一律 `unwrap_or(默认)`，于是 Agent 只想改个电平，
+            // 却把刚配好的 auto 模式 / 下降沿 / CH1 全部重置回
+            // normal / rising / CH0 —— 而 schema 里那句「省略的项沿用设备
+            // 当前值」还挂着。两个分支在同一函数里各说各话。
+            let cur = bus.config.clone();
+            let mode = t
+                .mode
+                .unwrap_or_else(|| match cur.as_ref().map(|c| c.trigger_mode) {
+                    Some(0) => TriggerMode::Auto,
+                    Some(2) => TriggerMode::Single,
+                    _ => TriggerMode::Normal,
+                });
             let mode_id = match mode {
-                "auto" => 0u8,
-                "single" => 2,
-                _ => 1,
+                TriggerMode::Auto => 0u8,
+                TriggerMode::Normal => 1,
+                TriggerMode::Single => 2,
             };
-            let edge = match t.get("edge").and_then(|v| v.as_str()) {
-                Some("falling") => 1u8,
-                _ => 0u8,
+            let edge = t
+                .edge
+                .unwrap_or_else(|| match cur.as_ref().map(|c| c.trigger_edge) {
+                    Some(1) => TriggerEdge::Falling,
+                    _ => TriggerEdge::Rising,
+                });
+            let edge_id = match edge {
+                TriggerEdge::Rising => 0u8,
+                TriggerEdge::Falling => 1,
             };
             // 电平既可以给 LSB，也可以给伏特（上位机换算 —— MCU 不碰浮点）
-            let level_lsb = match (
-                t.get("level_lsb").and_then(|v| v.as_u64()),
-                t.get("level_v").and_then(|v| v.as_f64()),
-            ) {
-                // 同样先校验再转换：`as u16` 会把 99999 回绕成 34463
-                (Some(l), _) if l <= 4095 => l as u16,
-                (Some(l), _) => {
-                    return Err(ToolError {
-                        message: format!("trigger.level_lsb={l} 超出 12-bit 范围（0..=4095）"),
-                        hint: Some("也可以改传 level_v（伏特）".into()),
-                    })
-                }
+            let level = match (t.level_lsb, t.level_v) {
+                (Some(l), _) => narrow::<u16>(
+                    l,
+                    0,
+                    LEVEL_MAX_LSB,
+                    "trigger.level_lsb",
+                    "电平是 12-bit ADC 的 LSB 整数；也可以改传 level_v（伏特）",
+                )?,
                 (None, Some(v)) => {
+                    // `volts_to_lsb` 回 i32，所以负电平在这里被挡住
                     let lsb = ChannelScale::default().volts_to_lsb(v);
-                    if !(0..=4095).contains(&lsb) {
+                    if !(0..=LEVEL_MAX_LSB as i32).contains(&lsb) {
                         return Err(ToolError {
                             message: format!("trigger.level_v={v} 超出 12-bit ADC 量程"),
                             hint: Some(
-                                "电压换算用的是未标定的占位参数（3.3 V / 4096、零点 2048），                                 范围约 -1.65..=+1.65 V；也可以直接给 level_lsb"
+                                "电压换算用的是未标定的占位参数（3.3 V / 4096、零点 2048），\
+                                 范围约 -1.65..=+1.65 V；也可以直接给 level_lsb"
                                     .into(),
                             ),
                         });
                     }
                     lsb as u16
                 }
-                (None, None) => 2048,
+                (None, None) => cur.as_ref().map(|c| c.trigger_level_lsb).unwrap_or(2048),
             };
-            let source = t.get("source").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
-            bus.set_trigger(mode_id, source, edge, level_lsb, 1024, 1000)
+            // `trig_src_t`：0=CH1 / 1=CH2 / 2=软件。**不是 0..=255** ——
+            // 从前用 u8，`3` 与 `255` 会被静默收下、原样下发给设备。
+            let source = match t.source {
+                Some(v) => narrow::<u8>(
+                    v,
+                    0,
+                    2,
+                    "trigger.source",
+                    "触发源见 proto/protocol.h 的 trig_src_t：0=CH1 / 1=CH2 / 2=软件触发",
+                )?,
+                None => cur.as_ref().map(|c| c.trigger_source).unwrap_or(0),
+            };
+            bus.set_trigger(mode_id, source, edge_id, level, 1024, 1000)
                 .map_err(ToolError::from)?;
             applied.insert(
                 "trigger".into(),
-                json!({ "mode": mode, "edge": edge, "source": source, "level_lsb": level_lsb }),
+                json!({
+                    "mode": mode.name(),
+                    "edge": edge.name(),
+                    "source": source,
+                    "level_lsb": level,
+                }),
             );
         }
 
-        if p.get("channel").is_some() {
-            warnings.push("channel 配置暂未接线上层（固件侧 SET_CHANNEL 已就绪）".into());
+        if let Some(c) = &p.channel {
+            // 固件侧 SET_CHANNEL 已就绪，但这一层还没接。**回显收到的内容** ——
+            // 只说一句「暂未接线」的话，Agent 无从判断参数有没有被读到。
+            warnings.push(format!(
+                "channel 配置暂未接线上层（收到 {}；固件侧 SET_CHANNEL 已就绪）",
+                describe_channel(c)
+            ));
         }
 
         Ok(json!({ "applied": applied, "warnings": warnings }))
     }
 
     /// `scope_capture` —— 采一次，**只回统计量 + 预览**。
-    pub fn capture(&mut self, p: &Value) -> R {
-        let timeout_ms = p.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(2000);
-        let max_preview = p
-            .get("max_preview_points")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(PREVIEW_MAX as u64)
-            .min(PREVIEW_MAX as u64) as usize;
+    pub fn capture(&mut self, p: &CaptureArgs) -> R {
+        // 从前 `mode` 在 schema 里声明了却**没人读** —— 传 `"stream"` 会静默
+        // 按单次跑，而 Agent 以为拿到的是流数据。现在明确告诉它去哪。
+        if p.mode == Some(AcqMode::Stream) {
+            return Err(ToolError {
+                message: "scope_capture 不支持流模式".into(),
+                hint: Some(
+                    "流模式固件侧尚未实现（P1+）。要在一段时间里连续观察请用 scope_watch".into(),
+                ),
+            });
+        }
+
+        let timeout_ms = p.timeout_ms.unwrap_or(defaults::CAPTURE_TIMEOUT_MS);
+        check_timeout(timeout_ms, "timeout_ms")?;
+        // 0 会让 `Capture::preview` 返回 `None` —— 一次「成功但没有预览」的
+        // 采集，Agent 很容易读成「没采到数据」。硬顶是设计（省 token），
+        // 下限也必须挡（否则是另一种静默的怪结果）。
+        let max_preview = p.max_preview_points.unwrap_or(PREVIEW_MAX);
+        if max_preview == 0 {
+            return Err(ToolError {
+                message: "max_preview_points 至少为 1".into(),
+                hint: Some(format!("上限是 {PREVIEW_MAX}（三层 token 防护第一层）")),
+            });
+        }
+        let max_preview = max_preview.min(PREVIEW_MAX) as usize;
 
         let cap = self.acquire_raw(timeout_ms)?;
         let out = capture_summary_json(&cap, max_preview);
@@ -419,30 +604,32 @@ impl Session {
     }
 
     /// `scope_read_waveform` —— 分页拉样点。**超出硬顶直接拒绝**。
-    pub fn read_waveform(&mut self, p: &Value) -> R {
-        let id = req_capture_id(p)?;
-        let ch = p.get("channel").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let start = p.get("start_sample").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    pub fn read_waveform(&mut self, p: &ReadWaveformArgs) -> R {
+        let id = capture_id(p.capture_id)?;
+        let ch = match p.channel {
+            Some(v) => u8_field(v, "channel")? as usize,
+            None => defaults::ZERO as usize,
+        };
+        let start = p.start_sample.unwrap_or(defaults::ZERO);
+        // `format` 只有一个合法值（schema 里就写着 enum: ["raw"]），解析成功
+        // 即等于「要 raw」。取出来是为了**回显在响应里** —— Agent 需要知道
+        // 拿到的是原始 12-bit LSB 整数，不是伏特。
+        let format = p.format.unwrap_or(crate::params::ReadFormat::Raw);
         // `count` 是主参数；`max_points` 作为旧名保留兼容。两个都给时以 `count`
         // 为准 —— 之前是「谁先出现用谁」，同一个请求换个字段顺序结果就不一样。
-        let want_raw = p
-            .get("count")
-            .or_else(|| p.get("max_points"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(READ_DEFAULT as u64);
+        let want_raw = p.count.or(p.max_points).unwrap_or(defaults::READ_COUNT);
         if want_raw == 0 {
             return Err(ToolError {
                 message: "count 至少为 1".into(),
                 hint: Some("要看空页就不必调用它".into()),
             });
         }
-        let want = want_raw as usize;
 
         // 硬顶：超过就**拒绝**，不做静默截断 —— 静默截断会让 Agent
         // 以为拿到了全部数据。要全量请走 scope_save_capture。
-        if want > READ_HARD_CAP {
+        if want_raw > READ_HARD_CAP {
             return Err(ToolError {
-                message: format!("一次最多读 {READ_HARD_CAP} 点，请求了 {want} 点"),
+                message: format!("一次最多读 {READ_HARD_CAP} 点，请求了 {want_raw} 点"),
                 hint: Some(
                     "分页读取（改 start_sample 多次调用），或改用 scope_save_capture 落盘 \
                      后用别的工具分析 —— 全量数据不进 LLM 上下文。"
@@ -450,6 +637,7 @@ impl Session {
                 ),
             });
         }
+        let want = want_raw as usize;
 
         let cap = self.store.get(id).ok_or_else(|| ToolError {
             message: format!("找不到采集 {id}"),
@@ -460,66 +648,84 @@ impl Session {
             hint: Some("用 scope_status 看设备的通道数".into()),
         })?;
 
-        // ⚠ `start` 是从未经校验的 u64 转来的，`start + want` 会溢出 ——
-        // debug 构建下直接 panic，**整个 MCP server 进程随之死掉**，
-        // 后续请求（包括在途的）全部丢失。
-        // 回归：`start_sample: 18446744073709551615` 一次就能远程打挂 server（rc=101）。
-        if start >= s.len() {
+        // ⚠ 这段的顺序不能动。`start` 是 u64（schema 不设上界，因为「越界的
+        // start 返回空页」是**约定行为**），所以**必须先比长度再转 usize**：
+        // 从前是 `start + want` 直接算，溢出后 debug 构建 panic，整个 MCP
+        // server 进程死掉（rc=101），后续请求连同在途的一起丢。
+        // 回归：`start_sample: 18446744073709551615` 一次就能远程打挂它。
+        let len = s.len();
+        if start >= len as u64 {
+            // 空页要**和正常页同形** —— `rate_hz`/`format` 一个都不能少。
+            // 回归：`format` 是后加的，只加在下面那条路径上，于是同一个工具
+            // 对合法请求返回两种形状；靠 `format` 判断样点单位的调用方
+            // 在分页末尾会拿到 undefined。
             return Ok(json!({
-                "capture_id": id, "channel": ch, "start_sample": start,
-                "count": 0, "has_more": false, "samples": [],
-                "note": format!("start_sample 超出采集长度（本次共 {} 点）", s.len()),
+                "capture_id": id,
+                "channel": ch,
+                "start_sample": start,
+                "count": 0,
+                "rate_hz": cap.rate_hz,
+                "format": format.name(),
+                "has_more": false,
+                "samples": [],
+                "note": format!("start_sample 超出采集长度（本次共 {len} 点）"),
             }));
         }
-        let end = start.saturating_add(want).min(s.len());
-        let slice: Vec<u16> = s[start..end].to_vec();
+        let from = start as usize; // 上面已保证 start < len，这里转换不会截断
+        let end = from.saturating_add(want).min(len);
+        let slice: Vec<u16> = s[from..end].to_vec();
         Ok(json!({
             "capture_id": id,
             "channel": ch,
             "start_sample": start,
             "count": slice.len(),
             "rate_hz": cap.rate_hz,
-            "has_more": end < s.len(),
+            "format": format.name(),
+            "has_more": end < len,
             "samples": slice,
         }))
     }
 
     /// `scope_measure` —— 主机侧定点测量（精度最高）。
-    pub fn measure(&mut self, p: &Value) -> R {
-        let id = req_capture_id(p)?;
+    pub fn measure(&mut self, p: &MeasureArgs) -> R {
+        let id = capture_id(p.capture_id)?;
         let cap = self.store.get(id).ok_or_else(|| ToolError {
             message: format!("找不到采集 {id}"),
             hint: Some("用 scope_list_captures 看现存采集".into()),
         })?;
 
-        // 只测指定通道（省略则全测）
-        let only_ch = p
-            .get("channel")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
-
-        // 只回指定指标（省略则全回）。**拼错的名字要报错** —— 静默忽略会让
-        // Agent 以为测过了，实际那一项根本没算。
-        const KINDS: [&str; 8] = ["vpp", "min", "max", "mean", "rms", "freq", "duty", "rise"];
-        let want: Option<Vec<String>> = match p.get("metrics").and_then(|v| v.as_array()) {
-            Some(a) => {
-                let names: Vec<String> = a
-                    .iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .collect();
-                if let Some(bad) = names.iter().find(|n| !KINDS.contains(&n.as_str())) {
+        // 只测指定通道（省略则全测）。
+        //
+        // 越界的通道号要**报错**，不能回一份空测量 ——
+        // 回归：`channel: 7`（本次只有 2 个通道）从前返回
+        // `{"measurements":{}, "note":"电压为未标定换算…"}` 且 `isError=false`，
+        // 读起来像「这个采集没有数据」，而不是「你给的通道不存在」。
+        // 同一个参数名在 `scope_read_waveform` 里是会报错的。
+        let only_ch = match p.channel {
+            Some(v) => {
+                let ch = u8_field(v, "channel")? as usize;
+                let n = cap.channels.len();
+                if ch >= n {
                     return Err(ToolError {
-                        message: format!("未知指标 {bad:?}"),
-                        hint: Some(format!("可用：{}", KINDS.join(" / "))),
+                        message: format!("通道越界：本次采集只有 {n} 个通道（编号 0..={}）", n - 1),
+                        hint: Some("用 scope_status 看设备的通道数".into()),
                     });
                 }
-                Some(names)
+                Some(ch)
             }
             None => None,
         };
-        let has = |k: &str| match &want {
+
+        // 只回指定指标（省略则全回）。
+        //
+        // 从前这里有一份手写的 `const KINDS: [&str; 8]`，而 schema 里另有一份
+        // 一模一样的枚举 —— 两份靠人眼保持一致。**现在清单就是 `MetricKind`
+        // 这个类型**：schema 由它生成，解析由它把关，拼错的名字在参数那一关
+        // 就被挡下（错误信息由 serde 给出，还附带合法取值）。
+        let want = p.metrics.as_deref();
+        let has = |k: MetricKind| match want {
             None => true,
-            Some(w) => w.iter().any(|x| x == k),
+            Some(w) => w.contains(&k),
         };
 
         let scale = ChannelScale::default();
@@ -530,28 +736,28 @@ impl Session {
             }
             if let Some(m) = scope_core::measure(cap, ch, &scale) {
                 let mut row = serde_json::Map::new();
-                if has("vpp") {
+                if has(MetricKind::Vpp) {
                     row.insert("vpp_v".into(), json!(m.vpp));
                 }
-                if has("min") {
+                if has(MetricKind::Min) {
                     row.insert("min_v".into(), json!(m.min));
                 }
-                if has("max") {
+                if has(MetricKind::Max) {
                     row.insert("max_v".into(), json!(m.max));
                 }
-                if has("mean") {
+                if has(MetricKind::Mean) {
                     row.insert("mean_v".into(), json!(m.mean));
                 }
-                if has("rms") {
+                if has(MetricKind::Rms) {
                     row.insert("ac_rms_v".into(), json!(m.ac_rms));
                 }
-                if has("freq") {
+                if has(MetricKind::Freq) {
                     row.insert("freq_hz".into(), json!(m.freq_hz));
                 }
-                if has("duty") {
+                if has(MetricKind::Duty) {
                     row.insert("duty_pct".into(), json!(m.duty_pct));
                 }
-                if has("rise") {
+                if has(MetricKind::Rise) {
                     row.insert("rise_ns".into(), json!(m.rise_ns));
                 }
                 out.insert(format!("ch{ch}"), Value::Object(row));
@@ -566,8 +772,8 @@ impl Session {
     }
 
     /// `scope_i2c_decode` —— 本项目的招牌能力。
-    pub fn i2c_decode(&mut self, p: &Value) -> R {
-        let id = req_capture_id(p)?;
+    pub fn i2c_decode(&mut self, p: &I2cDecodeArgs) -> R {
+        let id = capture_id(p.capture_id)?;
         let cap = self.store.get(id).ok_or_else(|| ToolError {
             message: format!("找不到采集 {id}"),
             hint: Some("用 scope_list_captures 看现存采集".into()),
@@ -585,24 +791,14 @@ impl Session {
 
         // 单侧给也要生效 —— 之前只有两个都给才用传入值，其余整体退默认，
         // 于是「只调 VIH」静默失效。
+        //
+        // 顺带堵掉一个回绕：从前 `as u16` 会把 65536 变成 **0**，一个
+        // 「门限 = 0」的判决带能让整条总线看起来全是高电平，而解码器
+        // 照样返回一份像是成功的结果。
         let dflt = Levels::default_ratio();
-        let levels = match (
-            p.get("vih_lsb").and_then(|v| v.as_u64()),
-            p.get("vil_lsb").and_then(|v| v.as_u64()),
-        ) {
-            (Some(h), Some(l)) => Levels {
-                vih_lsb: h as u16,
-                vil_lsb: l as u16,
-            },
-            (Some(h), None) => Levels {
-                vih_lsb: h as u16,
-                vil_lsb: dflt.vil_lsb,
-            },
-            (None, Some(l)) => Levels {
-                vih_lsb: dflt.vih_lsb,
-                vil_lsb: l as u16,
-            },
-            (None, None) => dflt,
+        let levels = Levels {
+            vih_lsb: level_lsb(p.vih_lsb, dflt.vih_lsb, "vih_lsb")?,
+            vil_lsb: level_lsb(p.vil_lsb, dflt.vil_lsb, "vil_lsb")?,
         };
         if !levels.is_valid() {
             return Err(ToolError {
@@ -614,13 +810,27 @@ impl Session {
             });
         }
 
-        // 通道没指定就自动判定（SCL 的边沿比 SDA 密）
-        let (scl, sda) = match (
-            p.get("scl_channel").and_then(|v| v.as_u64()),
-            p.get("sda_channel").and_then(|v| v.as_u64()),
-        ) {
-            (Some(a), Some(b)) => (a as usize, b as usize),
-            _ => detect_channels(cap, levels, 50).unwrap_or((0, 1)),
+        // 通道没指定就自动判定（SCL 的边沿比 SDA 密）。
+        //
+        // ⚠ 只给一个的话要报错，不能默默退回自动判定 —— 从前的 `_ =>` 分支
+        // 把「只指定了 SCL」变成「你指定的那个也没生效」，而返回的帧列表
+        // 看上去完全正常（自动判定大多能猜对），于是这个 bug 几乎不可能被发现。
+        let auto = detect_channels(cap, levels, 50).unwrap_or((0, 1));
+        let (scl, sda) = match (p.scl_channel, p.sda_channel) {
+            (Some(a), Some(b)) => (
+                u8_field(a, "scl_channel")? as usize,
+                u8_field(b, "sda_channel")? as usize,
+            ),
+            (None, None) => auto,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ToolError {
+                    message: "scl_channel 与 sda_channel 要么都给，要么都不给".into(),
+                    hint: Some(format!(
+                        "都不给时按边沿密度自动判定（SCL 边沿更密），本次会判成 SCL={} SDA={}",
+                        auto.0, auto.1
+                    )),
+                })
+            }
         };
 
         // 先按 MCP 自己的参数名报越界 —— core 的报错里字段叫 `i2c_channel`，
@@ -632,12 +842,28 @@ impl Session {
                 hint: Some("scl_channel / sda_channel 从 0 起算".into()),
             });
         }
+        if scl == sda {
+            return Err(ToolError {
+                message: format!("scl_channel 与 sda_channel 不能是同一个通道（都是 {scl}）"),
+                hint: Some("两条线是两个不同的通道".into()),
+            });
+        }
 
         let cfg = I2cDecodeConfig {
             scl_channel: scl,
             sda_channel: sda,
             levels,
-            debounce_ns: p.get("debounce_ns").and_then(|v| v.as_u64()).unwrap_or(50) as u32,
+            // 0 是合法的（不去抖）—— schema 里曾经写 `range(min = 1)`，
+            // 那是把实现做得到的事说小了。上限则**必须**有：窗口开到与时钟
+            // 周期一个量级，真实边沿会被当毛刺滤掉，而解码器仍报 trustworthy。
+            debounce_ns: narrow::<u32>(
+                p.debounce_ns.unwrap_or(defaults::DEBOUNCE_NS),
+                0,
+                defaults::MAX_DEBOUNCE_NS,
+                "debounce_ns",
+                "纳秒；0 表示不去抖。窗口接近时钟周期（400 kHz 时半周期 1250 ns）\
+                 会把真实边沿当毛刺滤掉",
+            )?,
         };
         let d = decode_capture(cap, &cfg).map_err(ToolError::from)?;
 
@@ -709,31 +935,19 @@ impl Session {
     }
 
     /// `scope_save_capture` —— 全量落盘。**数据不进 LLM 上下文。**
-    pub fn save_capture(&self, p: &Value) -> R {
-        let id = req_capture_id(p)?;
-        let path = p
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError {
-                message: "缺少 path".into(),
-                hint: Some("要写到哪？例如 ./captures/cap1.csv".into()),
-            })?;
+    pub fn save_capture(&self, p: &SaveCaptureArgs) -> R {
+        let id = capture_id(p.capture_id)?;
+        // schema 里曾经宣称支持 npy / bin，实现却一律写 CSV —— 静默落错格式
+        // 比报错危险得多：Agent 会拿一个 CSV 当二进制去解析。
+        // 现在 `SaveFormat` 只有一个变体，非 csv 在参数那一关就被挡下，
+        // 这里的 `unwrap_or` 只是取出「用户确认要的那个格式」。
+        let format = p.format.unwrap_or(SaveFormat::Csv);
+        let path = p.path.as_str();
 
         let cap = self.store.get(id).ok_or_else(|| ToolError {
             message: format!("找不到采集 {id}"),
             hint: Some("用 scope_list_captures 看现存采集".into()),
         })?;
-
-        // schema 里曾经宣称支持 npy / bin，实际一律写 CSV —— 静默落错格式
-        // 比报错危险得多：Agent 会拿一个 CSV 当二进制去解析。
-        if let Some(f) = p.get("format").and_then(|v| v.as_str()) {
-            if f != "csv" {
-                return Err(ToolError {
-                    message: format!("暂不支持导出 {f} 格式"),
-                    hint: Some("目前只能写 csv；npy / bin 尚未实现".into()),
-                });
-            }
-        }
 
         let scales: Vec<ChannelScale> = (0..cap.channels.len())
             .map(|_| ChannelScale::default())
@@ -745,6 +959,7 @@ impl Session {
 
         Ok(json!({
             "saved": path,
+            "format": format.name(),
             "bytes": std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
             "note": "全量样点已落盘。不要在对话里读它 —— 4096 点 ≈ 上万 token",
         }))
@@ -761,16 +976,23 @@ impl Session {
     ///   会伪装成「1 秒里 100 万次没触发」，还返回 `isError=false`。
     /// - **中间采集不入库**。初版全部都 push，500 ms 就能把用户已有的采集
     ///   全挤出容量 16 的历史。改为只保留第一次，供 Agent 后续 measure/decode。
-    pub fn watch(&mut self, p: &Value) -> R {
-        let duration_ms = p
-            .get("duration_ms")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1000);
-        let max_preview = p
-            .get("max_points")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(128)
-            .min(PREVIEW_MAX as u64) as usize;
+    pub fn watch(&mut self, p: &WatchArgs) -> R {
+        let duration_ms = p.duration_ms.unwrap_or(defaults::WATCH_MS);
+        // ⚠ 这条检查是**必需的**，不是参数洁癖：下面那个 deadline 一旦被算到
+        // 天文数字，这个 while 循环会永远转下去，而 `serve()` 是单线程 ——
+        // 整个 server 从此不再响应任何请求，只能杀进程重启。
+        // 回归：`{"duration_ms": 18446744073709551615}` 一次就能做到（实测
+        // 15 秒无任何响应，被外部强杀）。
+        check_timeout(duration_ms, "duration_ms")?;
+
+        let max_preview = p.max_points.unwrap_or(defaults::WATCH_POINTS);
+        if max_preview == 0 {
+            return Err(ToolError {
+                message: "max_points 至少为 1".into(),
+                hint: Some(format!("上限是 {PREVIEW_MAX}（三层 token 防护第一层）")),
+            });
+        }
+        let max_preview = max_preview.min(PREVIEW_MAX) as usize;
 
         if self.bus.is_none() {
             return Err(ToolError {
@@ -822,24 +1044,49 @@ impl Session {
     }
 
     /// `scope_sim_set_scenario` —— 仅模拟器。
-    pub fn sim_set_scenario(&mut self, p: &Value) -> R {
-        let name = p
-            .get("scenario")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError {
-                message: "缺少 scenario".into(),
-                hint: Some(format!("可选：{SCENARIO_LIST}")),
-            })?;
-        let sc = Scenario::parse(name).ok_or_else(|| ToolError {
-            message: format!("未知场景 {name:?}"),
-            hint: Some("见 scope_debug_raw 之外的场景清单".into()),
-        })?;
+    ///
+    /// `scenario` 的合法性在参数那关就验过了（[`ScenarioArg`] 的反序列化
+    /// 会列出全部可选值），所以这里不再重复一遍清单。
+    pub fn sim_set_scenario(&mut self, p: &SimSetScenarioArgs) -> R {
+        let sc = Scenario::from(p.scenario);
+
+        // 先**校验并算好**故障配置，再动设备。
+        //
+        // 回归：从前这一句跟在 `set_scenario` / `set_seed` **之后**，于是
+        // 参数非法时是「半应用」—— 场景与种子已经改了，故障没改，而工具
+        // 返回的是错误。Agent 会以为整次调用都没生效。
+        let faults = match &p.inject {
+            Some(inj) => Some(inj.clone().into_faults().map_err(|m| {
+                ToolError {
+                    message: m,
+                    hint: Some(
+                        "概率是 0.0..=1.0 的比值。要关掉这一项就把它设成 0，\
+                     不是设成负数 —— 负值会被当成「越界」拒绝而不是「关闭」"
+                            .into(),
+                    ),
+                }
+            })?),
+            None => None,
+        };
 
         let bus = self.bus("切换场景")?;
         let _ = bus.stop();
         match bus.port_mut().sim_mut() {
             Some(sim) => {
                 sim.set_scenario(sc);
+                // `seed` 与 `inject` 从前是**声明了但没人读**：传了就返回成功，
+                // 而工具说明写着「注入故障」。Agent 于是会拿着干净数据下结论，
+                // 以为自己刚注入过故障。现在它们真的生效。
+                if let Some(seed) = p.seed {
+                    sim.set_seed(seed);
+                }
+                if let Some(f) = faults {
+                    // 整体替换，不做合并 —— 「我还留着哪些故障」不该靠翻历史才知道
+                    sim.faults = f;
+                }
+                let faults = sim.faults.clone();
+                let clean = faults.is_clean();
+
                 // 场景换了通道数也会换（i2c 是 2 通道，正弦是 1 通道）。
                 // 不重新 GET_INFO 的话，之后 capture 会拿旧的 ch_count 去拉
                 // 不存在的通道，设备回 BadParam，而提示会把排查方向指错。
@@ -847,6 +1094,15 @@ impl Session {
                 Ok(json!({
                     "scenario": sc.name(),
                     "channels": bus.info.as_ref().map(|i| i.ch_count),
+                    "seed_set": p.seed,
+                    // 回显故障状态：Agent 在解读后续采集前，必须先知道
+                    // 这些「异常」是不是自己刚注入的
+                    "faults_clean": clean,
+                    "note": if clean {
+                        "模拟器当前不注入任何故障"
+                    } else {
+                        "模拟器正在注入故障 —— 采集里的异常可能是注入出来的，不是真的"
+                    },
                 }))
             }
             None => Err(ToolError {
@@ -857,14 +1113,16 @@ impl Session {
     }
 
     /// `scope_debug_raw` —— 开发者逃生门。
-    pub fn debug_raw(&mut self, p: &Value) -> R {
-        let code = p
-            .get("cmd")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| ToolError {
-                message: "缺少 cmd（命令码）".into(),
-                hint: None,
-            })? as u16;
+    pub fn debug_raw(&mut self, p: &DebugRawArgs) -> R {
+        // 先收窄再查表 —— 从前是 `as u16`，于是 `cmd: 65537` **回绕成 1**，
+        // 一个越界的输入变成了一条真实存在的命令。
+        let code = narrow::<u16>(
+            p.cmd,
+            0,
+            u64::from(u16::MAX),
+            "cmd",
+            "命令码是 u16，见 proto/protocol.h 的命令表",
+        )?;
         let cmd = Cmd::try_from_u16(code).ok_or_else(|| ToolError {
             message: format!("未知命令码 0x{code:04X}"),
             hint: Some("见 proto/protocol.h 的命令表".into()),
@@ -873,7 +1131,7 @@ impl Session {
         // 逐个 token 严格解析 —— `filter_map(..ok())` 会把解析失败的字节**静默
         // 丢掉**，于是「发的 payload」与「写的 payload」不是一回事，
         // 而调试工具最怕的就是这个。
-        let payload: Vec<u8> = match p.get("payload_hex").and_then(|v| v.as_str()) {
+        let payload: Vec<u8> = match p.payload_hex.as_deref() {
             None => Vec::new(),
             Some(h) => {
                 let mut out = Vec::with_capacity(h.len() / 2);
@@ -998,19 +1256,34 @@ fn capture_summary_json(cap: &Capture, max_preview: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::de::DeserializeOwned;
+
+    /// 把 JSON 解成参数类型 —— 走的是**真的反序列化路径**（含
+    /// `deny_unknown_fields` 与各字段的类型检查），不是直接构造结构体。
+    /// 直接构造的话，这些测试就绕开了这次重构最想守住的那道关。
+    fn args<T: DeserializeOwned>(v: Value) -> T {
+        serde_json::from_value(v).expect("测试给的参数应当能解析")
+    }
+
+    /// 同上，但预期解析会失败。
+    fn try_args<T: DeserializeOwned>(v: Value) -> std::result::Result<T, serde_json::Error> {
+        serde_json::from_value(v)
+    }
 
     /// 连模拟器 + 采一次，返回会话。
     fn connected() -> Session {
         let mut s = Session::new();
-        s.connect(&json!({ "transport": "sim", "sim_scenario": "i2c_100k" }))
-            .expect("连模拟器不该失败");
+        s.connect(&args(
+            json!({ "transport": "sim", "sim_scenario": "i2c_100k" }),
+        ))
+        .expect("连模拟器不该失败");
         s
     }
 
     #[test]
     fn refuses_to_work_before_connecting() {
         let mut s = Session::new();
-        let e = s.capture(&json!({})).unwrap_err();
+        let e = s.capture(&args(json!({}))).unwrap_err();
         assert!(e.message.contains("尚未连接"), "实测 {}", e.message);
         assert!(e.hint.is_some(), "错误必须给出「怎么办」");
     }
@@ -1019,11 +1292,11 @@ mod tests {
     fn capture_returns_stats_and_preview_but_not_the_raw_waveform() {
         // 三层 token 防护的第一层：统计量 + ≤256 点预览，绝不回全量样点。
         let mut s = connected();
-        let v = s.capture(&json!({})).unwrap();
+        let v = s.capture(&args(json!({}))).unwrap();
         assert!(v["sample_count"].as_u64().unwrap() > 1000);
         assert!(!v["channels"].as_array().unwrap().is_empty());
         let pts = v["preview"]["points"].as_u64().unwrap();
-        assert!(pts <= PREVIEW_MAX as u64, "预览桶数 {pts} 超过上限");
+        assert!(pts <= PREVIEW_MAX, "预览桶数 {pts} 超过上限");
         // 关键：**响应体积有上界**。
         //
         // 直接按「有没有样点数组」查会误伤吗？不会 —— 但要区分清楚：
@@ -1038,13 +1311,29 @@ mod tests {
     }
 
     #[test]
+    fn capture_rejects_stream_mode_instead_of_silently_doing_one_shot() {
+        // 回归：`mode` 从前在 schema 里声明了却**没人读** ——
+        // 传 "stream" 会静默按单次跑，而 Agent 以为拿到的是流数据。
+        let mut s = connected();
+        let e = s.capture(&args(json!({ "mode": "stream" }))).unwrap_err();
+        assert!(e.message.contains("流模式"), "实测 {}", e.message);
+        assert!(
+            e.hint.as_deref().unwrap_or("").contains("scope_watch"),
+            "要说清替代方案，实测 {:?}",
+            e.hint
+        );
+        // "single" 照常
+        assert!(s.capture(&args(json!({ "mode": "single" }))).is_ok());
+    }
+
+    #[test]
     fn read_waveform_rejects_requests_over_the_hard_cap() {
         // 超硬顶必须**拒绝**，不能静默截断 —— 静默截断会让 Agent
         // 以为拿到了全部数据。要全量请走 save_capture。
         let mut s = connected();
-        let _ = s.capture(&json!({})).unwrap();
+        let _ = s.capture(&args(json!({}))).unwrap();
         let e = s
-            .read_waveform(&json!({ "capture_id": 1, "count": 99999 }))
+            .read_waveform(&args(json!({ "capture_id": 1, "count": 99999 })))
             .unwrap_err();
         assert!(e.message.contains("4096"), "实测 {}", e.message);
         assert!(
@@ -1056,23 +1345,49 @@ mod tests {
     #[test]
     fn read_waveform_pages() {
         let mut s = connected();
-        let _ = s.capture(&json!({})).unwrap();
+        let _ = s.capture(&args(json!({}))).unwrap();
         let a = s
-            .read_waveform(&json!({ "capture_id": 1, "count": 16 }))
+            .read_waveform(&args(json!({ "capture_id": 1, "count": 16 })))
             .unwrap();
         assert_eq!(a["count"], 16);
         assert_eq!(a["has_more"], true);
+        assert_eq!(
+            a["format"], "raw",
+            "回显格式 —— 样点是原始 LSB 整数，不是伏特"
+        );
         let b = s
-            .read_waveform(&json!({ "capture_id": 1, "start_sample": 16, "count": 16 }))
+            .read_waveform(&args(
+                json!({ "capture_id": 1, "start_sample": 16, "count": 16 }),
+            ))
             .unwrap();
         assert_ne!(a["samples"], b["samples"], "分页两段不该相同");
     }
 
     #[test]
+    fn read_waveform_count_wins_over_the_legacy_max_points() {
+        // 两个都给时以 `count` 为准 —— 回归：从前是「谁先出现用谁」，
+        // 同一个请求换个字段顺序结果就不一样。
+        let mut s = connected();
+        let _ = s.capture(&args(json!({}))).unwrap();
+        let v = s
+            .read_waveform(&args(json!({
+                "capture_id": 1, "max_points": 32, "count": 8
+            })))
+            .unwrap();
+        assert_eq!(v["count"], 8);
+        let v = s
+            .read_waveform(&args(json!({
+                "capture_id": 1, "count": 8, "max_points": 32
+            })))
+            .unwrap();
+        assert_eq!(v["count"], 8, "换个字段顺序不该改变结果");
+    }
+
+    #[test]
     fn i2c_decode_returns_frames() {
         let mut s = connected();
-        let _ = s.capture(&json!({})).unwrap();
-        let v = s.i2c_decode(&json!({ "capture_id": 1 })).unwrap();
+        let _ = s.capture(&args(json!({}))).unwrap();
+        let v = s.i2c_decode(&args(json!({ "capture_id": 1 }))).unwrap();
         assert!(v["frame_count"].as_u64().unwrap() > 0, "应解出帧");
         let f = &v["frames"][0];
         assert_eq!(f["address"]["value"], 0x44, "模拟器的默认事务是 0x44");
@@ -1083,30 +1398,241 @@ mod tests {
     #[test]
     fn i2c_decode_on_a_single_channel_capture_says_why() {
         let mut s = Session::new();
-        s.connect(&json!({ "transport": "sim", "sim_scenario": "sine_1k_3v3" }))
-            .unwrap();
-        let _ = s.capture(&json!({})).unwrap();
-        let e = s.i2c_decode(&json!({ "capture_id": 1 })).unwrap_err();
+        s.connect(&args(
+            json!({ "transport": "sim", "sim_scenario": "sine_1k_3v3" }),
+        ))
+        .unwrap();
+        let _ = s.capture(&args(json!({}))).unwrap();
+        let e = s.i2c_decode(&args(json!({ "capture_id": 1 }))).unwrap_err();
         assert!(e.message.contains("两条线"), "实测 {}", e.message);
         assert!(e.hint.is_some());
     }
 
     #[test]
+    fn i2c_decode_refuses_a_half_specified_channel_pair() {
+        // 回归：从前的 `_ =>` 分支把「只指定了 SCL」变成「两个都忽略、
+        // 退回自动判定」。自动判定多半能猜对，于是返回的帧列表看着完全
+        // 正常 —— 这个 bug 几乎不可能被顺路径测试发现。
+        let mut s = connected();
+        let _ = s.capture(&args(json!({}))).unwrap();
+        let e = s
+            .i2c_decode(&args(json!({ "capture_id": 1, "scl_channel": 0 })))
+            .unwrap_err();
+        assert!(e.message.contains("要么都给"), "实测 {}", e.message);
+        assert!(
+            e.hint.as_deref().unwrap_or("").contains("SCL="),
+            "提示里要顺带告诉它自动判定会怎么判，实测 {:?}",
+            e.hint
+        );
+        // 两个都给就正常。但「正常」本身说明不了显式通道被采用了 ——
+        // 自动判定多半也判成 (0,1)，静默忽略同样能拿到这份结果。
+        // 所以判据是**把两条线对调**：结果必须跟着变。
+        let normal = s
+            .i2c_decode(&args(json!({
+                "capture_id": 1, "scl_channel": 0, "sda_channel": 1
+            })))
+            .unwrap();
+        assert!(normal["frame_count"].as_u64().unwrap() > 0);
+
+        let swapped = s
+            .i2c_decode(&args(json!({
+                "capture_id": 1, "scl_channel": 1, "sda_channel": 0
+            })))
+            .unwrap();
+        assert_eq!(swapped["scl_channel"], 1, "回显的应当是显式给的那个通道");
+        assert_ne!(
+            normal["signal_quality"]["scl_edges"], swapped["signal_quality"]["scl_edges"],
+            "把 SCL/SDA 对调之后边沿统计没变 —— 显式通道其实没被采用？"
+        );
+    }
+
+    #[test]
+    fn i2c_decode_rejects_a_level_that_would_wrap_around() {
+        // 65536 as u16 == 0。一个「门限 = 0」的判决带能让整条总线看起来
+        // 全是高电平，而解码器照样返回一份像是成功的结果。
+        let mut s = connected();
+        let _ = s.capture(&args(json!({}))).unwrap();
+        for bad in [65536u32, 4096, u32::MAX] {
+            let e = s
+                .i2c_decode(&args(json!({ "capture_id": 1, "vih_lsb": bad })))
+                .unwrap_err();
+            assert!(
+                e.message.contains(&bad.to_string()),
+                "vih_lsb={bad} 应当被拒绝，实测 {}",
+                e.message
+            );
+        }
+        // 4095 是边界内，应当通过
+        assert!(s
+            .i2c_decode(&args(
+                json!({ "capture_id": 1, "vih_lsb": 4095, "vil_lsb": 100 })
+            ))
+            .is_ok());
+    }
+
+    #[test]
     fn configure_reports_the_quantized_rate() {
         // SET_* 必须回显实际生效值 —— 定时器只能出整数分频的档位。
+        //
+        // 回归：这条测试**曾经用 857143**（比上限大 1）来触发量化。改成按
+        // schema 声明的上界拒绝越界值之后，那个输入直接撞在参数校验上，
+        // 测的就不再是量化逻辑了。这里换成范围内、但落在两个定时器档位
+        // 之间的值（72 MHz / 100001 不是整数分频）。
         let mut s = connected();
-        let v = s.configure(&json!({ "sample_rate_hz": 857_143 })).unwrap();
-        assert_eq!(v["applied"]["sample_rate_hz"], 857_142);
+        let v = s
+            .configure(&args(json!({ "sample_rate_hz": 100_001 })))
+            .unwrap();
+        let actual = v["applied"]["sample_rate_hz"].as_u64().unwrap();
+        assert_ne!(actual, 100_001, "100001 Hz 不是可达到的档位，应当被量化");
         let w = v["warnings"].as_array().unwrap();
         assert!(!w.is_empty(), "量化了就要说");
-        assert!(w[0].as_str().unwrap().contains("857142"));
+        assert!(
+            w[0].as_str().unwrap().contains(&actual.to_string()),
+            "量化提示里要写清实际值，实测 {:?}",
+            w[0]
+        );
+    }
+
+    #[test]
+    fn configure_rejects_a_rate_above_the_single_adc_limit() {
+        // schema 里写的是 `max = MAX_SAMPLE_RATE_HZ`(857142，单 ADC)，
+        // 而 `MAX_INTERLEAVED_HZ`(1714285) 是双 ADC 交织的**理论上限**、
+        // 文档明说只用于显示。两者不能混用 ——
+        // 回归：收窄当初用的是交织上限，于是 1000000 能过这一关再撞到核心层，
+        // 而错误消息说「上限 1714285 Hz」，与 schema 自相矛盾。
+        let mut s = connected();
+        for (v, ok) in [(857_142u64, true), (857_143, false), (1_000_000, false)] {
+            let r = s.configure(&args(json!({ "sample_rate_hz": v })));
+            assert_eq!(r.is_ok(), ok, "sample_rate_hz={v} 的接受性不对：{r:?}");
+            if !ok {
+                let e = r.unwrap_err();
+                assert!(
+                    e.message.contains("857142"),
+                    "错误里要说清真实上界，实测 {}",
+                    e.message
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configure_echoes_the_channel_it_received() {
+        // channel 尚未接线，但**必须回显收到了什么** —— 只说一句「暂未接线」
+        // 的话，Agent 无从判断自己的参数有没有被读到。
+        let mut s = connected();
+        let v = s
+            .configure(&args(json!({
+                "channel": { "ch": 0, "enable": false, "coupling": "ac", "offset_lsb": -100 }
+            })))
+            .unwrap();
+        let w = v["warnings"].as_array().unwrap();
+        let joined = w
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined.contains("coupling=ac"), "实测 {joined}");
+        assert!(joined.contains("offset_lsb=-100"), "实测 {joined}");
+        assert!(joined.contains("enable=false"), "实测 {joined}");
+    }
+
+    #[test]
+    fn configure_reports_the_trigger_it_applied_in_canonical_form() {
+        let mut s = connected();
+        let v = s
+            .configure(&args(json!({
+                "trigger": { "mode": "auto", "edge": "falling", "level_lsb": 1000, "source": 0 }
+            })))
+            .unwrap();
+        assert_eq!(v["applied"]["trigger"]["mode"], "auto");
+        assert_eq!(v["applied"]["trigger"]["edge"], "falling");
+        assert_eq!(v["applied"]["trigger"]["level_lsb"], 1000);
+    }
+
+    #[test]
+    fn configured_trigger_survives_a_capture() {
+        // 这条才是「configure 真的下发到设备了」的判据 ——
+        // 上面那条只看回显，而回显是照着请求拼出来的，**发错电平它也不会红**。
+        //
+        // 而且必须**中间夹一次采集**：采集路径（`core/acquire.rs`）从前会
+        // 无条件重发 `set_trigger(1, 0, 0, ..)` 与 `set_acq(0, .., 0, 1)`，
+        // 把 configure 配好的触发模式/边沿/源与采集格式/抽点整个推回默认。
+        // 配置在 `scope_status` 里「看着生效」，真正决定数据的那一次却没用上。
+        let mut s = connected();
+        // ⚠ 每个值都要**与 acquire 从前的硬编码不同**，否则测不出覆盖。
+        // `source` 曾经配 0 —— 而硬编码的 source 也是 0，于是「source 被覆盖」
+        // 这个变异体它能照样通过（第一版就是这么写的，被验证抓出来了）。
+        // 硬编码是 (mode=1 normal, source=0 CH1, edge=0 rising) + (format=0, decim=1)。
+        s.configure(&args(json!({
+            "decimation": 8,
+            "format": "minmax",
+            "trigger": { "mode": "auto", "edge": "falling", "level_lsb": 1000, "source": 1 }
+        })))
+        .unwrap();
+
+        let before = s.status().unwrap()["config"].clone();
+        assert_eq!(before["trigger_mode"], 0, "configure 之后设备侧就该是 auto");
+        assert_eq!(
+            before["trigger_source"], 1,
+            "configure 之后设备侧就该是 CH2"
+        );
+        assert_eq!(before["format"], 2, "configure 之后设备侧就该是 minmax");
+
+        let _ = s.capture(&args(json!({}))).unwrap();
+
+        let after = s.status().unwrap()["config"].clone();
+        // 五个字段都要比 —— 少了 `trigger_level_lsb` 的话，
+        // 「acquire 把电平钉成 2048」这个变异体不会被发现。
+        for k in [
+            "trigger_mode",
+            "trigger_edge",
+            "trigger_source",
+            "trigger_level_lsb",
+            "format",
+            "decimation",
+        ] {
+            assert_eq!(
+                after[k], before[k],
+                "采集之后 {k} 被改回了默认值 —— acquire 又在硬编码 set_trigger/set_acq？"
+            );
+        }
+    }
+
+    #[test]
+    fn configure_omitted_trigger_fields_inherit_from_the_device() {
+        // schema 里写着「省略的子项沿用设备当前值」，这条测试就是那句话的判据。
+        // 回归：从前实现一律 `unwrap_or(默认)`，于是 Agent 只想改个电平，
+        // 却把刚配好的 auto / 下降沿 / CH1 全部重置回 normal / rising / CH0 ——
+        // 与同函数里采集三件套（它们**确实**沿用现值）各说各话。
+        let mut s = connected();
+        s.configure(&args(json!({
+            "trigger": { "mode": "auto", "edge": "falling", "level_lsb": 1000, "source": 1 }
+        })))
+        .unwrap();
+
+        // 只改电平，别的都不给
+        let v = s
+            .configure(&args(json!({ "trigger": { "level_lsb": 1500 } })))
+            .unwrap();
+        assert_eq!(v["applied"]["trigger"]["level_lsb"], 1500);
+        assert_eq!(v["applied"]["trigger"]["mode"], "auto", "模式应当沿用");
+        assert_eq!(v["applied"]["trigger"]["edge"], "falling", "边沿应当沿用");
+        // `source` 也要查 —— 少了它，`None => 0` 那个变异体照样绿
+        assert_eq!(v["applied"]["trigger"]["source"], 1, "触发源应当沿用");
+
+        // 省略 level 时也该沿用现值，不是跳回 2048
+        let v = s
+            .configure(&args(json!({ "trigger": { "mode": "normal" } })))
+            .unwrap();
+        assert_eq!(v["applied"]["trigger"]["level_lsb"], 1500, "电平应当沿用");
+        assert_eq!(v["applied"]["trigger"]["source"], 1, "触发源应当沿用");
     }
 
     #[test]
     fn measure_reports_honest_units() {
         let mut s = connected();
-        let _ = s.capture(&json!({})).unwrap();
-        let v = s.measure(&json!({ "capture_id": 1 })).unwrap();
+        let _ = s.capture(&args(json!({}))).unwrap();
+        let v = s.measure(&args(json!({ "capture_id": 1 }))).unwrap();
         let ch0 = &v["measurements"]["ch0"];
         // 幅值必须是正的 —— 回归：曾经把幅值当电平换算，得到负数
         assert!(ch0["vpp_v"].as_f64().unwrap() > 0.0);
@@ -1117,25 +1643,17 @@ mod tests {
     }
 
     #[test]
-    fn reject_bad_transport_with_a_hint() {
-        let mut s = Session::new();
-        let e = s.connect(&json!({ "transport": "bogus" })).unwrap_err();
-        assert!(e.message.contains("serial"), "实测 {}", e.message);
-        assert!(e.hint.is_some());
-    }
-
-    #[test]
     fn read_waveform_survives_an_absurd_start_sample() {
         // 回归：start + want 曾溢出 → debug 下 panic → **整个 server 进程死掉**，
         // 后续请求（含在途的）全部丢失。一个合法 JSON 整数就能远程打挂它。
         let mut s = connected();
-        let _ = s.capture(&json!({})).unwrap();
+        let _ = s.capture(&args(json!({}))).unwrap();
         let v = s
-            .read_waveform(&json!({
+            .read_waveform(&args(json!({
                 "capture_id": 1,
                 "start_sample": u64::MAX,
                 "count": 1
-            }))
+            })))
             .expect("越界的 start_sample 应返回空页，而不是崩掉");
         assert_eq!(v["count"], 0);
         assert_eq!(v["has_more"], false);
@@ -1147,7 +1665,7 @@ mod tests {
         // 旧采集会**遮蔽**同 id 的新采集，measure/decode/read/save 全部
         // 静默返回过期数据。
         let mut s = connected();
-        let _ = s.capture(&json!({})).unwrap();
+        let _ = s.capture(&args(json!({}))).unwrap();
         assert_eq!(
             s.list_captures().unwrap()["captures"]
                 .as_array()
@@ -1156,8 +1674,10 @@ mod tests {
             1
         );
 
-        s.connect(&json!({ "transport": "sim", "sim_scenario": "sine_1k_3v3" }))
-            .unwrap();
+        s.connect(&args(
+            json!({ "transport": "sim", "sim_scenario": "sine_1k_3v3" }),
+        ))
+        .unwrap();
         assert_eq!(
             s.list_captures().unwrap()["captures"]
                 .as_array()
@@ -1166,7 +1686,7 @@ mod tests {
             0,
             "换连接后历史应清空，否则旧采集会遮蔽同 id 的新采集"
         );
-        let _ = s.capture(&json!({})).unwrap();
+        let _ = s.capture(&args(json!({}))).unwrap();
         let caps = s.list_captures().unwrap();
         let arr = caps["captures"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -1175,13 +1695,18 @@ mod tests {
 
     #[test]
     fn unknown_sim_scenario_is_rejected_not_silently_replaced() {
-        // 静默换成默认场景会让 Agent 以为连的是自己指定的波形
-        let mut s = Session::new();
-        let e = s
-            .connect(&json!({ "transport": "sim", "sim_scenario": "i2c_999k" }))
-            .unwrap_err();
-        assert!(e.message.contains("未知场景"), "实测 {}", e.message);
-        assert!(e.hint.unwrap().contains("i2c_100k"));
+        // 静默换成默认场景会让 Agent 以为连的是自己指定的波形。
+        // 现在这一关在**反序列化**时就守住了，错误里直接列出可选清单。
+        let e = try_args::<ConnectArgs>(json!({
+            "transport": "sim", "sim_scenario": "i2c_999k"
+        }))
+        .unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("未知场景"), "实测 {msg}");
+        assert!(
+            msg.contains("i2c_100k"),
+            "错误里应当列出可选场景，实测 {msg}"
+        );
     }
 
     #[test]
@@ -1189,32 +1714,33 @@ mod tests {
         let mut s = connected();
         // 65537 as u16 == 1：静默回绕会让「采 65537 点」变成「采 1 点」
         let e = s
-            .configure(&json!({ "capture_samples": 65537 }))
+            .configure(&args(json!({ "capture_samples": 65537 })))
             .unwrap_err();
         assert!(e.message.contains("65537"), "实测 {}", e.message);
         // 0 点会让每次采集都「成功但空」，状态还会持续污染历史
-        assert!(s.configure(&json!({ "capture_samples": 0 })).is_err());
+        assert!(s.configure(&args(json!({ "capture_samples": 0 }))).is_err());
     }
 
     #[test]
     fn save_capture_refuses_formats_it_cannot_write() {
-        // schema 曾宣称支持 npy / bin，实际一律写 CSV
-        let mut s = connected();
-        let _ = s.capture(&json!({})).unwrap();
-        let p = std::env::temp_dir().join("x.npy");
-        let e = s
-            .save_capture(&json!({ "capture_id": 1, "path": p.to_string_lossy(), "format": "npy" }))
-            .unwrap_err();
-        assert!(e.message.contains("npy"), "实测 {}", e.message);
+        // schema 曾宣称支持 npy / bin，实际一律写 CSV —— 现在 `SaveFormat`
+        // 只有一个变体，非 csv 在参数解析那关就被挡下。
+        let e = try_args::<SaveCaptureArgs>(json!({
+            "capture_id": 1, "path": "x.npy", "format": "npy"
+        }))
+        .unwrap_err();
+        assert!(e.to_string().contains("npy"), "实测 {e}");
     }
 
     #[test]
     fn measure_metrics_filter_and_reject_typos() {
         let mut s = connected();
-        let _ = s.capture(&json!({})).unwrap();
+        let _ = s.capture(&args(json!({}))).unwrap();
 
         let v = s
-            .measure(&json!({ "capture_id": 1, "metrics": ["vpp", "freq"], "channel": 0 }))
+            .measure(&args(
+                json!({ "capture_id": 1, "metrics": ["vpp", "freq"], "channel": 0 }),
+            ))
             .unwrap();
         let m = &v["measurements"];
         assert!(m.get("ch1").is_none(), "指定 channel=0 时不该回 ch1");
@@ -1222,11 +1748,13 @@ mod tests {
         assert!(ch0.get("vpp_v").is_some() && ch0.get("freq_hz").is_some());
         assert!(ch0.get("duty_pct").is_none(), "没要的指标不该回");
 
-        // 拼错的名字必须报错 —— 静默忽略会让 Agent 以为测过了
-        let e = s
-            .measure(&json!({ "capture_id": 1, "metrics": ["freqency"] }))
+        // 拼错的名字必须报错 —— 静默忽略会让 Agent 以为测过了。
+        // 现在这份清单**就是 `MetricKind` 这个类型**，不再有两份要靠人眼对齐。
+        let e = try_args::<MeasureArgs>(json!({ "capture_id": 1, "metrics": ["freqency"] }))
             .unwrap_err();
-        assert!(e.message.contains("freqency"), "实测 {}", e.message);
+        let msg = e.to_string();
+        assert!(msg.contains("freqency"), "实测 {msg}");
+        assert!(msg.contains("freq"), "错误里应当列出合法取值，实测 {msg}");
     }
 
     #[test]
@@ -1234,7 +1762,7 @@ mod tests {
         // 回归：初版把一切错误计进 gaps，于是「还没连设备」伪装成
         // 「1 秒里 100 万次没触发」，还返回 isError=false。
         let mut s = Session::new();
-        let e = s.watch(&json!({ "duration_ms": 50 })).unwrap_err();
+        let e = s.watch(&args(json!({ "duration_ms": 50 }))).unwrap_err();
         assert!(e.message.contains("尚未连接"), "实测 {}", e.message);
     }
 
@@ -1245,7 +1773,7 @@ mod tests {
             .as_array()
             .unwrap()
             .len();
-        let v = s.watch(&json!({ "duration_ms": 400 })).unwrap();
+        let v = s.watch(&args(json!({ "duration_ms": 400 }))).unwrap();
         let after = s.list_captures().unwrap()["captures"]
             .as_array()
             .unwrap()
@@ -1264,15 +1792,223 @@ mod tests {
     #[test]
     fn save_capture_writes_the_file() {
         let mut s = connected();
-        let _ = s.capture(&json!({})).unwrap();
+        let _ = s.capture(&args(json!({}))).unwrap();
         let path = std::env::temp_dir().join("scope-mcp-test.csv");
         let p = path.to_string_lossy().into_owned();
         let v = s
-            .save_capture(&json!({ "capture_id": 1, "path": p }))
+            .save_capture(&args(json!({ "capture_id": 1, "path": p })))
             .unwrap();
         assert!(v["bytes"].as_u64().unwrap() > 0, "文件应有内容");
+        assert_eq!(v["format"], "csv");
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("Time(s)"), "CSV 表头不对");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── 模拟器：seed 与 inject ────────────────────────────────────
+    //
+    // 这两个字段从前是**声明了但没人读**：传了照样返回成功，而工具说明
+    // 写着「注入故障」。Agent 会拿着干净数据下结论，以为自己刚注入过。
+
+    #[test]
+    fn sim_set_scenario_applies_the_seed() {
+        let mut s = Session::new();
+        s.connect(&args(
+            json!({ "transport": "sim", "sim_scenario": "noise" }),
+        ))
+        .unwrap();
+
+        let shot = |s: &mut Session, seed: u64| -> Value {
+            s.sim_set_scenario(&args(json!({ "scenario": "noise", "seed": seed })))
+                .unwrap();
+            let c = s.capture(&args(json!({}))).unwrap();
+            c["preview"]["y_min"].clone()
+        };
+
+        // **同一个种子两次必须逐点相同** —— 只有这条能证明 `set_seed` 真的接线了。
+        //
+        // 回归：这条测试的前一版比的是「种子 1 与种子 2 的波形不同」。
+        // 那个断言在 `set_seed` **完全空转**时照样成立 —— 两次采集之间
+        // 生成器本来就在推进，波形天然不同。它证明不了任何事。
+        // （`noise` 是纯 rng 场景，不看样点计数，所以同种子必定同波形。）
+        let a1 = shot(&mut s, 42);
+        let a2 = shot(&mut s, 42);
+        assert_eq!(a1, a2, "同一个种子两次跑出不同波形 —— set_seed 没接线？");
+
+        assert_ne!(a1, shot(&mut s, 7777), "换了种子波形应当不同");
+
+        // **相邻**种子也必须给出不同波形。
+        // 回归：`Rng::new` 从前是 `seed | 1`，把每一对相邻种子折成同一个
+        // （2 与 3 都变成 3），于是「换个种子试试」有一半概率拿到同一条波形。
+        assert_ne!(
+            shot(&mut s, 2),
+            shot(&mut s, 3),
+            "相邻种子折成了同一个 —— Rng::new 又在 |1 了？"
+        );
+    }
+
+    #[test]
+    fn sim_set_scenario_applies_clears_and_keeps_faults() {
+        let mut s = connected();
+
+        // 1) 注入生效
+        let v = s
+            .sim_set_scenario(&args(json!({
+                "scenario": "i2c_100k",
+                "inject": { "force_overrun": true }
+            })))
+            .unwrap();
+        assert_eq!(v["faults_clean"], false, "注入了故障就必须说");
+        let cap = s.capture(&args(json!({}))).unwrap();
+        assert_eq!(cap["overrun"], true, "注入的 force_overrun 应当真的生效");
+
+        // 2) **不带 `inject` 时故障必须原样留着** —— 这才是「省略 ≠ 清空」的判据。
+        //    回归：前一版把这条写成「先清空、再不带 inject 调用、断言还是干净」，
+        //    而那时故障本来就已经干净，断言恒真 —— 一个空转的测试。
+        let v = s
+            .sim_set_scenario(&args(json!({ "scenario": "i2c_100k" })))
+            .unwrap();
+        assert_eq!(v["faults_clean"], false, "省略 inject = 不动故障，不是清空");
+        let cap = s.capture(&args(json!({}))).unwrap();
+        assert_eq!(cap["overrun"], true, "省略 inject 之后故障应当还在");
+
+        // 3) `inject: {}` 的语义才是「清除全部故障」
+        let v = s
+            .sim_set_scenario(&args(json!({ "scenario": "i2c_100k", "inject": {} })))
+            .unwrap();
+        assert_eq!(v["faults_clean"], true);
+        let cap = s.capture(&args(json!({}))).unwrap();
+        assert_eq!(cap["overrun"], false, "清掉故障后不该再溢出");
+    }
+
+    #[test]
+    fn sim_set_scenario_rejects_bad_injection_through_the_tool_layer() {
+        // ⚠ 判据必须**经过 `Session::sim_set_scenario`**，不能直接调
+        // `InjectArgs::into_faults`。
+        //
+        // 回归：第一版只有 params.rs 里一条直接调 `into_faults` 的测试。
+        // 把 session.rs 里那句 `into_faults().map_err(..)?` 改成
+        // `unwrap_or_default()`，**63 条测试全绿** —— 负概率又变回
+        // 「静默清掉故障」，而响应还说 `faults_clean: true`。内层测到了、
+        // 工具层零覆盖，等于没测。
+        let mut s = connected();
+
+        // 先注入一个**合法**故障，好证明不合法的输入不会把它悄悄清掉
+        s.sim_set_scenario(&args(json!({
+            "scenario": "i2c_100k",
+            "inject": { "force_overrun": true }
+        })))
+        .unwrap();
+
+        for bad in [
+            json!({ "latency_spike_probability": -3.0 }),
+            json!({ "latency_spike_probability": 2.5 }),
+            json!({ "latency_spike_ms": defaults::MAX_LATENCY_SPIKE_MS + 1 }),
+            json!({ "latency_spike_ms": u64::MAX }),
+        ] {
+            let e = s
+                .sim_set_scenario(&args(json!({ "scenario": "i2c_100k", "inject": bad })))
+                .unwrap_err();
+            assert!(
+                e.hint.is_some(),
+                "参数错误也要给「怎么办」，实测 {}",
+                e.message
+            );
+            // 关键：**故障必须原样留着**，不能被静默清掉
+            let cap = s.capture(&args(json!({}))).unwrap();
+            assert_eq!(
+                cap["overrun"], true,
+                "非法注入被拒绝时不该动已有故障（{bad}），实测 {}",
+                e.message
+            );
+        }
+    }
+
+    #[test]
+    fn capture_and_watch_reject_an_absurd_timeout() {
+        // 回归：`check_timeout` 在 `capture` 与 `watch` 里各调一次，但
+        // **MCP 层一条测试都没有** —— 核心层有（`acquire.rs` 的
+        // `an_absurd_timeout_is_rejected...`），端到端我手跑过，
+        // 可是 CI 里没有一条会拦住有人删掉那两行 `check_timeout(...)?`。
+        //
+        // 这两个输入从前会让 `serve()` 永久挂住（单线程，之后任何请求都不
+        // 再被处理，只能杀进程），所以这条测试守的是一个**致命**行为，
+        // 不是参数洁癖。
+        let mut s = connected();
+        for bad in [u64::MAX, MAX_TIMEOUT_MS + 1] {
+            let e = s.capture(&args(json!({ "timeout_ms": bad }))).unwrap_err();
+            assert!(e.message.contains("timeout_ms"), "实测 {}", e.message);
+            assert!(
+                e.message.contains(&MAX_TIMEOUT_MS.to_string()),
+                "要说清上界"
+            );
+            assert!(e.hint.is_some(), "错误必须给出「怎么办」");
+
+            let e = s.watch(&args(json!({ "duration_ms": bad }))).unwrap_err();
+            assert!(e.message.contains("duration_ms"), "实测 {}", e.message);
+        }
+
+        // 0 也要拒 —— schema 里 minimum 是 1
+        assert!(s.capture(&args(json!({ "timeout_ms": 0 }))).is_err());
+        assert!(s.watch(&args(json!({ "duration_ms": 0 }))).is_err());
+
+        // 边界值本身合法（差一错误会让「上限」变成「上限减一」）
+        let v = s.capture(&args(
+            json!({ "timeout_ms": MAX_TIMEOUT_MS, "mode": "single" }),
+        ));
+        // 会真的等到触发或超时；用 Dc + auto 场景不会等满 10 分钟才回来 ——
+        // 这里只要求「不是被参数校验挡下的」。
+        if let Err(e) = v {
+            assert!(
+                !e.message.contains("超出范围"),
+                "正好等于上界不该被拒，实测 {}",
+                e.message
+            );
+        }
+    }
+
+    #[test]
+    fn preview_point_caps_reject_zero() {
+        // 0 会让 `Capture::preview` 返回 `None` —— 一次「成功但没有预览」
+        // 的采集，Agent 很容易读成「没采到数据」。schema 里 minimum 是 1。
+        let mut s = connected();
+        for e in [
+            s.capture(&args(json!({ "max_preview_points": 0 })))
+                .unwrap_err(),
+            s.watch(&args(json!({ "max_points": 0 }))).unwrap_err(),
+        ] {
+            assert!(e.message.contains("至少为 1"), "实测 {}", e.message);
+        }
+    }
+
+    #[test]
+    fn an_absurd_latency_spike_cannot_hang_the_server() {
+        // 回归：`latency_spike_ms` 会被原样交给 `sim` 的 `thread::sleep`，
+        // 而 `serve()` 是单线程 —— u64::MAX 毫秒＝永久睡死，之后任何调用
+        // 都不再被处理。这跟 `timeout_ms` / `duration_ms` 是同一个洞，
+        // 从「故障注入」这个门又漏了回来。
+        let mut s = connected();
+        let e = s
+            .sim_set_scenario(&args(json!({
+                "scenario": "i2c_100k",
+                "inject": { "latency_spike_probability": 1.0, "latency_spike_ms": u64::MAX }
+            })))
+            .unwrap_err();
+        assert!(e.message.contains("latency_spike_ms"), "实测 {}", e.message);
+        // 而且拒绝之后必须还能正常干活（没被半应用弄坏）
+        assert!(s.status().is_ok());
+        assert!(s.capture(&args(json!({}))).is_ok());
+    }
+
+    #[test]
+    fn debug_raw_rejects_a_command_code_that_would_wrap_around() {
+        // 回归：`as u16` 会把 65537 变成 1 —— 一个越界的输入
+        // 变成了一条真实存在的命令。
+        let mut s = connected();
+        let e = s.debug_raw(&args(json!({ "cmd": 65537 }))).unwrap_err();
+        assert!(e.message.contains("65537"), "实测 {}", e.message);
+        // 65535 在范围内，但不是一个已知命令码
+        let e = s.debug_raw(&args(json!({ "cmd": 65535 }))).unwrap_err();
+        assert!(e.message.contains("未知命令码"), "实测 {}", e.message);
     }
 }

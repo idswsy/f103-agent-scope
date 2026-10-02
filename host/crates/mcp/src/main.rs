@@ -25,9 +25,11 @@
 #![deny(clippy::all)]
 
 mod jsonrpc;
+mod params;
 mod session;
 
 use anyhow::{Context, Result};
+use params::*;
 use scope_core::{CaptureStore, CommandBus};
 use scope_sim::{Scenario, SimDevice};
 use serde_json::{json, Value};
@@ -37,115 +39,322 @@ struct ToolSpec {
     name: &'static str,
     /// 一句话说明 —— 这是 LLM 决定要不要调用它的主要依据。
     description: &'static str,
-    /// 输入参数的 JSON Schema。
-    input_schema: &'static str,
+    /// 输入参数的 JSON Schema —— **由参数类型生成**，不是手写的。
+    schema: fn() -> Value,
     /// 对应哪些协议命令。
     protocol_cmds: &'static str,
     /// 是否只在某些条件下注册。
     condition: &'static str,
+    /// 实现。内部会把 `arguments` 解成**生成 `schema` 的那个类型**。
+    handler: fn(&mut session::Session, &Value) -> R,
 }
 
-/// 工具清单 —— 与 docs/03-protocol.md §MCP 保持一致。
+/// 参数解析的结果类型（与 `session.rs` 里的一致）。
+type R = std::result::Result<Value, session::ToolError>;
+
+/// 声明一个工具。
+///
+/// `$args` 在整个宏体里**只写一次**，而展开后它既是 schema 的来源、
+/// 又是解析的目标。这就是「声明的参数」与「实现读的参数」不可能不一致的
+/// **全部机制** —— 想让它们分家，你得先让同一个宏参数同时是两个类型。
+///
+/// 从前 `input_schema` 是一段手写的 JSON 字符串，与 `session.rs` 里
+/// `p.get("字段名")` 的读取之间没有任何联系。上一轮对抗性验证找出的 8 类
+/// P1 里有 4 类是「schema 声明了、实现忽略」——`scope_capture.mode`、
+/// `scope_read_waveform.format`、`scope_sim_set_scenario` 的 `seed` 与
+/// `inject` 全都是传了不报错、静默走默认值。
+macro_rules! tool {
+    (
+        $name:literal, $desc:literal, $cmds:literal, $cond:literal,
+        $args:ty, |$s:ident, $p:ident| $body:expr
+    ) => {
+        ToolSpec {
+            name: $name,
+            description: $desc,
+            protocol_cmds: $cmds,
+            condition: $cond,
+            schema: schema_of::<$args>,
+            handler: |$s: &mut session::Session, __args: &Value| {
+                parse_then::<$args, _>(__args, |$p| $body)
+            },
+        }
+    };
+}
+
+/// 从一个参数类型生成 JSON Schema。
+///
+/// schemars 生成的 schema 必定能转成 JSON —— 转不动是代码错误，应当当场
+/// 炸掉。**从前这里是 `unwrap_or_else(|_| json!({"type":"object"}))`**：
+/// 手写的 schema 字符串里多一个逗号，那个工具的参数说明就整个消失，
+/// 客户端看到一个「不需要参数」的工具，而服务端一声不吭。
+fn schema_of<T: schemars::JsonSchema>() -> Value {
+    Value::from(schemars::schema_for!(T))
+}
+
+/// 把 `arguments` 解成 `T`，成功就交给 `f`。
+///
+/// 失败时给一条**指明字段**的错误，外加「本工具接受哪些参数」——后者直接
+/// 从 `T` 自己的 schema 里读出来，所以不可能和实现说的不是一回事。
+fn parse_then<T, F>(args: &Value, f: F) -> R
+where
+    T: serde::de::DeserializeOwned + schemars::JsonSchema,
+    F: FnOnce(T) -> R,
+{
+    match serde_json::from_value::<T>(args.clone()) {
+        Ok(t) => f(t),
+        Err(e) => Err(session::ToolError {
+            message: format!("参数不合法：{e}"),
+            hint: Some(accepted_params::<T>()),
+        }),
+    }
+}
+
+/// 「本工具接受哪些参数」——从类型自己的 schema 里读。
+fn accepted_params<T: schemars::JsonSchema>() -> String {
+    let s = schema_of::<T>();
+    let Some(props) = s.get("properties").and_then(|v| v.as_object()) else {
+        return "本工具不接受任何参数；arguments 请留空或省略".into();
+    };
+    if props.is_empty() {
+        return "本工具不接受任何参数；arguments 请留空或省略".into();
+    }
+    let required: Vec<&str> = s
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let list: Vec<String> = props
+        .iter()
+        .map(|(k, v)| {
+            let ty = type_label(v, &s);
+            if required.contains(&k.as_str()) {
+                format!("{k}:{ty}（必填）")
+            } else {
+                format!("{k}:{ty}")
+            }
+        })
+        .collect();
+    format!(
+        "本工具接受的参数：{}。用 tools/list 可以看每一项的完整说明",
+        list.join(" / ")
+    )
+}
+
+/// 一个属性的 `type` 名单（可能是字符串，也可能是数组）。
+fn type_names(s: &Value) -> Vec<&str> {
+    match s.get("type") {
+        Some(Value::String(x)) => vec![x.as_str()],
+        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 把一个属性的 schema 解成「真身」+「是否可空」。
+///
+/// schemars 1.x 生成的是 JSON Schema 2020-12，同一个意思有好几种写法，
+/// **三种都要认**：
+///
+/// | 写法 | 什么时候出现 |
+/// |---|---|
+/// | `"type": "integer"` | 必填的基本类型 |
+/// | `"type": ["integer","null"]` | **可选**的基本类型 |
+/// | `"anyOf": [<真身>, {"type":"null"}]` | 可选的自定义类型（枚举、结构体） |
+/// | `"$ref": "#/$defs/X"` | 自定义类型本身被抽到了 `$defs` |
+///
+/// 外加派生枚举生成的是 `oneOf: [{"const": ...}]` 而不是 `enum`。
+///
+/// 抽出来共用是因为**这个坑会以另一种面貌重现在任何「读 schema 的地方」**：
+/// 第一版 `type_label` 只认字符串，于是所有可选参数在提示里都显示成
+/// 「任意」；而测试里按 schema 造值的 `sample_for` 犯了同一个错，于是
+/// 造出了 `null` 去喂必填字段。两处各写一份，就会修一处漏一处。
+fn resolve_prop<'a>(schema: &'a Value, root: &'a Value) -> (&'a Value, bool) {
+    // 1. 拆 anyOf
+    let (inner, nullable) = match schema.get("anyOf").and_then(|v| v.as_array()) {
+        Some(arms) => {
+            let is_null = |a: &Value| a.get("type").and_then(|t| t.as_str()) == Some("null");
+            (
+                arms.iter().find(|a| !is_null(a)).unwrap_or(schema),
+                arms.iter().any(is_null),
+            )
+        }
+        None => (schema, false),
+    };
+
+    // 2. 解 `$ref`（`#/$defs/X` → JSON Pointer 要去掉开头的 `#`）
+    let resolved = match inner.get("$ref").and_then(|v| v.as_str()) {
+        Some(r) => root
+            .pointer(r.strip_prefix('#').unwrap_or(r))
+            .unwrap_or(inner),
+        None => inner,
+    };
+
+    (
+        resolved,
+        nullable || type_names(schema).contains(&"null") || type_names(resolved).contains(&"null"),
+    )
+}
+
+/// 把 schema 的类型描述压缩成一句，用在参数清单里。
+///
+/// 例：`整数`、`整数?`（可选）、`serial|sim?`（可选枚举）、`数组?`。
+///
+/// 需要 `root` 才能解 `$ref` —— 见 [`resolve_prop`]。
+fn type_label(schema: &Value, root: &Value) -> String {
+    let (resolved, nullable) = resolve_prop(schema, root);
+
+    let label = if let Some(e) = resolved.get("enum").and_then(|v| v.as_array()) {
+        e.iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join("|")
+    } else if let Some(o) = resolved.get("oneOf").and_then(|v| v.as_array()) {
+        // 自定义枚举生成的是 `oneOf: [{"const":"serial"}, ...]`
+        o.iter()
+            .filter_map(|arm| arm.get("const").and_then(|c| c.as_str()))
+            .collect::<Vec<_>>()
+            .join("|")
+    } else {
+        type_names(resolved)
+            .iter()
+            .filter(|n| **n != "null")
+            .map(|n| match *n {
+                "string" => "字符串",
+                "integer" => "整数",
+                "number" => "数字",
+                "boolean" => "布尔",
+                "array" => "数组",
+                "object" => "对象",
+                other => other,
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+
+    match (label.is_empty(), nullable) {
+        (true, _) => "任意".into(),
+        // 「可选」用问号表示，不必在类型里重复说一遍 null
+        (false, true) => format!("{label}?"),
+        (false, false) => label,
+    }
+}
+
+/// 工具清单 —— 与 `docs/03-protocol.md` §MCP 保持一致。
+///
+/// 每个条目的最后一个参数是参数类型：schema 由它生成，`arguments` 也解成它。
+/// **不要在这里手写 schema 字符串** —— 见 [`tool!`] 的说明。
 const TOOLS: &[ToolSpec] = &[
-    ToolSpec {
-        name: "scope_list_devices",
-        description: "列出系统中可用的串口。不指定 port 连接时用内置模拟器，无需硬件",
-        input_schema: r#"{"type":"object","properties":{},"required":[]}"#,
-        protocol_cmds: "GET_INFO",
-        condition: "总是",
-    },
-    ToolSpec {
-        name: "scope_connect",
-        description: "连接设备。不指定 port 时使用模拟器",
-        input_schema: r#"{"type":"object","properties":{"port":{"type":"string"},"baud":{"type":"integer"},"transport":{"type":"string","enum":["serial","sim"]},"sim_scenario":{"type":"string"}},"required":[]}"#,
-        protocol_cmds: "GET_INFO + GET_CONFIG",
-        condition: "总是",
-    },
-    ToolSpec {
-        name: "scope_disconnect",
-        description: "断开连接并停止流",
-        input_schema: r#"{"type":"object","properties":{},"required":[]}"#,
-        protocol_cmds: "STOP",
-        condition: "总是",
-    },
-    ToolSpec {
-        name: "scope_status",
-        description: "设备当前状态与生效配置（含链路描述）。任何状态可调",
-        input_schema: r#"{"type":"object","properties":{},"required":[]}"#,
-        protocol_cmds: "GET_STATUS",
-        condition: "总是",
-    },
-    ToolSpec {
-        name: "scope_configure",
-        description: "一次性配置采样率/采集/触发/通道。返回实际生效值与警告",
-        input_schema: r#"{"type":"object","properties":{"sample_rate_hz":{"type":"integer"},"capture_samples":{"type":"integer"},"mode":{"type":"string","enum":["single","stream"]},"format":{"type":"string","enum":["raw","packed12","minmax"]},"decimation":{"type":"integer"},"trigger":{"type":"object"},"channel":{"type":"object"}},"required":[]}"#,
-        protocol_cmds: "SET_SAMPLE_RATE / SET_TRIGGER / SET_ACQ / SET_CHANNEL",
-        condition: "总是",
-    },
-    ToolSpec {
-        name: "scope_capture",
-        description: "采集一次并等待触发完成。默认只返回统计量与 ≤256 点 minmax 预览，不含全量波形",
-        input_schema: r#"{"type":"object","properties":{"mode":{"type":"string","enum":["single"]},"timeout_ms":{"type":"integer","default":2000},"max_preview_points":{"type":"integer","default":256}},"required":[]}"#,
-        protocol_cmds: "ARM + EVENT_TRIGGER + READ_BUFFER",
-        condition: "总是",
-    },
-    ToolSpec {
-        name: "scope_read_waveform",
-        description: "按需分页拉取波形样点。硬顶 4096 点；要全量请用 scope_save_capture",
-        input_schema: r#"{"type":"object","properties":{"capture_id":{"type":"integer"},"start_sample":{"type":"integer"},"count":{"type":"integer"},"max_points":{"type":"integer","default":512},"format":{"type":"string"},"channel":{"type":"integer"}},"required":["capture_id"]}"#,
-        protocol_cmds: "READ_BUFFER",
-        condition: "总是",
-    },
-    ToolSpec {
-        name: "scope_measure",
-        description: "对指定采集做测量：频率/峰峰值/均值/RMS/占空比/上升时间。返回纯数字+单位",
-        input_schema: r#"{"type":"object","properties":{"capture_id":{"type":"integer"},"metrics":{"type":"array","items":{"type":"string","enum":["vpp","min","max","mean","rms","freq","duty","rise"]}},"channel":{"type":"integer"}},"required":["capture_id"]}"#,
-        protocol_cmds: "主机侧计算（精度最高）；流模式可走 MEASURE",
-        condition: "总是",
-    },
-    ToolSpec {
-        name: "scope_i2c_decode",
-        description:
-            "把采集解码为 I2C 帧序列（START/地址/ACK/数据/STOP），返回帧列表与信号质量评估",
-        input_schema: r#"{"type":"object","properties":{"capture_id":{"type":"integer"},"scl_channel":{"type":"integer","default":0},"sda_channel":{"type":"integer","default":1},"vih_lsb":{"type":"integer"},"vil_lsb":{"type":"integer"},"debounce_ns":{"type":"integer"}},"required":["capture_id"]}"#,
-        protocol_cmds: "主机侧解码（基于 READ_BUFFER 数据）",
-        condition: "总是",
-    },
-    ToolSpec {
-        name: "scope_list_captures",
-        description: "列出主机侧保存的最近采集，供引用而不必重抓",
-        input_schema: r#"{"type":"object","properties":{},"required":[]}"#,
-        protocol_cmds: "无（本地 capture store）",
-        condition: "总是",
-    },
-    ToolSpec {
-        name: "scope_save_capture",
-        description: "把全量波形落盘为 CSV。全量数据不进 LLM 上下文",
-        input_schema: r#"{"type":"object","properties":{"capture_id":{"type":"integer"},"path":{"type":"string"},"format":{"type":"string","enum":["csv"],"description":"目前只支持 csv"}},"required":["capture_id","path"]}"#,
-        protocol_cmds: "无（本地写文件）",
-        condition: "总是",
-    },
-    ToolSpec {
-        name: "scope_watch",
-        description: "在一段时间里连续采集，返回采集次数与缺口统计，外加第一次采集（供后续测量/解码）。设备侧流模式尚未实现",
-        input_schema: r#"{"type":"object","properties":{"duration_ms":{"type":"integer","default":1000},"max_points":{"type":"integer","default":128}},"required":[]}"#,
-        protocol_cmds: "ARM(stream) + 分片推送 + STOP",
-        condition: "总是",
-    },
-    ToolSpec {
-        name: "scope_sim_set_scenario",
-        description: "切换模拟器波形场景 / 注入故障（仅模拟器模式）",
-        input_schema: r#"{"type":"object","properties":{"scenario":{"type":"string"},"seed":{"type":"integer"},"inject":{"type":"object"}},"required":[]}"#,
-        protocol_cmds: "无（模拟器内部）",
-        condition: "仅 transport=sim",
-    },
-    ToolSpec {
-        name: "scope_debug_raw",
-        description: "开发者逃生门：发任意命令码与 payload。默认不向 LLM 暴露",
-        input_schema: r#"{"type":"object","properties":{"cmd":{"type":"integer"},"payload_hex":{"type":"string"}},"required":["cmd"]}"#,
-        protocol_cmds: "任意（含 MEM_READ / MEM_WRITE）",
-        condition: "仅 SCOPE_MCP_DEBUG=1",
-    },
+    tool!(
+        "scope_list_devices",
+        "列出系统中可用的串口。不指定 port 连接时用内置模拟器，无需硬件",
+        "GET_INFO",
+        "总是",
+        NoArgs,
+        |s, _p| s.list_devices()
+    ),
+    tool!(
+        "scope_connect",
+        "连接设备。不指定 port 时使用模拟器",
+        "GET_INFO + GET_CONFIG",
+        "总是",
+        ConnectArgs,
+        |s, p| s.connect(&p)
+    ),
+    tool!(
+        "scope_disconnect",
+        "断开连接并停止流",
+        "STOP",
+        "总是",
+        NoArgs,
+        |s, _p| s.disconnect()
+    ),
+    tool!(
+        "scope_status",
+        "设备当前状态与生效配置（含链路描述）。任何状态可调",
+        "GET_STATUS",
+        "总是",
+        NoArgs,
+        |s, _p| s.status()
+    ),
+    tool!(
+        "scope_configure",
+        "一次性配置采样率/采集/触发/通道。返回实际生效值与警告",
+        "SET_SAMPLE_RATE / SET_TRIGGER / SET_ACQ / SET_CHANNEL",
+        "总是",
+        ConfigureArgs,
+        |s, p| s.configure(&p)
+    ),
+    tool!(
+        "scope_capture",
+        "采集一次并等待触发完成。默认只返回统计量与 ≤256 点 minmax 预览，不含全量波形",
+        "ARM + EVENT_TRIGGER + READ_BUFFER",
+        "总是",
+        CaptureArgs,
+        |s, p| s.capture(&p)
+    ),
+    tool!(
+        "scope_read_waveform",
+        "按需分页拉取波形样点。硬顶 4096 点；要全量请用 scope_save_capture",
+        "READ_BUFFER",
+        "总是",
+        ReadWaveformArgs,
+        |s, p| s.read_waveform(&p)
+    ),
+    tool!(
+        "scope_measure",
+        "对指定采集做测量：频率/峰峰值/均值/RMS/占空比/上升时间。返回纯数字+单位",
+        "主机侧计算（精度最高）；流模式可走 MEASURE",
+        "总是",
+        MeasureArgs,
+        |s, p| s.measure(&p)
+    ),
+    tool!(
+        "scope_i2c_decode",
+        "把采集解码为 I2C 帧序列（START/地址/ACK/数据/STOP），返回帧列表与信号质量评估",
+        "主机侧解码（基于 READ_BUFFER 数据）",
+        "总是",
+        I2cDecodeArgs,
+        |s, p| s.i2c_decode(&p)
+    ),
+    tool!(
+        "scope_list_captures",
+        "列出主机侧保存的最近采集，供引用而不必重抓",
+        "无（本地 capture store）",
+        "总是",
+        NoArgs,
+        |s, _p| s.list_captures()
+    ),
+    tool!(
+        "scope_save_capture",
+        "把全量波形落盘为 CSV。全量数据不进 LLM 上下文",
+        "无（本地写文件）",
+        "总是",
+        SaveCaptureArgs,
+        |s, p| s.save_capture(&p)
+    ),
+    tool!(
+        "scope_watch",
+        "在一段时间里连续采集，返回采集次数与缺口统计，外加第一次采集（供后续测量/解码）。设备侧流模式尚未实现",
+        "ARM(stream) + 分片推送 + STOP",
+        "总是",
+        WatchArgs,
+        |s, p| s.watch(&p)
+    ),
+    tool!(
+        "scope_sim_set_scenario",
+        "切换模拟器波形场景 / 换随机种子 / 注入故障（仅模拟器模式）",
+        "无（模拟器内部）",
+        "仅 transport=sim",
+        SimSetScenarioArgs,
+        |s, p| s.sim_set_scenario(&p)
+    ),
+    tool!(
+        "scope_debug_raw",
+        "开发者逃生门：发任意命令码与 payload。默认不向 LLM 暴露",
+        "任意（含 MEM_READ / MEM_WRITE）",
+        "仅 SCOPE_MCP_DEBUG=1",
+        DebugRawArgs,
+        |s, p| s.debug_raw(&p)
+    ),
 ];
 
 fn main() -> Result<()> {
@@ -345,6 +554,9 @@ fn tool_enabled(name: &str, debug: bool) -> bool {
 }
 
 /// 工具清单 —— 按会话状态过滤后返回。
+///
+/// `inputSchema` 现在是**现场从参数类型生成的**，不再是一段手写字符串 ——
+/// 所以不存在「字符串写坏了，工具的参数说明整个消失」这种事。
 fn tool_list(debug: bool) -> Vec<Value> {
     TOOLS
         .iter()
@@ -353,38 +565,26 @@ fn tool_list(debug: bool) -> Vec<Value> {
             json!({
                 "name": t.name,
                 "description": t.description,
-                "inputSchema": serde_json::from_str::<Value>(t.input_schema)
-                    .unwrap_or_else(|_| json!({ "type": "object" })),
+                "inputSchema": (t.schema)(),
             })
         })
         .collect()
 }
 
 /// 把一次 `tools/call` 派发到具体实现，并把结果包成 MCP 的 content 形状。
+///
+/// 查表和调用**是同一张表**（[`TOOLS`]）—— 从前这里是一个 14 分支的 match，
+/// 与上面那张表各写一遍工具名，改名时只改一处就能让两个工具错位。
 fn dispatch(session: &mut session::Session, name: &str, args: &Value) -> Value {
     use jsonrpc::{tool_error, tool_result};
 
-    let r = match name {
-        "scope_list_devices" => session.list_devices(),
-        "scope_connect" => session.connect(args),
-        "scope_disconnect" => session.disconnect(),
-        "scope_status" => session.status(),
-        "scope_configure" => session.configure(args),
-        "scope_capture" => session.capture(args),
-        "scope_read_waveform" => session.read_waveform(args),
-        "scope_measure" => session.measure(args),
-        "scope_i2c_decode" => session.i2c_decode(args),
-        "scope_list_captures" => session.list_captures(),
-        "scope_save_capture" => session.save_capture(args),
-        "scope_watch" => session.watch(args),
-        "scope_sim_set_scenario" => session.sim_set_scenario(args),
-        "scope_debug_raw" => session.debug_raw(args),
-        other => {
-            return tool_error(format!("未知工具 {other}"), None);
-        }
+    // `handle_line` 已经先查过一遍并给出 JSON-RPC 错误码，正常走不到这里；
+    // 留着是为了让这个函数自己也是完整的。
+    let Some(spec) = TOOLS.iter().find(|t| t.name == name) else {
+        return tool_error(format!("未知工具 {name}"), None);
     };
 
-    match r {
+    match (spec.handler)(session, args) {
         Ok(v) => tool_result(&v, false),
         Err(e) => tool_error(e.message, e.hint),
     }
@@ -404,7 +604,11 @@ fn print_tools() {
         println!("   说明   : {}", t.description);
         println!("   协议   : {}", t.protocol_cmds);
         println!("   注册条件: {}", t.condition);
-        println!("   schema : {}", t.input_schema);
+        // 美化输出：这是给人核对用的，紧凑 JSON 读起来太费劲
+        println!(
+            "   schema : {}",
+            serde_json::to_string_pretty(&(t.schema)()).unwrap_or_else(|_| "(无法序列化)".into())
+        );
         println!();
     }
 }
@@ -604,20 +808,271 @@ mod tests {
     }
 
     #[test]
-    fn every_tool_schema_parses_as_json() {
-        // TOOLS 里的 input_schema 是字符串字面量 —— 拼错了要到运行时才炸。
-        // 这条测试把它提前到编译期后立刻暴露。
-        for t in TOOLS {
-            serde_json::from_str::<Value>(t.input_schema)
-                .unwrap_or_else(|e| panic!("{} 的 input_schema 不是合法 JSON: {e}", t.name));
-        }
-    }
-
-    #[test]
     fn tool_names_are_unique() {
         let mut seen = std::collections::HashSet::new();
         for t in TOOLS {
             assert!(seen.insert(t.name), "工具名重复：{}", t.name);
         }
+    }
+
+    /// 走一遍协议层调用工具，返回**工具自己的响应体**（已解掉 MCP 的
+    /// content 信封）。
+    fn tool_call(session: &mut session::Session, name: &str, args: Value) -> Value {
+        let line = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": name, "arguments": args },
+        })
+        .to_string();
+        let r = handle_line(&line, session, true).expect("tools/call 不是通知");
+        let r = r.result.expect("tools/call 不该产生协议级错误");
+        let text = r["content"][0]["text"].as_str().expect("应当是文本块");
+        serde_json::from_str(text).expect("工具响应应当是 JSON")
+    }
+
+    /// 这条响应是不是「参数没通过解析」，而不是工具自身业务上的失败。
+    ///
+    /// [`tool_call`] 已经剥掉了 MCP 的信封，所以这里判的是**内层**形状：
+    /// 工具失败时内层是 `{"error": ..., "hint": ...}`。带 `error` 键的
+    /// 内层对象只有失败路径会产生。
+    ///
+    /// 判据是 [`parse_then`] 给参数错误加的那句前缀。
+    fn is_param_error(r: &Value) -> bool {
+        r.get("error")
+            .and_then(|v| v.as_str())
+            .map(|s| s.starts_with("参数不合法"))
+            .unwrap_or(false)
+    }
+
+    /// 按 schema 造一个合法值 —— 只覆盖本项目用到的类型。
+    ///
+    /// 解析部分一律走 [`resolve_prop`]，不另起炉灶：第一版这里自己读
+    /// `s["type"].as_str()`，于是对 `"type":["integer","null"]` 的字段
+    /// 造出了 `null`，对一个**必填**字段也一样 —— 造出来的值根本不合 schema。
+    fn sample_for(s: &Value, root: &Value) -> Value {
+        let (real, _) = resolve_prop(s, root);
+
+        // 取值优先：`enum` 或派生枚举的 `oneOf: [{"const": ...}]`
+        if let Some(first) = real["enum"].as_array().and_then(|e| e.first()) {
+            return first.clone();
+        }
+        if let Some(c) = real["oneOf"]
+            .as_array()
+            .and_then(|o| o.first())
+            .and_then(|arm| arm.get("const"))
+        {
+            return c.clone();
+        }
+
+        // `type` 可能是数组（可选字段），挑一个非 null 的来造值
+        match type_names(real).into_iter().find(|t| *t != "null") {
+            // 空串而不是 "x"：有些字段（payload_hex、port）用空串会走到
+            // 「业务上的失败」，而 "x" 可能撞上别的错误分支。
+            Some("string") => json!(""),
+            Some("integer") => json!(1),
+            Some("number") => json!(0.5),
+            Some("boolean") => json!(true),
+            Some("array") => json!([]),
+            // 嵌套对象：把它自己的属性也填满 —— 这样 `configure.trigger`、
+            // `configure.channel`、`sim_set_scenario.inject` 里面的字段
+            // 也在覆盖范围内，而那些正是嵌套声明最容易和实现分家的地方。
+            Some("object") => match real["properties"].as_object() {
+                Some(p) => Value::Object(
+                    p.iter()
+                        .map(|(k, v)| (k.clone(), sample_for(v, root)))
+                        .collect(),
+                ),
+                None => json!({}),
+            },
+            _ => json!(null),
+        }
+    }
+
+    /// **本文件最重要的那条测试。**
+    ///
+    /// 它证明：`tools/list` 里为每个工具声明的参数，与 `tools/call` 真正
+    /// 解析的参数，是同一份。做法是两头夹：
+    ///
+    /// 1. schema 里出现的每个属性，照着造一个合法值发过去 —— 不许出现
+    ///    「参数不合法」。TOOLS 的 schema 与 dispatch 用的类型一旦分家，
+    ///    这里就会炸。
+    /// 2. 反过来，发一个 schema 里没声明的属性 —— **必须**被拒绝。
+    ///
+    /// 两条合起来即 `properties(schema) == fields(解析目标类型)`。
+    ///
+    /// 之所以需要这条，是因为上一轮对抗性验证找出的 8 类 P1 里有 4 类是
+    /// 「schema 声明了、实现忽略」：`scope_capture.mode`、
+    /// `scope_read_waveform.format`、`scope_sim_set_scenario` 的 `seed` 与
+    /// `inject`，全都是**传了不报错、静默走默认值**。这类 bug 顺路径测试
+    /// 永远发现不了，因为测试用的字段名是对的。
+    #[test]
+    fn every_tool_accepts_exactly_the_parameters_its_schema_declares() {
+        for t in TOOLS {
+            let schema = (t.schema)();
+            let empty = serde_json::Map::new();
+            let props = schema["properties"].as_object().unwrap_or(&empty);
+
+            // (1) 把 schema 声明的参数全填上，必须被接受
+            let full: Value = Value::Object(
+                props
+                    .iter()
+                    .map(|(k, v)| (k.clone(), sample_for(v, &schema)))
+                    .collect(),
+            );
+            let mut s = session::Session::new();
+            let got = tool_call(&mut s, t.name, full.clone());
+            assert!(
+                !is_param_error(&got),
+                "{} 的 schema 声明了这些参数 {full}，但实现不认：{got}",
+                t.name
+            );
+
+            // (2) schema 没声明的参数，必须被拒绝 —— 否则「字段名拼错」
+            //     又会退化成静默走默认值
+            let mut s = session::Session::new();
+            let mut bogus = full.clone();
+            bogus["__nope__"] = json!(1);
+            let got = tool_call(&mut s, t.name, bogus);
+            assert!(
+                is_param_error(&got),
+                "{} 接受了 schema 里没声明的参数（字段名拼错会被静默忽略）：{got}",
+                t.name
+            );
+            assert!(
+                got["error"].as_str().unwrap_or("").contains("__nope__"),
+                "{} 的错误里要点名是哪个参数不对：{got}",
+                t.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_tool_schema_is_a_closed_object() {
+        // MCP 要求 inputSchema 是对象；`additionalProperties: false` 是
+        // `deny_unknown_fields` 在 schema 上的投影 —— 有了它，客户端在
+        // 发出去之前就知道多余字段会被拒，而不是发了才撞墙。
+        for t in TOOLS {
+            let schema = (t.schema)();
+            assert_eq!(schema["type"], json!("object"), "{}", t.name);
+            assert_eq!(
+                schema["additionalProperties"],
+                json!(false),
+                "{} 的 schema 没有声明 additionalProperties: false",
+                t.name
+            );
+        }
+    }
+
+    #[test]
+    fn section_names_match_the_serialized_field_names() {
+        // 字段名是 Agent 唯一能用的接口。抽查几条：schema 里的名字必须
+        // 就是实现读的那个名字。
+        let connect = (TOOLS
+            .iter()
+            .find(|t| t.name == "scope_connect")
+            .expect("有 scope_connect")
+            .schema)();
+        let props = connect["properties"].as_object().unwrap();
+        for k in ["port", "baud", "transport", "sim_scenario"] {
+            assert!(props.contains_key(k), "scope_connect 的 schema 缺 {k}");
+        }
+        // 报告里曾经写过 `scl_chanel` 这种拼错的名字，靠人眼是看不出来的
+        assert!(
+            !props.contains_key("sim_scenerio"),
+            "schema 里出现了拼错的字段名"
+        );
+    }
+
+    #[test]
+    fn bad_parameters_come_back_with_a_field_list_and_a_hint() {
+        // 错误要给「怎么办」—— 这里给的是「本工具接受哪些参数」，
+        // 直接从参数类型自己的 schema 里读出来。
+        let mut s = session::Session::new();
+        let got = tool_call(
+            &mut s,
+            "scope_i2c_decode",
+            json!({ "capture_id": 1, "scl_chanel": 0 }),
+        );
+        assert!(is_param_error(&got), "实测 {got}");
+        let hint = got["hint"].as_str().unwrap_or("");
+        assert!(
+            hint.contains("capture_id"),
+            "提示要列出可用参数，实测 {hint}"
+        );
+        assert!(
+            hint.contains("scl_channel"),
+            "提示要列出可用参数，实测 {hint}"
+        );
+        assert!(hint.contains("必填"), "提示要标出哪些是必填的，实测 {hint}");
+    }
+
+    #[test]
+    fn bad_transport_is_rejected_with_the_valid_values() {
+        // `TransportArg` 只认 schema 里那两个名字 —— 别名（simulator /
+        // uart / port）留给给人用的 CLI，MCP 这层要对齐 schema。
+        let mut s = session::Session::new();
+        let got = tool_call(&mut s, "scope_connect", json!({ "transport": "bogus" }));
+        assert!(is_param_error(&got), "实测 {got}");
+        let msg = got["error"].as_str().unwrap_or("");
+        assert!(msg.contains("bogus"), "实测 {msg}");
+        assert!(msg.contains("serial"), "错误里要列出合法取值，实测 {msg}");
+        assert!(msg.contains("sim"), "错误里要列出合法取值，实测 {msg}");
+    }
+
+    #[test]
+    fn missing_required_arguments_name_the_field() {
+        let mut s = session::Session::new();
+        let got = tool_call(&mut s, "scope_save_capture", json!({ "capture_id": 1 }));
+        assert!(is_param_error(&got), "实测 {got}");
+        assert!(
+            got["error"].as_str().unwrap_or("").contains("path"),
+            "实测 {got}"
+        );
+    }
+
+    #[test]
+    fn param_type_labels_handle_both_schema_shapes() {
+        // 回归：只按字符串读 `type` 时，**所有可选参数**都会显示成「任意」——
+        // 因为 schemars 为 `Option<T>` 生成的是 `"type": ["integer","null"]`。
+        // 一条把每个可选参数都写成「任意」的提示，等于没有提示。
+        let schema_of = |tool: &str| {
+            (TOOLS
+                .iter()
+                .find(|t| t.name == tool)
+                .unwrap_or_else(|| panic!("有 {tool}"))
+                .schema)()
+        };
+
+        let label = |root: &Value, field: &str| type_label(&root["properties"][field], root);
+
+        let decode = schema_of("scope_i2c_decode");
+        // 可选、无 enum → 类型名 + ?   （`"type": ["integer","null"]` 那种）
+        assert_eq!(label(&decode, "debounce_ns"), "整数?");
+        // 必填 → 不加问号
+        assert_eq!(label(&decode, "capture_id"), "整数");
+
+        // 可选**自定义枚举**走的是 `anyOf: [$ref, null]`，
+        // 而枚举本身是 `oneOf: [{const}, ...]` —— 三层都要解对
+        let connect = schema_of("scope_connect");
+        assert_eq!(label(&connect, "transport"), "serial|sim?");
+        assert_eq!(
+            label(&connect, "sim_scenario"),
+            "sine_1k_3v3|square_50k|pulse_glitch|noise|dc|am|i2c_100k|i2c_400k?"
+        );
+
+        // 可选数组、可选字符串
+        assert_eq!(label(&schema_of("scope_measure"), "metrics"), "数组?");
+        assert_eq!(label(&connect, "port"), "字符串?");
+    }
+
+    #[test]
+    fn the_parameter_hint_names_every_field_with_its_type_and_requiredness() {
+        let mut s = session::Session::new();
+        let got = tool_call(&mut s, "scope_connect", json!({ "nope": 1 }));
+        let hint = got["hint"].as_str().unwrap_or("").to_string();
+        for want in ["port:字符串?", "baud:整数?", "transport:serial|sim?"] {
+            assert!(hint.contains(want), "提示里应当有 {want}，实测 {hint}");
+        }
+        // 没有必填项时不该乱标
+        assert!(!hint.contains("必填"), "实测 {hint}");
     }
 }

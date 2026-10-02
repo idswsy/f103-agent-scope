@@ -47,6 +47,23 @@ const NO_TRIGGER: u32 = u32::MAX;
 /// 响应取消和强制触发。
 const WAIT_SLICE: Duration = Duration::from_millis(80);
 
+/// 一次采集等待触发的上限（ms）。
+///
+/// 这条上界的存在理由很具体：`wait_trigger_sliced` 算的是
+/// `Instant::now() + total`，`total` 来自调用方。给一个 `u64::MAX` 毫秒
+/// （约 5.8 亿年，LLM 常拿大整数当「无限」）之后，**整个调用会永久挂住
+/// 且不报错** —— 实测 MCP server 从此不再响应任何请求，只能杀进程重启，
+/// 在途请求连同后续的全部丢失。
+///
+/// 10 分钟是「人还愿意等」的上限；比这更长的观测应该用 `scope_watch`
+/// 那种分段采集，而不是把一次等待拉长。
+pub const MAX_TIMEOUT_MS: u64 = 600_000;
+
+/// `SET_TRIGGER.mode` 的取值（见 `proto/protocol.h`）。
+const TRIG_MODE_NORMAL: u8 = 1;
+/// `SET_ACQ.mode` 的取值。
+const ACQ_SINGLE: u8 = 0;
+
 /// 一次采集的参数。
 #[derive(Debug, Clone, Copy)]
 pub struct AcquireParams {
@@ -123,14 +140,48 @@ pub fn acquire_cancellable<P: DevicePort>(
     params: &AcquireParams,
     cancel: &AtomicBool,
 ) -> Result<Capture> {
+    // 超时上界 —— 见 [`MAX_TIMEOUT_MS`] 的说明。放在**这里**而不是只放在
+    // MCP 层：CLI 与 GUI 走的是同一条路径，一处漏掉就有一处能卡死。
+    if params.timeout > Duration::from_millis(MAX_TIMEOUT_MS) {
+        return Err(ScopeError::InvalidParam {
+            field: "timeout",
+            value: format!("{} ms", params.timeout.as_millis()),
+            reason: format!("超过上限 {MAX_TIMEOUT_MS} ms"),
+        });
+    }
+
     // ── 1) 采样率：以**回显值**建时间轴（ADR 纪律，绝不用请求值）──
     let actual_hz = bus.set_sample_rate(params.rate_hz)?;
 
     // ── 2) 触发与采集参数 ──
-    // normal / ch0 / 上升沿 / 预触发一半 / holdoff 1000 µs
+    //
+    // 触发模式/边沿/源与采集格式/抽点**沿用设备当前配置**，不写死。
+    //
+    // 回归：这里从前是 `set_trigger(1, 0, 0, ..)` 与 `set_acq(0, .., 0, 1)`
+    // —— 固定 normal / ch0 / 上升沿 / RAW16 / 不抽点。于是
+    // `scope_configure` 配好的东西会被**下一次采集**整个推回默认，
+    // 而 configure 的响应还回显着「已生效」、`GET_STATUS` 也确认过。
+    // 最刺眼的一处：采集超时的错误提示写着「改用 auto 模式」，而按提示
+    // 配好的 auto 会在 ARM 之前被这几行改回 normal —— 提示是条死路。
+    //
+    // 沿用现值是**兼容**的：`Config::default()` 恰好就是
+    // `trigger_mode=normal / source=0 / edge=rising / format=RAW16 /
+    // decimation=1`，所以从不碰触发配置的调用方，行为一字不变。
+    let cfg = bus.config.as_ref();
+    let (t_mode, t_src, t_edge) = cfg
+        .map(|c| (c.trigger_mode, c.trigger_source, c.trigger_edge))
+        .unwrap_or((TRIG_MODE_NORMAL, 0, 0));
+    let (a_mode, a_fmt, a_dec) = cfg
+        .map(|c| (c.acq_mode, c.format, c.decimation))
+        .unwrap_or((ACQ_SINGLE, 0, 1));
+    // 抽点倍数 0 是非法值（协议规定 1..=256），`set_acq` 会直接拒绝 ——
+    // 于是一个把 `decimation` 报成 0 的设备会让**每一次采集都失败**。
+    // 从前这里写死 1，恰好兜住了这种情况；改成沿用例值之后必须显式兜底。
+    let a_dec = if a_dec == 0 { 1 } else { a_dec };
+
     let pre = (params.samples / 2).min(2048);
-    bus.set_trigger(1, 0, 0, params.trigger_level_lsb, pre, 1000)?;
-    bus.set_acq(0, params.samples, 0, 1)?; // 单次 / RAW16 / 不抽点
+    bus.set_trigger(t_mode, t_src, t_edge, params.trigger_level_lsb, pre, 1000)?;
+    bus.set_acq(a_mode, params.samples, a_fmt, a_dec)?;
 
     bus.arm()?;
 
@@ -263,6 +314,79 @@ mod tests {
         assert_eq!(ev.rate_hz, 857_142);
         assert_eq!(ev.n_samples, 4096);
         assert_eq!(ev.device_tick_us, 1234);
+    }
+
+    /// 一个什么都不做的传输。
+    ///
+    /// 超时检查发生在**任何设备 I/O 之前**（见 [`acquire_cancellable`] 的
+    /// 第一步），所以这里的实现永远不会被调用 —— 它存在的唯一理由是给
+    /// `CommandBus` 一个具体类型。要测真实交互请去 `scope-device` 或
+    /// `scope-mcp`（那边有模拟器；core 不依赖 sim，这是**对的**依赖方向）。
+    struct NullPort;
+
+    impl crate::DevicePort for NullPort {
+        fn write_all(&mut self, _bytes: &[u8]) -> std::result::Result<(), crate::LinkError> {
+            Ok(())
+        }
+        fn read_some(&mut self) -> std::result::Result<Vec<u8>, crate::LinkError> {
+            Ok(Vec::new())
+        }
+        fn describe(&self) -> String {
+            "null".into()
+        }
+    }
+
+    #[test]
+    fn an_absurd_timeout_is_rejected_before_it_becomes_a_deadline() {
+        // 回归：`wait_trigger_sliced` 算的是 `Instant::now() + total`。
+        // 给一个 u64::MAX 毫秒（约 5.8 亿年）之后**调用永久挂住且不报错** ——
+        // 实测一次就能让整个 MCP server 从此不再响应任何请求（`serve()` 是
+        // 单线程），只能杀进程重启。这里守住的是 CLI / GUI / MCP 三条路径
+        // 的共同入口。
+        let mut bus = CommandBus::new(NullPort);
+
+        for bad in [
+            Duration::from_millis(MAX_TIMEOUT_MS + 1),
+            Duration::from_millis(u64::MAX),
+        ] {
+            let params = AcquireParams {
+                timeout: bad,
+                ..Default::default()
+            };
+            match acquire(&mut bus, &params).unwrap_err() {
+                ScopeError::InvalidParam {
+                    field,
+                    value,
+                    reason,
+                } => {
+                    assert_eq!(field, "timeout");
+                    assert!(!value.is_empty(), "错误里要带上实际请求的值");
+                    assert!(
+                        reason.contains(&MAX_TIMEOUT_MS.to_string()),
+                        "理由里要写清上界，实测 {reason}"
+                    );
+                }
+                other => panic!("越界超时应当被明确拒绝，实测 {}", other.summary()),
+            }
+        }
+    }
+
+    #[test]
+    fn the_timeout_boundary_itself_is_not_rejected() {
+        // 正好等于上界必须放行 —— 否则「上限」就成了「上限减一」，
+        // 而那是个看不出来的差一错误。
+        let mut bus = CommandBus::new(NullPort);
+        let params = AcquireParams {
+            timeout: Duration::from_millis(MAX_TIMEOUT_MS),
+            ..Default::default()
+        };
+        // 会往后走到设备 I/O 上失败（NullPort 不响应），但不能是超时那条错误
+        let e = acquire(&mut bus, &params).unwrap_err();
+        assert!(
+            !matches!(&e, ScopeError::InvalidParam { field, .. } if *field == "timeout"),
+            "正好等于上界不该被拒，实测 {}",
+            e.summary()
+        );
     }
 
     #[test]
