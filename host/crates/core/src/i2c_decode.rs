@@ -986,38 +986,34 @@ pub fn detect_channels(cap: &Capture, levels: Levels, debounce_ns: u32) -> Optio
         return None;
     }
 
-    let score = |scl_ch: usize, sda_ch: usize| -> (usize, u32) {
+    // 判据是**边沿数**，不是解出多少帧。
+    //
+    // I2C 里 SCL 每个比特时钟一次，SDA 一个比特至多变一次 —— 所以
+    // 「哪条线的边沿多，哪条就是 SCL」是硬性质。
+    //
+    // 回归：这里曾经以「解出的完整帧数」为首要判据，结果**反向接法反而赢**。
+    // 把 SDA 当 SCL 时，真正的 SCL（高频跳变）被当成数据线，那些跳变被
+    // 误读成 START/STOP，于是解出一堆「被伪 STOP 正常收尾」的空壳帧，
+    // 完整帧数比正确方向还多一个 —— 自动判定选反，62 个 address=null 的
+    // 空帧还被报成 trustworthy=true。
+    let edges = |scl_ch: usize, sda_ch: usize| -> u32 {
         let (Some(a), Some(b)) = (cap.samples(scl_ch), cap.samples(sda_ch)) else {
-            return (0, 0);
+            return 0;
         };
-        let r = decode(a, b, cap.rate_hz, levels, debounce_ns);
-        let complete = r.transactions.iter().filter(|t| t.complete).count();
-        (complete, r.quality.scl_edges)
+        decode(a, b, cap.rate_hz, levels, debounce_ns)
+            .quality
+            .scl_edges
     };
 
     // 只在前两个通道之间试正反 —— 更多通道的组合需要人工指定
-    let forward = score(0, 1);
-    let reverse = score(1, 0);
+    let forward = edges(0, 1);
+    let reverse = edges(1, 0);
 
-    let pick = if forward.0 != reverse.0 {
-        if forward.0 > reverse.0 {
-            (0, 1)
-        } else {
-            (1, 0)
-        }
-    } else if forward.1 != reverse.1 {
-        if forward.1 > reverse.1 {
-            (0, 1)
-        } else {
-            (1, 0)
-        }
-    } else if forward.1 == 0 {
+    if forward == 0 && reverse == 0 {
         return None; // 两个方向都没有边沿 —— 没信号
-    } else {
-        (0, 1) // 打平且都有边沿：按约定取默认
-    };
-
-    Some(pick)
+    }
+    // 打平按约定取默认
+    Some(if forward >= reverse { (0, 1) } else { (1, 0) })
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1397,6 +1393,37 @@ mod tests {
             (0.4..=0.6).contains(&duty),
             "SCL 是方波，占空比应接近 50%，实测 {:.1}%",
             duty * 100.0
+        );
+    }
+
+    #[test]
+    fn channel_detection_uses_edge_count_not_frame_count() {
+        // 回归：判据曾经是「解出的完整帧数」，而反向接法解出的空壳帧**更多**
+        // （真 SCL 的跳变被当成数据线后误读成 START/STOP，每帧都被伪 STOP
+        // 正常收尾），于是自动判定稳定选反。
+        let mut b = Builder::new();
+        b.start(4);
+        b.byte(0x88, true, 4);
+        b.byte(0x00, true, 4);
+        b.byte(0x1A, true, 4);
+        b.stop(4);
+
+        let n = b.scl.len() as u32;
+        let mut normal = Capture::new(1, 857_142, 2, n);
+        normal.channels = vec![b.scl.clone(), b.sda.clone()];
+        assert_eq!(
+            detect_channels(&normal, levels(), 50),
+            Some((0, 1)),
+            "正接（CH0=SCL）应判为 (0, 1)"
+        );
+
+        // 反过来接：CH0 = SDA、CH1 = SCL
+        let mut swapped = Capture::new(1, 857_142, 2, n);
+        swapped.channels = vec![b.sda, b.scl];
+        assert_eq!(
+            detect_channels(&swapped, levels(), 50),
+            Some((1, 0)),
+            "反接（CH1=SCL）应判为 (1, 0)，而不是被空壳帧骗过去"
         );
     }
 

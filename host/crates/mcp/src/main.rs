@@ -99,7 +99,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "scope_measure",
         description: "对指定采集做测量：频率/峰峰值/均值/RMS/占空比/上升时间。返回纯数字+单位",
-        input_schema: r#"{"type":"object","properties":{"capture_id":{"type":"integer"},"metrics":{"type":"array","items":{"type":"string"}},"channel":{"type":"integer"}},"required":["capture_id"]}"#,
+        input_schema: r#"{"type":"object","properties":{"capture_id":{"type":"integer"},"metrics":{"type":"array","items":{"type":"string","enum":["vpp","min","max","mean","rms","freq","duty"]}},"channel":{"type":"integer"}},"required":["capture_id"]}"#,
         protocol_cmds: "主机侧计算（精度最高）；流模式可走 MEASURE",
         condition: "总是",
     },
@@ -121,14 +121,14 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "scope_save_capture",
         description: "把全量波形落盘（csv/npy/bin）。数据不进 LLM 上下文",
-        input_schema: r#"{"type":"object","properties":{"capture_id":{"type":"integer"},"path":{"type":"string"},"format":{"type":"string","enum":["csv","npy","bin"]}},"required":["capture_id","path"]}"#,
+        input_schema: r#"{"type":"object","properties":{"capture_id":{"type":"integer"},"path":{"type":"string"},"format":{"type":"string","enum":["csv"],"description":"目前只支持 csv"}},"required":["capture_id","path"]}"#,
         protocol_cmds: "无（本地写文件）",
         condition: "总是",
     },
     ToolSpec {
         name: "scope_watch",
         description: "start→收集→stop 一体化的流式观察，返回滚动摘要与缺口统计",
-        input_schema: r#"{"type":"object","properties":{"duration_ms":{"type":"integer","default":1000},"bucket":{"type":"integer"},"max_points":{"type":"integer","default":128}},"required":[]}"#,
+        input_schema: r#"{"type":"object","properties":{"duration_ms":{"type":"integer","default":1000},"max_points":{"type":"integer","default":128}},"required":[]}"#,
         protocol_cmds: "ARM(stream) + 分片推送 + STOP",
         condition: "总是",
     },
@@ -186,14 +186,31 @@ fn serve() -> Result<()> {
             continue;
         }
 
-        let req: jsonrpc::Request = match serde_json::from_str(&line) {
-            Ok(r) => r,
+        // 先宽松解析成 Value 再收紧成 Request —— 这样「**是**合法 JSON 但
+        // 不**是**合法请求对象」能报 -32600 并**回显 id**，而不是一律
+        // -32700 且把 id 丢成 null。客户端靠 id 匹配响应，丢了它只能干等。
+        let raw: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
             Err(e) => {
-                // 解析失败连 id 都拿不到，按规范用 null
+                // 这一步才是真的解析失败：连 id 都无从得知，按规范用 null
                 let resp = Response::err(
                     Value::Null,
                     code::PARSE_ERROR,
                     format!("JSON 解析失败: {e}"),
+                );
+                writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
+                stdout.flush()?;
+                continue;
+            }
+        };
+        let req: jsonrpc::Request = match serde_json::from_value(raw.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                let id = raw.get("id").cloned().unwrap_or(Value::Null);
+                let resp = Response::err(
+                    id,
+                    code::INVALID_REQUEST,
+                    format!("不是合法的 JSON-RPC 请求对象: {e}"),
                 );
                 writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
                 stdout.flush()?;
@@ -245,9 +262,14 @@ fn serve() -> Result<()> {
                 } else if !tool_enabled(name, debug_tools) {
                     Response::err(
                         id,
-                        code::METHOD_NOT_FOUND,
+                        code::INVALID_PARAMS,
                         format!("工具 {name} 在当前会话里不可用（未注册）"),
                     )
+                } else if !TOOLS.iter().any(|t| t.name == name) {
+                    // 未知工具名与「未注册」走同一类错误 —— 两条路径报不同
+                    // 种类的错会让客户端难以统一处理（原来一个是工具级
+                    // isError，一个是协议级 -32601）。
+                    Response::err(id, code::INVALID_PARAMS, format!("未知工具 {name}"))
                 } else {
                     Response::ok(id, dispatch(&mut session, name, &args))
                 }
