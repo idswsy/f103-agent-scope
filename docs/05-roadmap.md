@@ -77,7 +77,7 @@ cd host && cargo test       # Rust 端全部测试
 | 模拟器 | `host/crates/sim/` | 含 F103 真实档位表、触发语义、故障注入；故障注入必须**在主机侧可观测** |
 | MCP Server | `host/crates/mcp/` | 工具 schema 由参数类型经 `schemars` 生成，**不是手写的**；见下方「schema 与实现的一致性」 |
 | 14 个粗粒度工具 | `host/crates/mcp/src/main.rs` 的 `TOOLS` | 见下表 |
-| Agent 工作流 | `docs/` | 一段可复现的对话实录 |
+| Agent 工作流 | [`08-agent-walkthrough.md`](08-agent-walkthrough.md) 生成程序在 [`tools/agent_demo/`](../tools/agent_demo/) | 一段**可复现**的对话实录：一个 LLM 走 MCP 原生工具调用完成一次总线排查。⚠ 实测暴露了两件事 —— 模拟器场景没有读事务、以及 NACK 造不出来（见该文第 5 节） |
 
 ### schema 与实现的一致性（P3 的硬性验收）
 
