@@ -4,15 +4,15 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  L5  Agent 层           Claude / 任意 LLM                            │
-│                          ↕ MCP (JSON-RPC over stdio)                 │
-│  L4  MCP Server         ~12 个粗粒度工具，schema 自动生成              │
-│                          ↕ 直接调用 scope-core 的 async API          │
-│  L3  命令层 scope-core  CommandBus：编码 / seq / 超时重试 / 状态缓存   │
-│                          ↕ DevicePort (trait)                        │
-│  L2  传输层             UART(tokio-serial) │ sim │ tcp(可选)          │
-│                          ↕ AA55 帧 / CRC16 / 分片                     │
-│  L1  设备层             STM32F103C8T6 固件                            │
+│  L5  Agent 层           Claude / 任意 LLM                           │
+│                          ↕ MCP (JSON-RPC over stdio)                │
+│  L4  MCP Server        14 个粗粒度工具，schema 手写（待改 schemars）│
+│                          ↕ 直接调用 scope-core 的 async API         │
+│  L3  命令层 scope-core  CommandBus：编码 / seq / 超时重试 / 状态缓存│
+│                          ↕ DevicePort (trait)                       │
+│  L2  传输层             UART(tokio-serial) │ sim │ tcp(可选)        │
+│                          ↕ AA55 帧 / CRC16 / 分片                   │
+│  L1  设备层             STM32F103C8T6 固件                          │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 

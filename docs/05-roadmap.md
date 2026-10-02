@@ -75,8 +75,8 @@ cd host && cargo test       # Rust 端全部测试
 | 交付物 | 位置 | 验收标准 |
 |---|---|---|
 | 模拟器 | `host/crates/sim/` | 含 F103 真实档位表、触发语义、故障注入 |
-| MCP Server | `host/crates/mcp/` | 工具 schema 由 Rust 类型自动生成 |
-| 12 个粗粒度工具 | `docs/03-protocol.md` §MCP | 见下表 |
+| MCP Server | `host/crates/mcp/` | 工具 schema 与实现一致（⏳ 目前是手写字面量，尚未改为 `schemars` 从 Rust 类型生成） |
+| 14 个粗粒度工具 | `host/crates/mcp/src/main.rs` 的 `TOOLS` | 见下表 |
 | Agent 工作流 | `docs/` | 一段可复现的对话实录 |
 
 ### MCP 工具清单（粗粒度，**14 个** Agent 意图）
