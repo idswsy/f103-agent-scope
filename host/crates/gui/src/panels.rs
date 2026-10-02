@@ -53,7 +53,7 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
 
         ui.separator();
         if ui
-            .selectable_label(app.show_help, "能力边界")
+            .selectable_label(app.show_help, "帮助")
             .on_hover_text("这台设备能做什么、做不到什么 —— 建议先看一眼")
             .clicked()
         {
