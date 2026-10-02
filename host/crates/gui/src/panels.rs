@@ -99,16 +99,10 @@ pub fn device(app: &mut App, ui: &mut egui::Ui) {
                 egui::ComboBox::from_id_salt("scenario")
                     .selected_text(app.scenario.name())
                     .show_ui(ui, |ui| {
-                        for s in [
-                            Scenario::I2c100k,
-                            Scenario::I2c400k,
-                            Scenario::Sine1k3v3,
-                            Scenario::Square50k,
-                            Scenario::PulseGlitch,
-                            Scenario::Noise,
-                            Scenario::Dc,
-                            Scenario::Am,
-                        ] {
+                        // 直接用 `Scenario::ALL`，**不要再手抄一份清单** ——
+                        // 从前这里是一个写死的数组，于是往模拟器加场景时
+                        // GUI 会静默地少一个，而没有任何东西会提醒你。
+                        for s in Scenario::ALL {
                             ui.selectable_value(&mut app.scenario, s, s.name());
                         }
                     });

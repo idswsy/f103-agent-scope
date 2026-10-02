@@ -1385,13 +1385,60 @@ mod tests {
 
     #[test]
     fn i2c_decode_returns_frames() {
+        // 默认场景现在是一笔**完整的**「写寄存器指针 → 重复起始 → 读数据」。
+        // 这条测试锁的是这个形状：两帧、一写一读、第二帧是重复起始。
+        //
+        // 回归：从前默认事务是 `[0x88, 0x00, 0x1A]` —— **只有写、没有读**，
+        // 于是任何问「为什么读出来全是 0」的 Agent 都会得到「总线上根本没有
+        // 读事务」这个诊断。那在模拟器上是对的，对真实总线却是推出来的。
         let mut s = connected();
         let _ = s.capture(&args(json!({}))).unwrap();
         let v = s.i2c_decode(&args(json!({ "capture_id": 1 }))).unwrap();
-        assert!(v["frame_count"].as_u64().unwrap() > 0, "应解出帧");
+        assert!(v["frame_count"].as_u64().unwrap() >= 2, "应解出多帧");
+
+        let w = &v["frames"][0];
+        assert_eq!(w["address"]["value"], 0x44, "地址应是 0x44");
+        assert_eq!(w["address"]["read"], false, "第一帧是写");
+        assert_eq!(w["bytes"], json!([0x00]), "写的是寄存器指针 0x00");
+
+        let r = &v["frames"][1];
+        assert_eq!(r["address"]["value"], 0x44, "同一个从机地址");
+        assert_eq!(r["address"]["read"], true, "第二帧是读");
+        assert_eq!(r["repeated_start"], true, "第二帧应以重复起始开头");
+        assert_eq!(r["bytes"], json!([0x01, 0x2C]), "读回两个字节");
+
+        assert_eq!(v["trustworthy"], true);
+    }
+
+    #[test]
+    fn i2c_decode_reports_a_nack() {
+        // README 给 P3 定的验收场景就是「抓一次 I2C 写时序并告诉我**为什么
+        // NACK**」，而在此之前模拟器**造不出 NACK** —— `transaction()` 把
+        // 应答位写死在每个字节后面。这条测试锁住新补的场景。
+        let mut s = Session::new();
+        s.connect(&args(
+            json!({ "transport": "sim", "sim_scenario": "i2c_nack" }),
+        ))
+        .unwrap();
+        let _ = s.capture(&args(json!({}))).unwrap();
+        let v = s.i2c_decode(&args(json!({ "capture_id": 1 }))).unwrap();
+
         let f = &v["frames"][0];
-        assert_eq!(f["address"]["value"], 0x44, "模拟器的默认事务是 0x44");
-        assert_eq!(f["bytes"], json!([0x00, 0x1A]));
+        assert_eq!(
+            f["address"]["acked"], true,
+            "地址被应答了 —— 从机在总线上、地址也对"
+        );
+        assert_eq!(f["nack"], true, "但这一笔写被 NACK 了");
+        assert_eq!(
+            f["bytes"],
+            json!([0x00]),
+            "被 NACK 的那个字节仍然出现在总线上，解码器应当照实报出来"
+        );
+        // `complete` 说的是「有正常 STOP 收尾」，**不是**「没有 NACK」——
+        // 被 NACK 的帧照样会以 STOP 正常结束。`false` 只意味着被采集窗截断。
+        // 这两个概念混起来读，会把「器件拒绝了你」误读成「数据不完整」。
+        assert_eq!(f["complete"], true, "这一帧是正常收尾的，只是内容被拒了");
+        // 从机在，地址对，但这一笔它不收 —— 解码器不该因此判定整条总线不可信
         assert_eq!(v["trustworthy"], true);
     }
 

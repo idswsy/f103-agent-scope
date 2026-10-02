@@ -1056,7 +1056,7 @@ mod tests {
         assert_eq!(label(&connect, "transport"), "serial|sim?");
         assert_eq!(
             label(&connect, "sim_scenario"),
-            "sine_1k_3v3|square_50k|pulse_glitch|noise|dc|am|i2c_100k|i2c_400k?"
+            "sine_1k_3v3|square_50k|pulse_glitch|noise|dc|am|i2c_100k|i2c_400k|i2c_nack?"
         );
 
         // 可选数组、可选字符串

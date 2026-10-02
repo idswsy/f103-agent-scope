@@ -180,6 +180,9 @@ enum ScenarioArg {
     I2c100k,
     #[value(name = "i2c_400k")]
     I2c400k,
+    /// 地址被应答、但随后的一笔写被 NACK —— 用来演示「为什么 NACK」
+    #[value(name = "i2c_nack")]
+    I2cNack,
 }
 
 impl From<ScenarioArg> for Scenario {
@@ -193,6 +196,7 @@ impl From<ScenarioArg> for Scenario {
             ScenarioArg::Am => Scenario::Am,
             ScenarioArg::I2c100k => Scenario::I2c100k,
             ScenarioArg::I2c400k => Scenario::I2c400k,
+            ScenarioArg::I2cNack => Scenario::I2cNack,
         }
     }
 }
@@ -563,5 +567,40 @@ impl<P: DevicePort> DevicePort for RefPort<'_, P> {
     }
     fn byte_rate(&self) -> u32 {
         self.0.byte_rate()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::ValueEnum;
+
+    /// CLI 的场景清单必须与 `scope_sim::Scenario` **逐字一致**。
+    ///
+    /// CLI 这里有一份自己的枚举（为了 clap 的命令行补全与帮助文本），
+    /// 而 `Scenario` 那边有 `ALL` 与 `name()` —— 同一份东西三处各写一遍。
+    ///
+    /// 回归：从前没有任何东西保证它们对得上。给模拟器加了 `i2c_nack` 之后，
+    /// **CLI 与 GUI 都静默地少了一个场景**，没有一条测试会红。
+    /// GUI 那边已经改成直接遍历 `Scenario::ALL`（把重复消灭掉）；
+    /// CLI 因为要用 clap 的 `ValueEnum`，保留枚举，改用这条测试卡住。
+    #[test]
+    fn scenario_list_matches_the_simulator() {
+        let cli: Vec<String> = ScenarioArg::value_variants()
+            .iter()
+            .filter_map(|v| v.to_possible_value().map(|p| p.get_name().to_string()))
+            .collect();
+        let sim: Vec<String> = Scenario::all_names().map(String::from).collect();
+        assert_eq!(cli, sim, "CLI 的场景清单与 scope_sim::Scenario 分家了");
+
+        // 而且每一个都要真的能转过去 —— 防止只加了枚举、忘了写 From 分支
+        for v in ScenarioArg::value_variants() {
+            let s: Scenario = (*v).into();
+            assert_eq!(
+                s.name(),
+                v.to_possible_value().unwrap().get_name(),
+                "枚举名与场景名对不上"
+            );
+        }
     }
 }
