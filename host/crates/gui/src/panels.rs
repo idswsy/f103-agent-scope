@@ -54,7 +54,7 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
         ui.separator();
         if ui
             .selectable_label(app.show_help, "帮助")
-            .on_hover_text("这台设备能做什么、做不到什么 —— 建议先看一眼")
+            .on_hover_text("技术规格 / 使用限制 / 注意事项")
             .clicked()
         {
             app.show_help = !app.show_help;
@@ -359,14 +359,14 @@ pub fn faults(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
-/// 中央区：能力边界。
+/// 中央区：帮助页。
 ///
-/// 写成**规格文档**的样子，不是"给你讲解" —— 客观陈述、表格化、不用
-/// emoji、不用第二人称。文档要求这些限制「必须写进 UI 与预期」，
-/// 目的是让人查得到，不是让人读得感动。
+/// 写成**说明书**的样子，不是"讲解"：名词化标题、条目以参数名打头、陈述句。
+/// 参考同类工具（Keil µVision / Saleae Logic / PulseView）的说明页结构 ——
+/// Specifications / Limitations / Notes。不含第二人称、感叹、建议。
 pub fn help_page(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        ui.heading("能力边界");
+        ui.heading("帮助");
         if ui.button("← 返回波形").clicked() {
             app.show_help = false;
         }
@@ -377,64 +377,63 @@ pub fn help_page(app: &mut App, ui: &mut egui::Ui) {
         .id_salt("help_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            egui::Grid::new("caps")
-                .num_columns(2)
-                .spacing([18.0, 4.0])
-                .show(ui, |ui| {
-                    ui.strong("测量能力");
-                    ui.label("");
-                    ui.end_row();
-                    for (k, v) in [
-                        ("I2C 协议解码", "100 kHz / 400 kHz / 1 MHz"),
-                        ("模拟带宽", "≤ 100 kHz"),
-                        ("采样率", "双通道同步 857 kSPS / 通道"),
-                        ("单次采集深度", "4096 点"),
-                        ("触发电平迟滞", "±16 LSB"),
-                    ] {
-                        ui.label(format!("    {k}"));
-                        ui.monospace(v);
-                        ui.end_row();
-                    }
-                });
+            section(ui, "技术规格", &[
+                ("I2C 协议解码", "100 kHz / 400 kHz / 1 MHz（数字通路）"),
+                ("模拟带宽", "≤ 100 kHz"),
+                ("采样率", "双通道同步 857 kSPS / 通道"),
+                ("单次采集深度", "4096 点"),
+                ("触发电平迟滞", "±16 LSB"),
+                ("边沿时间戳分辨率", "13.9 ns"),
+            ]);
 
-            ui.add_space(10.0);
-            ui.strong("不支持");
-            ui.add_space(2.0);
-            // 用普通列表而不是 Grid —— 这两列里第一列是空的，Grid 会把
-            // 各行的缩进按最宽单元格对齐，首行反而跟别的行对不齐。
-            for v in [
-                "1 MSPS 与 USB 并存",
-                "深存储 / 外扩 SRAM",
-                "带宽 > 0.5 MHz",
-                "I2C 时序合规性验证（tSU;DAT / tr 的 ns 级判定）",
-                "计量级测量、THD / SFDR、12-bit 绝对精度",
-                "程控量程（量程切换为机械开关）",
-            ] {
-                ui.label(format!("    {v}"));
-            }
+            ui.add_space(12.0);
+            section(ui, "使用限制", &[
+                ("采样率", "上限 857 142 Hz。定时器整数分频，请求值将被量化"),
+                ("传输", "不支持 1 MSPS 与 USB 并存"),
+                ("存储", "不支持外扩；单次采集上限 4096 点"),
+                ("带宽", "上限 0.5 MHz"),
+                ("I2C 时序合规性", "不提供（tSU;DAT / tr 的 ns 级判定）"),
+                ("测量精度", "不提供计量级结果（THD / SFDR、12-bit 绝对精度）"),
+                ("量程", "机械开关切换，不支持程控"),
+            ]);
 
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             ui.strong("注意事项");
-            ui.add_space(2.0);
-            // ⚠ 这些字符串**不要用 `\` 续行**：续行后源码里的缩进会原样
-            // 进到字符串里，渲染出来每句中间凭空多一大段空白。
+            ui.add_space(3.0);
+            // ⚠ 这些字符串不要用 `\` 续行 —— 续行后源码里的缩进会原样进到
+            // 字符串里，渲染出来每句中间凭空多一大段空白。
             let notes = [
-                "采样率上限为 857 142 Hz。设备按 72 MHz 定时器整数分频得到档位，请求值会被量化；时间轴一律以设备回显的实际值为准。",
                 "电压换算使用未标定的占位参数（3.3 V / 4096、零点 2048）。接入实机后需按设备 UID 标定。",
-                "上升时间的分辨率下限为 1 个采样周期，更快的边沿无法分辨。",
-                "频率与占空比已排除事务之间的空闲区间；非周期信号（如数据线）报出的是边沿速率。",
-                "协议解码走数字通路（LM393 比较器 + 定时器输入捕获，13.9 ns 分辨率），与 ADC 采样率无关；ADC 通路负责信号质量评估。两条通路互补：前者回答协议是否正确，后者回答信号是否良好。",
+                "上升时间的分辨率下限为 1 个采样周期。",
+                "频率与占空比已排除事务之间的空闲区间；非周期信号报出的是边沿速率。",
+                "协议解码走数字通路（LM393 比较器 + 定时器输入捕获），与 ADC 采样率无关；ADC 通路负责信号质量评估。",
             ];
-            for t in notes {
-                ui.label(format!("    · {t}"));
+            for (i, t) in notes.iter().enumerate() {
+                ui.label(format!("    {}. {t}", i + 1));
             }
 
-            ui.add_space(14.0);
+            ui.add_space(16.0);
             ui.separator();
             ui.weak(format!(
                 "scope-gui {}  ·  协议 v1  ·  设计与性能数据见 docs/",
                 scope_core::VERSION
             ));
+        });
+}
+
+/// 说明页里的一段「参数名 | 参数值」表格。
+fn section(ui: &mut egui::Ui, title: &str, rows: &[(&str, &str)]) {
+    ui.strong(title);
+    ui.add_space(3.0);
+    egui::Grid::new(title)
+        .num_columns(2)
+        .spacing([20.0, 4.0])
+        .show(ui, |ui| {
+            for (k, v) in rows {
+                ui.label(format!("    {k}"));
+                ui.label(*v);
+                ui.end_row();
+            }
         });
 }
 
