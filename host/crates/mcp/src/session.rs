@@ -1925,6 +1925,63 @@ mod tests {
     }
 
     #[test]
+    fn capture_and_watch_reject_an_absurd_timeout() {
+        // 回归：`check_timeout` 在 `capture` 与 `watch` 里各调一次，但
+        // **MCP 层一条测试都没有** —— 核心层有（`acquire.rs` 的
+        // `an_absurd_timeout_is_rejected...`），端到端我手跑过，
+        // 可是 CI 里没有一条会拦住有人删掉那两行 `check_timeout(...)?`。
+        //
+        // 这两个输入从前会让 `serve()` 永久挂住（单线程，之后任何请求都不
+        // 再被处理，只能杀进程），所以这条测试守的是一个**致命**行为，
+        // 不是参数洁癖。
+        let mut s = connected();
+        for bad in [u64::MAX, MAX_TIMEOUT_MS + 1] {
+            let e = s.capture(&args(json!({ "timeout_ms": bad }))).unwrap_err();
+            assert!(e.message.contains("timeout_ms"), "实测 {}", e.message);
+            assert!(
+                e.message.contains(&MAX_TIMEOUT_MS.to_string()),
+                "要说清上界"
+            );
+            assert!(e.hint.is_some(), "错误必须给出「怎么办」");
+
+            let e = s.watch(&args(json!({ "duration_ms": bad }))).unwrap_err();
+            assert!(e.message.contains("duration_ms"), "实测 {}", e.message);
+        }
+
+        // 0 也要拒 —— schema 里 minimum 是 1
+        assert!(s.capture(&args(json!({ "timeout_ms": 0 }))).is_err());
+        assert!(s.watch(&args(json!({ "duration_ms": 0 }))).is_err());
+
+        // 边界值本身合法（差一错误会让「上限」变成「上限减一」）
+        let v = s.capture(&args(
+            json!({ "timeout_ms": MAX_TIMEOUT_MS, "mode": "single" }),
+        ));
+        // 会真的等到触发或超时；用 Dc + auto 场景不会等满 10 分钟才回来 ——
+        // 这里只要求「不是被参数校验挡下的」。
+        if let Err(e) = v {
+            assert!(
+                !e.message.contains("超出范围"),
+                "正好等于上界不该被拒，实测 {}",
+                e.message
+            );
+        }
+    }
+
+    #[test]
+    fn preview_point_caps_reject_zero() {
+        // 0 会让 `Capture::preview` 返回 `None` —— 一次「成功但没有预览」
+        // 的采集，Agent 很容易读成「没采到数据」。schema 里 minimum 是 1。
+        let mut s = connected();
+        for e in [
+            s.capture(&args(json!({ "max_preview_points": 0 })))
+                .unwrap_err(),
+            s.watch(&args(json!({ "max_points": 0 }))).unwrap_err(),
+        ] {
+            assert!(e.message.contains("至少为 1"), "实测 {}", e.message);
+        }
+    }
+
+    #[test]
     fn an_absurd_latency_spike_cannot_hang_the_server() {
         // 回归：`latency_spike_ms` 会被原样交给 `sim` 的 `thread::sleep`，
         // 而 `serve()` 是单线程 —— u64::MAX 毫秒＝永久睡死，之后任何调用
