@@ -10,14 +10,8 @@
 use scope_core::{Capture, DeviceConfig, DeviceInfo, State};
 use scope_sim::{FaultInjection, Scenario};
 
-/// 一次连接的传输选择。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TransportKind {
-    /// 内置模拟器。
-    Sim,
-    /// 串口。
-    Serial,
-}
+// 连接方式的定义在共享的设备层里（GUI 与 MCP 共用一份）
+pub use scope_device::TransportKind;
 
 /// UI → worker。
 #[derive(Debug, Clone)]
@@ -122,48 +116,8 @@ pub enum Update {
 
 /// 把错误拆成 UI 能用的两段：说明 + 自救提示。
 ///
-/// 项目纪律：错误要给"怎么办"，不能只给错误码
-/// （见 `docs/03-protocol.md` 「UI/MCP 只用枚举不用裸码」）。
+/// 实现在 core 里（`ScopeError::summary()` / `hint()`）—— GUI 与 MCP 共用一份，
+/// 免得两边的措辞漂移。
 pub fn describe_error(e: &scope_core::ScopeError) -> (String, Option<String>) {
-    use scope_core::ScopeError;
-    match e {
-        // ⚠ 下面这四个变体的 `Display` **已经把 hint/reason 拼进正文了**
-        // （见 `core/src/error.rs` 的 `#[error(...)]`），再单独显示一次 hint，
-        // 同一句话就会在底栏出现两遍。所以这里自己拼一段**不带 hint** 的说明。
-        ScopeError::InvalidParam {
-            field,
-            value,
-            reason,
-        } => (format!("参数非法: {field} = {value}"), Some(reason.clone())),
-        ScopeError::BadState {
-            current,
-            action,
-            hint,
-        } => (
-            format!("当前状态 {current:?} 不允许执行 {action}"),
-            Some(hint.clone()),
-        ),
-        ScopeError::NoTrigger(ms, hint) => (format!("未在 {ms} ms 内触发"), Some(hint.clone())),
-        ScopeError::Unsupported(msg) => ("该功能在此硬件上不可用".to_string(), Some(msg.clone())),
-
-        ScopeError::Device(d) => (d.to_string(), Some(d.hint().to_string())),
-        ScopeError::Link(l) => {
-            use scope_core::LinkError;
-            let hint = match l {
-                LinkError::Timeout(_) => "设备无响应：确认已上电、波特率正确、没被串口助手占用",
-                LinkError::Disconnected => "链路已断开：点「连接」重建",
-                LinkError::Desynchronized(_) => "连续 CRC 错，链路失步：重插一次 USB",
-                LinkError::Open { .. } => "端口打不开：确认端口号，并关掉占用它的程序",
-                _ => "检查接线与供电",
-            };
-            (l.to_string(), Some(hint.to_string()))
-        }
-        ScopeError::NoSuchCapture(id) => (
-            e.to_string(),
-            Some(format!(
-                "采集 {id} 已被淘汰（历史只留最近 16 次），请重新采集"
-            )),
-        ),
-        ScopeError::Cancelled(_) => (e.to_string(), None),
-    }
+    (e.summary(), e.hint())
 }

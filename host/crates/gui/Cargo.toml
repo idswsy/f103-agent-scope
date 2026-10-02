@@ -15,6 +15,7 @@ rust-version = "1.95"
 scope-core             = { workspace = true }
 scope-sim              = { workspace = true }
 scope-transport-serial = { workspace = true }
+scope-device           = { workspace = true }
 
 eframe    = { workspace = true }
 egui      = { workspace = true }

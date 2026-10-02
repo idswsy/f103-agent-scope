@@ -2847,6 +2847,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scope-device"
+version = "0.1.0"
+dependencies = [
+ "scope-core",
+ "scope-sim",
+ "scope-transport-serial",
+]
+
+[[package]]
 name = "scope-gui"
 version = "0.1.0"
 dependencies = [
@@ -2854,6 +2863,7 @@ dependencies = [
  "egui",
  "egui_plot",
  "scope-core",
+ "scope-device",
  "scope-sim",
  "scope-transport-serial",
 ]
@@ -2864,9 +2874,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "scope-core",
+ "scope-device",
  "scope-proto",
  "scope-sim",
  "scope-transport-serial",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

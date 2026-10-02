@@ -125,6 +125,58 @@ pub enum ScopeError {
 /// 结果别名。
 pub type Result<T> = std::result::Result<T, ScopeError>;
 
+impl ScopeError {
+    /// 一句话说明 —— **不含**「怎么办」。
+    ///
+    /// 有四个变体的 `Display` 已经把 hint/reason 拼进正文了
+    /// （见各变体的 `#[error(...)]`）。显示层如果直接 `to_string()` 再把
+    /// [`hint`](Self::hint) 单独显示一次，同一句话会出现两遍。
+    /// 所以显示层应该用 `summary()` + `hint()` 这一对，而不是 `Display`。
+    pub fn summary(&self) -> String {
+        match self {
+            ScopeError::InvalidParam { field, value, .. } => {
+                format!("参数非法: {field} = {value}")
+            }
+            ScopeError::BadState {
+                current, action, ..
+            } => format!("当前状态 {current:?} 不允许执行 {action}"),
+            ScopeError::NoTrigger(ms, _) => format!("未在 {ms} ms 内触发"),
+            ScopeError::Unsupported(_) => "该功能在此硬件上不可用".to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    /// 「怎么办」。没有建议可给的变体返回 `None`。
+    ///
+    /// 项目纪律：错误要给「怎么办」，不能只给错误码
+    /// （见 `docs/03-protocol.md` 的「UI/MCP 只用枚举不用裸码」）。
+    pub fn hint(&self) -> Option<String> {
+        match self {
+            ScopeError::InvalidParam { reason, .. } => Some(reason.clone()),
+            ScopeError::BadState { hint, .. } => Some(hint.clone()),
+            ScopeError::NoTrigger(_, hint) => Some(hint.clone()),
+            ScopeError::Unsupported(msg) => Some(msg.clone()),
+            ScopeError::Device(d) => Some(d.hint().to_string()),
+            ScopeError::Link(l) => Some(link_hint(l).to_string()),
+            ScopeError::NoSuchCapture(id) => Some(format!(
+                "采集 {id} 已被淘汰（历史只留最近 16 次），请重新采集"
+            )),
+            ScopeError::Cancelled(_) => None,
+        }
+    }
+}
+
+/// 链路错误的「怎么办」。
+fn link_hint(l: &LinkError) -> &'static str {
+    match l {
+        LinkError::Timeout(_) => "设备无响应：确认已上电、波特率正确、没被串口助手占用",
+        LinkError::Disconnected => "链路已断开：重新连接",
+        LinkError::Desynchronized(_) => "连续 CRC 错，链路失步：重插一次 USB",
+        LinkError::Open { .. } => "端口打不开：确认端口号，并关掉占用它的程序",
+        _ => "检查接线与供电",
+    }
+}
+
 impl DeviceError {
     /// 附带一条「怎么办」的提示，供 Agent 自我修复。
     pub fn hint(&self) -> &'static str {

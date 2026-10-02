@@ -17,4 +17,7 @@ scope-proto            = { workspace = true }
 scope-core             = { workspace = true }
 scope-sim              = { workspace = true }
 scope-transport-serial = { workspace = true }
-anyhow = { workspace = true }
+scope-device           = { workspace = true }
+anyhow      = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }

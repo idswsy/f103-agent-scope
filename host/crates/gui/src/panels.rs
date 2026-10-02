@@ -158,7 +158,7 @@ pub fn device(app: &mut App, ui: &mut egui::Ui) {
             }
         } else if ui.add_enabled(!busy, egui::Button::new("连接")).clicked() {
             app.worker.send(Request::Connect {
-                transport: app.transport_kind.clone(),
+                transport: app.transport_kind,
                 port: app.port.clone(),
                 baud: app.baud,
                 scenario: app.scenario,

@@ -20,9 +20,9 @@
 //!    的话队列一满，UI 线程的 `send` 就会阻塞 —— 这是整套设计里唯一的真死锁入口。
 //! 2. **`request_repaint` 只在状态真正变化时调**。放进高频轮询会长期烧掉一个核。
 
-use crate::msg::{describe_error, Request, TransportKind, Update};
-use crate::transport::Transport;
+use crate::msg::{describe_error, Request, Update};
 use scope_core::{CommandBus, ScopeError, State};
+use scope_device::{Transport, TransportKind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;

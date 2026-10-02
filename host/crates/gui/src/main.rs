@@ -37,7 +37,6 @@ mod app;
 mod font;
 mod msg;
 mod panels;
-mod transport;
 mod vmodel;
 mod worker;
 

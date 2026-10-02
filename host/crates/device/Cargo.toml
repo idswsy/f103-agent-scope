@@ -1,0 +1,14 @@
+[package]
+name        = "scope-device"
+description = "设备层：运行时在模拟器与串口之间切换的 DevicePort 实现"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+scope-core             = { workspace = true }
+scope-sim              = { workspace = true }
+scope-transport-serial = { workspace = true }

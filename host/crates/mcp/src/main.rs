@@ -24,9 +24,13 @@
 
 #![deny(clippy::all)]
 
-use anyhow::Result;
+mod jsonrpc;
+mod session;
+
+use anyhow::{Context, Result};
 use scope_core::{CaptureStore, CommandBus};
 use scope_sim::{Scenario, SimDevice};
+use serde_json::{json, Value};
 
 /// 一个 MCP 工具的声明。
 struct ToolSpec {
@@ -151,20 +155,173 @@ fn main() -> Result<()> {
         print_tools();
         return Ok(());
     }
-
     if args.iter().any(|a| a == "--selftest") {
         return selftest();
     }
 
-    print_tools();
-    println!();
-    println!("MCP Server 尚未实现（P3 阶段）。");
-    println!("现在可用：");
-    println!("  scope-mcp --list-tools   查看工具清单与 schema");
-    println!("  scope-mcp --selftest     走一遍模拟器，确认命令层可用");
-    println!();
-    println!("P0–P2 阶段请先用 `scope-cli sim ...` 开发与验证。");
+    // 默认：跑 stdio 上的 MCP server
+    serve()
+}
+
+// ══════════════════════════════════════════════════════════════
+// stdio 上的 MCP server
+// ══════════════════════════════════════════════════════════════
+
+/// 协议版本。客户端给别的值也照常工作，只是回我们支持的这一版。
+const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// 跑 stdio 循环：一行一条 JSON-RPC 消息，读到 EOF 就退出。
+fn serve() -> Result<()> {
+    use jsonrpc::{code, Response};
+    use std::io::{BufRead, Write};
+
+    let debug_tools = std::env::var("SCOPE_MCP_DEBUG").is_ok();
+    let mut session = session::Session::new();
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+
+    for line in stdin.lock().lines() {
+        let line = line.context("读 stdin 失败")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let req: jsonrpc::Request = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                // 解析失败连 id 都拿不到，按规范用 null
+                let resp = Response::err(
+                    Value::Null,
+                    code::PARSE_ERROR,
+                    format!("JSON 解析失败: {e}"),
+                );
+                writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
+                stdout.flush()?;
+                continue;
+            }
+        };
+
+        // 没有 id 就是通知 —— 按 JSON-RPC 规矩不回响应
+        let Some(id) = req.id.clone() else {
+            continue;
+        };
+
+        // 规范要求校验 `jsonrpc` 字段。缺省时宽容处理（有些客户端不发），
+        // 但发了别的值就是客户端 bug，明确报出来比默默算错好。
+        if !req.jsonrpc.is_empty() && req.jsonrpc != "2.0" {
+            let resp = Response::err(
+                id,
+                code::INVALID_REQUEST,
+                format!("jsonrpc 必须是 \"2.0\"，收到 {:?}", req.jsonrpc),
+            );
+            writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
+            stdout.flush()?;
+            continue;
+        }
+        let params = req.params.clone();
+
+        let resp = match req.method.as_str() {
+            "initialize" => Response::ok(
+                id,
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": {
+                        "name": "scope-mcp",
+                        "version": scope_core::VERSION,
+                    },
+                }),
+            ),
+
+            "ping" => Response::ok(id, json!({})),
+
+            "tools/list" => Response::ok(id, json!({ "tools": tool_list(debug_tools) })),
+
+            "tools/call" => {
+                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let args = params.get("arguments").cloned().unwrap_or(json!({}));
+                if name.is_empty() {
+                    Response::err(id, code::INVALID_PARAMS, "tools/call 缺少 name")
+                } else if !tool_enabled(name, debug_tools) {
+                    Response::err(
+                        id,
+                        code::METHOD_NOT_FOUND,
+                        format!("工具 {name} 在当前会话里不可用（未注册）"),
+                    )
+                } else {
+                    Response::ok(id, dispatch(&mut session, name, &args))
+                }
+            }
+
+            other => Response::err(id, code::METHOD_NOT_FOUND, format!("未知方法 {other}")),
+        };
+
+        writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
+        stdout.flush()?;
+    }
     Ok(())
+}
+
+/// 这个工具在 `tools/list` 里出不出现。
+///
+/// **只按启动时定死的东西过滤**，不看连接状态。理由：MCP 客户端一般在启动时
+/// `tools/list` 一次就缓存了，之后连接模拟器并不会让它重新拉列表 ——
+/// 按 `sim` 过滤的话，`scope_sim_set_scenario` 在连上模拟器后依然看不见。
+/// 所以它总是列出，真连了串口再调用时给一句明确的错误。
+///
+/// `scope_debug_raw` 是例外：它由环境变量决定，进程启动后就定死了，
+/// 不会中途变化，过滤掉是安全的。
+fn tool_enabled(name: &str, debug: bool) -> bool {
+    match name {
+        "scope_debug_raw" => debug,
+        _ => true,
+    }
+}
+
+/// 工具清单 —— 按会话状态过滤后返回。
+fn tool_list(debug: bool) -> Vec<Value> {
+    TOOLS
+        .iter()
+        .filter(|t| tool_enabled(t.name, debug))
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "inputSchema": serde_json::from_str::<Value>(t.input_schema)
+                    .unwrap_or_else(|_| json!({ "type": "object" })),
+            })
+        })
+        .collect()
+}
+
+/// 把一次 `tools/call` 派发到具体实现，并把结果包成 MCP 的 content 形状。
+fn dispatch(session: &mut session::Session, name: &str, args: &Value) -> Value {
+    use jsonrpc::{tool_error, tool_result};
+
+    let r = match name {
+        "scope_list_devices" => session.list_devices(),
+        "scope_connect" => session.connect(args),
+        "scope_disconnect" => session.disconnect(),
+        "scope_status" => session.status(),
+        "scope_configure" => session.configure(args),
+        "scope_capture" => session.capture(args),
+        "scope_read_waveform" => session.read_waveform(args),
+        "scope_measure" => session.measure(args),
+        "scope_i2c_decode" => session.i2c_decode(args),
+        "scope_list_captures" => session.list_captures(),
+        "scope_save_capture" => session.save_capture(args),
+        "scope_watch" => session.watch(args),
+        "scope_sim_set_scenario" => session.sim_set_scenario(args),
+        "scope_debug_raw" => session.debug_raw(args),
+        other => {
+            return tool_error(format!("未知工具 {other}"), None);
+        }
+    };
+
+    match r {
+        Ok(v) => tool_result(&v, false),
+        Err(e) => tool_error(e.message, e.hint),
+    }
 }
 
 fn print_tools() {
