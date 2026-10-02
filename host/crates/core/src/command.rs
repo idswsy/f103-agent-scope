@@ -541,11 +541,12 @@ impl<P: DevicePort> CommandBus<P> {
                 ),
             });
         }
-        if decimation == 0 || decimation > 256 {
+        let max_decim = crate::f103::MAX_DECIMATION as u16;
+        if decimation == 0 || decimation > max_decim {
             return Err(ScopeError::InvalidParam {
                 field: "decimation",
                 value: decimation.to_string(),
-                reason: "范围 1..256".into(),
+                reason: format!("范围 1..={max_decim}"),
             });
         }
 

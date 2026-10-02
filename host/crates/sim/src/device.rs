@@ -181,6 +181,15 @@ impl SimDevice {
         self.captured = None;
     }
 
+    /// 换波形随机种子。
+    ///
+    /// `new()` 固定用 `0x5EED_1234`，所以 `noise` 场景每次跑出来一模一样 ——
+    /// 那是为了回归测试可断言。想在演示里看到不同的噪声就换种子。
+    pub fn set_seed(&mut self, seed: u64) {
+        self.wave.set_seed(seed);
+        self.captured = None;
+    }
+
     /// 设备报告的通道数。
     pub fn channel_count(&self) -> u8 {
         self.scenario.channel_count() as u8
@@ -565,17 +574,34 @@ impl SimDevice {
         let n = slice.len() as u16;
 
         let mut p = Vec::with_capacity(CHUNK_HEADER_LEN + slice.len() * 2);
+        // **模拟器约定**：发生过 overrun 的采集，它的分片数据一律标为无效。
+        //
+        // 用「约定」而不是「复刻真机」是有意的 —— 固件还是 0 行，串口路径
+        // 从未与真机对过话，协议只定义了这个 bit 的含义（「数据无效 /
+        // 期间发生 overrun」），**没有**规定「整次采集的每一片都要置位」。
+        // 这条是模拟器与主机之间的约定，不是对硬件的断言。
+        //
+        // 主机侧确实只认这个标志位（`command.rs` 写着 EVENT_OVERRUN 不改
+        // 状态机，调用方靠它判断这份数据能不能用）。
+        //
+        // 回归：从前这里只打 `CHUNK_FLAG_LAST`，于是 `force_overrun` 这个
+        // 故障**注入了但主机侧完全观察不到** —— 一个「制造溢出」的开关，
+        // 打开后所有现象与没开时一模一样。
+        let mut flags = if end >= channel.len() {
+            CHUNK_FLAG_LAST
+        } else {
+            0
+        };
+        if cap.overrun {
+            flags |= CHUNK_FLAG_INVALID;
+        }
         let ch_hdr = ChunkHeader {
             capture_id,
             start_sample: start,
             count: n,
             decimation: self.cfg.decimation,
             format,
-            flags: if end >= channel.len() {
-                CHUNK_FLAG_LAST
-            } else {
-                0
-            },
+            flags,
         };
         p.extend_from_slice(&ch_hdr.encode());
 

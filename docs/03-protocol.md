@@ -435,3 +435,8 @@ aa 55           SYNC
 | **CBOR** | 自描述的标签特性两端都用不上，体积 +10~30%，MCU 解码器成本高。 |
 
 上位的「命令只定义一次」原则**在上位机 + MCP 侧完整保留**（Rust 类型 → serde/schemars → MCP JSON Schema），只是线上 codec 换成手写定长。将来固件若迁移 Rust，只需把 codec 换回 postcard，其余不动。
+
+这条在 MCP 侧是**字面落实**的：工具参数类型定义在 `host/crates/mcp/src/params.rs`，
+同一个类型既是 `inputSchema` 的来源、又是 `arguments` 的解析目标。手写 schema
+字符串与实现之间没有任何机制保证一致，而它的失效方式很隐蔽 —— 字段声明了
+却没人读，传了不报错、静默走默认值。`main.rs` 有一条测试两头夹住这件事。

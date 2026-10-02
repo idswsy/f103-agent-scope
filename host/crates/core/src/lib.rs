@@ -76,6 +76,11 @@ pub mod f103 {
     pub const MAX_INTERLEAVED_HZ: u32 = 1_714_285;
     /// 单次采集上限。
     pub const MAX_CAPTURE_SAMPLES: u32 = 4096;
+    /// 抽点倍数上限（`SET_ACQ.decimation: 1..256`，见 `proto/protocol.h`）。
+    ///
+    /// 提成常量是因为它此前散在三处：命令层校验、MCP 校验、以及要做成
+    /// 工具 schema 的上界 —— 三份写死的 256 迟早只改一处。
+    pub const MAX_DECIMATION: u32 = 256;
     /// 采集环缓冲字节数。
     pub const RING_BYTES: u32 = 8 * 1024;
     /// ADC 位数。

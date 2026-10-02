@@ -74,10 +74,39 @@ cd host && cargo test       # Rust 端全部测试
 
 | 交付物 | 位置 | 验收标准 |
 |---|---|---|
-| 模拟器 | `host/crates/sim/` | 含 F103 真实档位表、触发语义、故障注入 |
-| MCP Server | `host/crates/mcp/` | 工具 schema 与实现一致（⏳ 目前是手写字面量，尚未改为 `schemars` 从 Rust 类型生成） |
+| 模拟器 | `host/crates/sim/` | 含 F103 真实档位表、触发语义、故障注入；故障注入必须**在主机侧可观测** |
+| MCP Server | `host/crates/mcp/` | 工具 schema 由参数类型经 `schemars` 生成，**不是手写的**；见下方「schema 与实现的一致性」 |
 | 14 个粗粒度工具 | `host/crates/mcp/src/main.rs` 的 `TOOLS` | 见下表 |
 | Agent 工作流 | `docs/` | 一段可复现的对话实录 |
+
+### schema 与实现的一致性（P3 的硬性验收）
+
+工具的参数 schema **不许手写**。每个工具的参数类型定义在
+`host/crates/mcp/src/params.rs`，同一个类型既生成 `inputSchema`，又接收
+`arguments` —— 结构上不可能分家。
+
+这条不是风格问题。曾经的实现是「schema 手写一段 JSON 字符串 + 实现里
+`p.get("字段名")` 逐个手抠」，两边没有任何机制保证一致，于是出现了 4 个
+**声明了却没人读**的字段（`scope_capture.mode`、`scope_read_waveform.format`、
+`scope_sim_set_scenario` 的 `seed` 与 `inject`）：传了不报错、静默走默认值，
+Agent 拿到的是它没要求的配置下的数据。
+
+守门的是 `main.rs` 里那条 `every_tool_accepts_exactly_the_parameters_its_schema_declares`：
+对每个工具，按 schema 把参数填满发过去必须被接受，再塞一个 schema 里
+没声明的字段必须被拒绝。两头夹住即 `properties(schema) == 字段集`。
+
+**它管什么、不管什么**（别把它的能力说大）：
+
+| 管 | 不管 |
+|---|---|
+| schema 声明的字段集 == 实现能解析的字段集 | 字段解析出来之后**有没有被用**（解析照常、行为删掉，它照样绿） |
+| 字段拼错会被拒绝，而不是静默走默认值 | 字段的**语义**对不对（上界、默认值、跨字段约束） |
+| 每个属性都有名字、类型、必填标记 | |
+
+「声明了却没人读」那半要靠另外的手段：默认值进 schema（`#[serde(default)]`）、
+范围进 schema 且**实现真的校验**（`#[schemars(range)]` 只是注解，serde 不看）、
+以及每个工具都有一条「配置之后夹一次真实操作再读回」的测试
+（如 `configured_trigger_survives_a_capture`）。
 
 ### MCP 工具清单（粗粒度，**14 个** Agent 意图）
 
@@ -98,7 +127,7 @@ cd host && cargo test       # Rust 端全部测试
 | `scope_list_captures()` | 历史采集注册表（保留最近 16 次） | 无（本地） |
 | `scope_save_capture(capture_id, path)` | **全量数据只进磁盘，不进 LLM token** | 无（本地） |
 | `scope_watch(duration_ms?)` | start→收集→stop 一体化，返回滚动摘要 | 流模式分片 + `STOP` |
-| `scope_sim_set_scenario(...)` | 切换场景 / 注入故障。仅 `transport='sim'` 时注册 | 无（模拟器内部） |
+| `scope_sim_set_scenario(...)` | 切换场景 / 换随机种子 / 注入故障。仅 `transport='sim'` 时注册。故障**整体替换**（`inject:{}` 即清除） | 无（模拟器内部） |
 | `scope_debug_raw(...)` | 逃生门。仅 `SCOPE_MCP_DEBUG=1` 时注册 | 任意（含 `MEM_READ`） |
 
 **未列入但已规划**：`scope_autoset()`（主机侧复合算法，自动找时基/量程/触发）—— 属 **P4**，
