@@ -33,6 +33,13 @@ const PREVIEW_MAX: usize = 256;
 const READ_DEFAULT: usize = 512;
 const READ_HARD_CAP: usize = 4096;
 
+/// 可选场景清单。
+///
+/// 抽成常量：之前两处各写一遍，其中一处用 `\` 续行时把源码缩进写进了字符串，
+/// 渲染出来中间一大段空白（这个坑在帮助页上也踩过一次）。
+const SCENARIO_LIST: &str =
+    "sine_1k_3v3 / square_50k / pulse_glitch / noise / dc / am / i2c_100k / i2c_400k";
+
 /// 一次 MCP 会话。
 pub struct Session {
     bus: Option<CommandBus<Transport>>,
@@ -159,15 +166,32 @@ impl Session {
         let scenario = match p.get("sim_scenario").and_then(|v| v.as_str()) {
             Some(name) => Scenario::parse(name).ok_or_else(|| ToolError {
                 message: format!("未知场景 {name:?}"),
-                hint: Some(
-                    "可选：sine_1k_3v3 / square_50k / pulse_glitch / noise / dc / am /                      i2c_100k / i2c_400k"
-                        .into(),
-                ),
+                hint: Some(format!("可选：{SCENARIO_LIST}")),
             })?,
             None => Scenario::I2c100k,
         };
 
-        let dev = Transport::open(kind, port, baud, scenario).map_err(ToolError::from)?;
+        if kind == TransportKind::Serial && port.trim().is_empty() {
+            return Err(ToolError {
+                message: "transport=\"serial\" 但没给 port".into(),
+                hint: Some("先用 scope_list_devices 看可用串口；不指定 port 即使用模拟器".into()),
+            });
+        }
+
+        let dev = Transport::open(kind, port, baud, scenario).map_err(|e| {
+            // 连失败时把「现在到底连着谁」讲清楚 —— 之前旧连接静默保留，
+            // Agent 会以为已经切到新设备了。
+            let te = ToolError::from(e);
+            ToolError {
+                hint: Some(match (&self.bus, &te.hint) {
+                    (Some(b), Some(h)) => format!("{h}；当前仍保持着原来的连接：{}", b.describe()),
+                    (None, Some(h)) => h.clone(),
+                    (Some(b), None) => format!("当前仍保持着原来的连接：{}", b.describe()),
+                    (None, None) => "检查接线与供电".into(),
+                }),
+                ..te
+            }
+        })?;
         let mut bus = CommandBus::new(dev);
 
         let info = bus.connect().map_err(ToolError::from)?;
@@ -208,6 +232,8 @@ impl Session {
         let bus = self.bus("查询状态")?;
         let state = bus.get_status().map_err(ToolError::from)?;
         Ok(json!({
+            "link": bus.describe(),
+            "simulated": bus.is_simulated(),
             "state": state_name(state),
             "config": bus.config.as_ref().map(config_json),
         }))
@@ -320,7 +346,19 @@ impl Session {
                         hint: Some("也可以改传 level_v（伏特）".into()),
                     })
                 }
-                (None, Some(v)) => ChannelScale::default().volts_to_lsb(v).clamp(0, 4095) as u16,
+                (None, Some(v)) => {
+                    let lsb = ChannelScale::default().volts_to_lsb(v);
+                    if !(0..=4095).contains(&lsb) {
+                        return Err(ToolError {
+                            message: format!("trigger.level_v={v} 超出 12-bit ADC 量程"),
+                            hint: Some(
+                                "电压换算用的是未标定的占位参数（3.3 V / 4096、零点 2048），                                 范围约 -1.65..=+1.65 V；也可以直接给 level_lsb"
+                                    .into(),
+                            ),
+                        });
+                    }
+                    lsb as u16
+                }
                 (None, None) => 2048,
             };
             let source = t.get("source").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
@@ -385,11 +423,20 @@ impl Session {
         let id = req_capture_id(p)?;
         let ch = p.get("channel").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let start = p.get("start_sample").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let want = p
+        // `count` 是主参数；`max_points` 作为旧名保留兼容。两个都给时以 `count`
+        // 为准 —— 之前是「谁先出现用谁」，同一个请求换个字段顺序结果就不一样。
+        let want_raw = p
             .get("count")
             .or_else(|| p.get("max_points"))
             .and_then(|v| v.as_u64())
-            .unwrap_or(READ_DEFAULT as u64) as usize;
+            .unwrap_or(READ_DEFAULT as u64);
+        if want_raw == 0 {
+            return Err(ToolError {
+                message: "count 至少为 1".into(),
+                hint: Some("要看空页就不必调用它".into()),
+            });
+        }
+        let want = want_raw as usize;
 
         // 硬顶：超过就**拒绝**，不做静默截断 —— 静默截断会让 Agent
         // 以为拿到了全部数据。要全量请走 scope_save_capture。
@@ -453,7 +500,7 @@ impl Session {
 
         // 只回指定指标（省略则全回）。**拼错的名字要报错** —— 静默忽略会让
         // Agent 以为测过了，实际那一项根本没算。
-        const KINDS: [&str; 7] = ["vpp", "min", "max", "mean", "rms", "freq", "duty"];
+        const KINDS: [&str; 8] = ["vpp", "min", "max", "mean", "rms", "freq", "duty", "rise"];
         let want: Option<Vec<String>> = match p.get("metrics").and_then(|v| v.as_array()) {
             Some(a) => {
                 let names: Vec<String> = a
@@ -504,6 +551,9 @@ impl Session {
                 if has("duty") {
                     row.insert("duty_pct".into(), json!(m.duty_pct));
                 }
+                if has("rise") {
+                    row.insert("rise_ns".into(), json!(m.rise_ns));
+                }
                 out.insert(format!("ch{ch}"), Value::Object(row));
             }
         }
@@ -533,6 +583,9 @@ impl Session {
             });
         }
 
+        // 单侧给也要生效 —— 之前只有两个都给才用传入值，其余整体退默认，
+        // 于是「只调 VIH」静默失效。
+        let dflt = Levels::default_ratio();
         let levels = match (
             p.get("vih_lsb").and_then(|v| v.as_u64()),
             p.get("vil_lsb").and_then(|v| v.as_u64()),
@@ -541,8 +594,25 @@ impl Session {
                 vih_lsb: h as u16,
                 vil_lsb: l as u16,
             },
-            _ => Levels::default_ratio(),
+            (Some(h), None) => Levels {
+                vih_lsb: h as u16,
+                vil_lsb: dflt.vil_lsb,
+            },
+            (None, Some(l)) => Levels {
+                vih_lsb: dflt.vih_lsb,
+                vil_lsb: l as u16,
+            },
+            (None, None) => dflt,
         };
+        if !levels.is_valid() {
+            return Err(ToolError {
+                message: format!(
+                    "门限非法：VIH={} 必须大于 VIL={}",
+                    levels.vih_lsb, levels.vil_lsb
+                ),
+                hint: Some("电平用 ADC LSB 整数（12-bit，0..=4095）".into()),
+            });
+        }
 
         // 通道没指定就自动判定（SCL 的边沿比 SDA 密）
         let (scl, sda) = match (
@@ -552,6 +622,16 @@ impl Session {
             (Some(a), Some(b)) => (a as usize, b as usize),
             _ => detect_channels(cap, levels, 50).unwrap_or((0, 1)),
         };
+
+        // 先按 MCP 自己的参数名报越界 —— core 的报错里字段叫 `i2c_channel`，
+        // 那个名字在 schema 里根本不存在，Agent 会去找一个没提过的参数。
+        let n = cap.channels.len();
+        if scl >= n || sda >= n {
+            return Err(ToolError {
+                message: format!("通道越界：本次采集只有 {n} 个通道（编号 0..={}）", n - 1),
+                hint: Some("scl_channel / sda_channel 从 0 起算".into()),
+            });
+        }
 
         let cfg = I2cDecodeConfig {
             scl_channel: scl,
@@ -591,6 +671,12 @@ impl Session {
             "frame_count": d.frame_count(),
             "frames": frames,
             "all_bytes": d.all_bytes(),
+            // 回显生效的门限与去抖 —— 否则「我到底用的是什么阈值」无从得知
+            "levels": {
+                "vih_lsb": levels.vih_lsb,
+                "vil_lsb": levels.vil_lsb,
+                "debounce_ns": cfg.debounce_ns,
+            },
             "signal_quality": {
                 "scl_edges": d.quality.scl_edges,
                 "scl_freq_hz": d.quality.scl_freq_hz,
@@ -742,11 +828,7 @@ impl Session {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError {
                 message: "缺少 scenario".into(),
-                hint: Some(
-                    "可选：sine_1k_3v3 / square_50k / pulse_glitch / noise / dc / am / \
-                     i2c_100k / i2c_400k"
-                        .into(),
-                ),
+                hint: Some(format!("可选：{SCENARIO_LIST}")),
             })?;
         let sc = Scenario::parse(name).ok_or_else(|| ToolError {
             message: format!("未知场景 {name:?}"),
@@ -758,7 +840,14 @@ impl Session {
         match bus.port_mut().sim_mut() {
             Some(sim) => {
                 sim.set_scenario(sc);
-                Ok(json!({ "scenario": sc.name() }))
+                // 场景换了通道数也会换（i2c 是 2 通道，正弦是 1 通道）。
+                // 不重新 GET_INFO 的话，之后 capture 会拿旧的 ch_count 去拉
+                // 不存在的通道，设备回 BadParam，而提示会把排查方向指错。
+                bus.connect().map_err(ToolError::from)?;
+                Ok(json!({
+                    "scenario": sc.name(),
+                    "channels": bus.info.as_ref().map(|i| i.ch_count),
+                }))
             }
             None => Err(ToolError {
                 message: "当前连接的不是模拟器".into(),
@@ -781,15 +870,24 @@ impl Session {
             hint: Some("见 proto/protocol.h 的命令表".into()),
         })?;
 
-        let payload: Vec<u8> = p
-            .get("payload_hex")
-            .and_then(|v| v.as_str())
-            .map(|h| {
-                h.split_whitespace()
-                    .filter_map(|b| u8::from_str_radix(b, 16).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // 逐个 token 严格解析 —— `filter_map(..ok())` 会把解析失败的字节**静默
+        // 丢掉**，于是「发的 payload」与「写的 payload」不是一回事，
+        // 而调试工具最怕的就是这个。
+        let payload: Vec<u8> = match p.get("payload_hex").and_then(|v| v.as_str()) {
+            None => Vec::new(),
+            Some(h) => {
+                let mut out = Vec::with_capacity(h.len() / 2);
+                for tok in h.split_whitespace() {
+                    let t = tok.trim_start_matches("0x");
+                    let b = u8::from_str_radix(t, 16).map_err(|_| ToolError {
+                        message: format!("payload_hex 里有非法字节 {tok:?}"),
+                        hint: Some("用空格分隔的两位十六进制，例如 \"11 22 33\"".into()),
+                    })?;
+                    out.push(b);
+                }
+                out
+            }
+        };
 
         let bus = self.bus("发原始命令")?;
         let resp = bus
