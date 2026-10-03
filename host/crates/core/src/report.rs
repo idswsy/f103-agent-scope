@@ -39,11 +39,16 @@ use crate::measure::measure;
 /// 波形包络的**目标**桶数。
 ///
 /// 与 MCP 的 `PREVIEW_POINTS`（256）不同：后者服务于 Agent 的工具返回值，
-/// 而此处仅为附带上下文，128 桶足以呈现形状，且不会挤占帧表。
+/// 而此处仅为附带上下文，`32` 桶足够看出「这是不是 I2C 该有的样子」，
+/// 又不会挤占真正有诊断价值的帧表与信号质量。
 ///
 /// ⚠ 该值为**目标值**，非硬上限。见 [`preview_section`] 的说明：
 /// 采集点数较短时，实际桶数可达 `2 * PREVIEW_POINTS - 1`。
-pub const PREVIEW_POINTS: usize = 128;
+///
+/// **从 128 降到 32 的原因**：128 桶在短采集上会退化成「每个样点一桶」，
+/// 那时 min 恒等于 max，包络变成把整条波形原样喂给模型 —— 正是本模块
+/// 要避免的事。32 桶下 168 点的采集每桶 5 点，仍有降采样效果。
+pub const PREVIEW_POINTS: usize = 32;
 
 /// 帧表里最多列几帧。超出的在末尾记一条截断说明。
 pub const MAX_FRAMES: usize = 64;
@@ -131,10 +136,10 @@ fn config_section(s: &mut String, config: Option<&DeviceConfig>) {
     );
     let _ = writeln!(
         s,
-        "触发: 模式={} 边沿={} 源=ch{} 电平={} LSB",
+        "触发: 模式={} 边沿={} 源={} 电平={} LSB",
         trigger_mode_name(c.trigger_mode),
         trigger_edge_name(c.trigger_edge),
-        c.trigger_source,
+        channel_label(c.trigger_source as usize),
         c.trigger_level_lsb,
     );
     let _ = writeln!(
@@ -183,21 +188,38 @@ fn capture_section(s: &mut String, cap: &Capture) {
     }
 }
 
+/// 通道的显示名。
+///
+/// **必须与界面一致。** 界面用 `CH{ch + 1}`（`panels.rs` 里到处是 `ch + 1`），
+/// 所以索引 0 是 `CH1`。这里曾经直接用索引写成 `ch0` —— 用户在界面上看到的
+/// 是 CH1 / CH2，而分析里冒出个 `ch0`，**读起来就是「AI 分析错了」**。
+///
+/// 这不是措辞问题：同一台设备的同一条通道，两个地方叫两个名字，
+/// 用户没有任何办法知道它们指的是同一条线。
+fn channel_label(ch: usize) -> String {
+    format!("CH{}", ch + 1)
+}
+
 /// 每通道的测量 —— 全部来自 `crate::measure()`，没有一个数是在这里算的。
+///
+/// ⚠ 表头的措辞很要紧。曾经写的是「可直接引用」，而系统提示词要求的是
+/// **不要复述界面上已有的数值** —— 两处正好相反。这里给的是**判断依据**，
+/// 不是让模型转达的内容；表头必须说清这一点，否则就是在自己拆自己的台。
 fn channels_section(s: &mut String, input: &EvidenceInput<'_>) {
     let _ = writeln!(s);
-    let _ = writeln!(s, "== 通道测量（机器精确计算的结果，可直接引用）==");
+    let _ = writeln!(s, "== 通道测量（供你判断用；界面上已有，不必复述）==");
 
     let mut any = false;
     for ch in 0..input.capture.channels.len() {
+        let name = channel_label(ch);
         let Some(m) = measure(input.capture, ch, input.scale) else {
-            let _ = writeln!(s, "ch{ch}: 测不出（通道无数据）");
+            let _ = writeln!(s, "{name}: 测不出（通道无数据）");
             continue;
         };
         any = true;
         let _ = writeln!(
             s,
-            "ch{ch}: Vpp={:.4} V  min={:.4} V  max={:.4} V  mean={:.4} V  AC-RMS={:.4} V",
+            "{name}: Vpp={:.4} V  min={:.4} V  max={:.4} V  mean={:.4} V  AC-RMS={:.4} V",
             m.vpp, m.min, m.max, m.mean, m.ac_rms
         );
         // 「测不出」要写成「测不出」，不能写 0 —— 项目纪律：宁可说不知道
@@ -248,7 +270,13 @@ fn preview_section(s: &mut String, cap: &Capture) {
             continue;
         };
         wrote = true;
-        let _ = writeln!(s, "ch{ch}  桶宽={:.2} µs  桶数={}", p.dt_us, p.y_min.len());
+        let _ = writeln!(
+            s,
+            "{}  桶宽={:.2} µs  桶数={}",
+            channel_label(ch),
+            p.dt_us,
+            p.y_min.len()
+        );
         let _ = writeln!(s, "  min: {}", join_u16(&p.y_min));
         let _ = writeln!(s, "  max: {}", join_u16(&p.y_max));
     }
@@ -271,8 +299,9 @@ fn decode_section(s: &mut String, input: &EvidenceInput<'_>) {
         // 说明通道是**用户选的**，不是自动检测的 —— 这一点影响模型对结论的信任度
         let _ = writeln!(
             s,
-            "SCL=ch{}  SDA=ch{}   （通道是用户在界面上选的，不是自动检测的结果）",
-            cfg.scl_channel, cfg.sda_channel
+            "SCL={}  SDA={}   （通道是用户在界面上选的，不是自动检测的结果）",
+            channel_label(cfg.scl_channel),
+            channel_label(cfg.sda_channel)
         );
         let _ = writeln!(
             s,
@@ -358,7 +387,8 @@ fn footer_section(s: &mut String, input: &EvidenceInput<'_>) {
     );
     let _ = writeln!(
         s,
-        "- 上面所有数字都来自精确计算。**直接引用它们，不要自己估算或重新推导。**"
+        "- 上面所有数字都来自精确计算，**不要自己估算或重新推导**；\
+         它们是判断依据，不是要复述的内容。"
     );
     let _ = writeln!(
         s,
@@ -602,11 +632,65 @@ mod tests {
         i.decode_cfg = Some(&cfg);
         let text = build_evidence(&i);
 
-        assert!(text.contains("SCL=ch1"), "应打印配置里的通道：{text}");
-        assert!(text.contains("SDA=ch0"), "应打印配置里的通道：{text}");
+        assert!(text.contains("SCL=CH2"), "应打印配置里的通道：{text}");
+        assert!(text.contains("SDA=CH1"), "应打印配置里的通道：{text}");
         assert!(
             text.contains("用户在界面上选"),
             "必须说明通道是用户选的而不是自动检测的"
+        );
+    }
+
+    /// **通道编号必须与界面一致。**
+    ///
+    /// 回归：证据包里曾经直接用 0 起的索引写成 `ch0` / `ch1`，而界面
+    /// （`panels.rs` 里的 `CH{ch + 1}`）显示的是 `CH1` / `CH2`。
+    /// 用户测的是 CH1 和 CH2，分析里冒出个 `ch0` —— **读起来就是「分析错了」**，
+    /// 而模型其实什么都没算错，是这份文本把通道叫错了名字。
+    ///
+    /// 这条测试钉死：文本里**不得出现 0 起的 `chN` 写法**。
+    #[test]
+    fn channel_names_match_the_ui_numbering() {
+        let cap = i2c_capture(true);
+        let scale = ChannelScale::default();
+        let d = decode_capture(&cap, &I2cDecodeConfig::default()).unwrap();
+        let cfg = I2cDecodeConfig::default();
+        let mut i = input(&cap, &scale);
+        i.decode = Some(&d);
+        i.decode_cfg = Some(&cfg);
+        let text = build_evidence(&i);
+
+        assert!(text.contains("CH1"), "两通道采集应出现 CH1：{text}");
+        assert!(text.contains("CH2"), "两通道采集应出现 CH2：{text}");
+        for bad in ["ch0", "ch1", "ch2"] {
+            assert!(
+                !text.contains(bad),
+                "证据包里出现了界面不存在的写法 `{bad}` —— \
+                 界面用的是 CH1/CH2（1 起），必须一致\n{text}"
+            );
+        }
+    }
+
+    /// **短采集不得退化成「每个样点一桶」。**
+    ///
+    /// 回归：`PREVIEW_POINTS` 曾是 128，而 168 点的采集算出来
+    /// `bucket = 168/128 = 1` —— 每个样点自成一桶，`min` 恒等于 `max`，
+    /// 所谓「降采样包络」变成了**把整条波形原样发给模型**。
+    ///
+    /// 判据：桶数必须**显著少于**样点数，否则就不是降采样。
+    #[test]
+    fn a_short_capture_is_still_downsampled() {
+        let cap = i2c_capture(true);
+        let n = cap.channels[0].len();
+        let buckets = cap.preview(0, PREVIEW_POINTS).unwrap().y_min.len();
+
+        assert!(
+            buckets < n,
+            "采集 {n} 点却排出 {buckets} 桶 —— 没有降采样，等于把波形原样发出去"
+        );
+        // 多数桶应当真的装了多个样点
+        assert!(
+            buckets * 2 <= n || buckets <= 64,
+            "采集 {n} 点排出 {buckets} 桶，压缩比不足：{n}/{buckets}"
         );
     }
 
