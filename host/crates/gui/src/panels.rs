@@ -1063,9 +1063,9 @@ pub fn ai_panel(app: &mut App, ui: &mut egui::Ui) {
     );
 
     ui.horizontal(|ui| {
-        // 「交给 AI」—— 它自己配置、自己采
+        // 「交给 AI 采集」—— AI 接管设备，自行配置并按需重采
         let can_drive = app.can_start_drive() && app.ai.cfg.has_key();
-        let drive_btn = ui.add_enabled(can_drive, egui::Button::new("交给 AI 自己采"));
+        let drive_btn = ui.add_enabled(can_drive, egui::Button::new("交给 AI 采集"));
         let drive_btn = if !app.connected {
             drive_btn.on_disabled_hover_text("尚未连接设备。交接的前提是先连上一台。")
         } else if !app.ai.cfg.has_key() {
@@ -1073,17 +1073,26 @@ pub fn ai_panel(app: &mut App, ui: &mut egui::Ui) {
         } else if driving {
             drive_btn.on_disabled_hover_text("设备当前由 AI 持握。")
         } else {
-            drive_btn
+            // 可用时也要说明它**做什么**。按钮上只放得下两个字，而它实际
+            // 会配置、按需重采并分析，期间设备控件全部停用。
+            drive_btn.on_hover_text(
+                "AI 接管设备：自行配置、采集并分析，必要时会重采。\
+                 期间界面上的设备控件停用；结束后设备自动交还。",
+            )
         };
         if drive_btn.clicked() {
             app.start_drive();
         }
 
-        // 「开始分析」—— 只解释屏幕上这一窗，不碰设备
+        // 「分析当前采集」—— 只解释屏幕上这一窗，不碰设备。
+        //
+        // 「当前」不是「这次」：代码里管这一窗就叫「当前采集」
+        // （`app.capture`、以及「结论对不上当前采集」那句提示），
+        // 界面上换个说法就是又一处同一件事两种叫法。
         let btn = egui::Button::new(if running {
             "分析中…"
         } else {
-            "分析这次采集"
+            "分析当前采集"
         });
         let resp = ui.add_enabled(can_start && !driving, btn);
         let resp = if !has_capture {
