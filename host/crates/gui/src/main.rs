@@ -187,6 +187,7 @@ fn drive_cli(task: &str, port: Option<String>, scenario: Option<Scenario>) -> ef
                 if hit_limit { "，撞上限被停" } else { "" }
             );
         }
+        DriveEvent::Failed(e) => println!("\n✗ {}｜{}", e.message, e.hint),
     });
 
     mcp.shutdown(); // 优雅收场：让它自己断开，再等退出

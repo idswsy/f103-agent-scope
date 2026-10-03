@@ -295,6 +295,14 @@ impl McpProcess {
         })
     }
 
+    /// 子进程句柄 —— 给 UI 线程用来「立刻终止」。
+    ///
+    /// 必须是共享的 `Arc<Mutex<_>>`：取消时本线程多半正阻塞在 LLM 的 HTTP
+    /// （最长 [`LLM_TIMEOUT`]）或管道读上，**它自己没有机会去看取消标志**。
+    pub fn child_handle(&self) -> Arc<Mutex<Child>> {
+        Arc::clone(&self.child)
+    }
+
     fn send(&mut self, msg: &Value) -> Result<(), AiError> {
         let mut line = serde_json::to_string(msg).map_err(|e| {
             AiError::new(format!("序列化请求失败：{e}"), "属程序缺陷，请提交 issue")
@@ -413,7 +421,7 @@ impl Mirrored {
     /// 返回这一轮新出现的采集（可能为空）。
     ///
     /// **这些调用绝不进 LLM 的消息** —— 它们是「给人看的」，
-    /// 让模型看见只会白烧 token，而且 4096 点还会被截断成半截。
+    /// 让模型看见只会白白消耗 token，而且 4096 点还会被截断成半截。
     pub fn poll(&mut self, mcp: &mut McpProcess) -> Result<Vec<Capture>, AiError> {
         let list = mcp.call(
             "tools/call",
@@ -560,6 +568,15 @@ pub enum DriveEvent {
         /// 是不是撞了轮数上限被迫停的。
         hit_limit: bool,
     },
+    /// 出错结束。
+    ///
+    /// ⚠ **必须有这一条，不能只发一条「失败」文案。**
+    ///
+    /// 回归：第一版出错时只往轨迹里塞了一句 `✗ …`，而没有终止信号 ——
+    /// 于是收尾那一步（把设备连回来）根本不会执行，
+    /// **界面永远停在「AI 正在操作设备」，而设备谁也拿不回来**。
+    /// 是「`DrivePhase::Failed` 从没被构造」这个死代码警告把它顶出来的。
+    Failed(AiError),
 }
 
 /// 跑一次完整会话。**阻塞**，只能在专用线程里调。
@@ -826,6 +843,306 @@ fn first_line(text: &str) -> String {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════
+// 会话句柄：UI 侧的那一半
+// ══════════════════════════════════════════════════════════════════
+
+/// 子进程句柄的「信箱」。
+///
+/// 线程 spawn 出子进程之后把句柄放进来，UI 点「终止」时直接拿它去 kill ——
+/// 线程可能正阻塞在 LLM 的 HTTP 上，它自己没有机会看取消标志。
+type ChildSlot = Arc<Mutex<Option<Arc<Mutex<Child>>>>>;
+
+/// 一次会话在 UI 侧的句柄。
+pub struct DriveHandle {
+    /// 线程报上来的事件。
+    events: Receiver<DriveEvent>,
+    /// 子进程句柄（起好之后才有）。
+    child: ChildSlot,
+    /// 世代号 —— 迟到的会话事件靠它丢弃。
+    ///
+    /// 用户终止后又发起一次时，旧线程可能还会吐几条事件出来；
+    /// 没有这个号，它们会混进新会话的轨迹里。
+    pub generation: u64,
+}
+
+impl DriveHandle {
+    /// 排空事件。**收进 Vec 再处理** —— 与 `worker.rs` / `ai.rs` 同一套纪律，
+    /// 免得在闭包里可变借走 `App`。
+    pub fn drain(&self, mut f: impl FnMut(DriveEvent)) {
+        while let Ok(e) = self.events.try_recv() {
+            f(e);
+        }
+    }
+
+    /// 立刻终止：杀掉子进程。
+    ///
+    /// **不走优雅收场** —— 用户点了终止就该立刻停，而不是再等 3 秒。
+    /// 代价是真机可能停在 Armed，重连后要如实提示（见 `App` 那侧的处理）。
+    pub fn terminate(&self) {
+        if let Ok(slot) = self.child.lock() {
+            if let Some(c) = slot.as_ref() {
+                if let Ok(mut child) = c.lock() {
+                    let _ = child.kill();
+                    // 必须 wait：句柄不释放，GUI 重连会偶发「端口被占用」
+                    let _ = child.wait();
+                }
+            }
+        }
+    }
+}
+
+/// 起一条线程跑完整会话，返回 UI 侧的句柄。
+///
+/// 线程里做四件事：找 exe → spawn → 跑循环 → 优雅收场。
+/// 所有进展都经 [`DriveEvent`] 报回 UI。
+pub fn spawn_session(job: DriveJob, generation: u64, ctx: egui::Context) -> DriveHandle {
+    let (tx, events) = mpsc::channel::<DriveEvent>();
+    let child: ChildSlot = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&child);
+
+    std::thread::Builder::new()
+        .name("scope-drive".into())
+        .spawn(move || {
+            let mut emit = |e: DriveEvent| {
+                if tx.send(e).is_ok() {
+                    ctx.request_repaint();
+                }
+            };
+
+            // 起不来的两种情况都走同一个出口：报 `Failed`。
+            // ⚠ 不能只发一条文案就 `return` —— 那样 UI 侧收不到终止信号，
+            // 会永远停在「AI 正在操作设备」。
+            let exe = match find_scope_mcp() {
+                Ok(p) => p,
+                Err(e) => {
+                    emit(DriveEvent::Failed(e));
+                    return;
+                }
+            };
+
+            let mut mcp = match McpProcess::spawn(&exe) {
+                Ok(m) => m,
+                Err(e) => {
+                    emit(DriveEvent::Failed(e));
+                    return;
+                }
+            };
+
+            // 把句柄交给 UI —— 在这之前用户点终止是杀不到东西的（还没起）
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(mcp.child_handle());
+            }
+
+            if let Err(e) = run_session(&job, &mut mcp, &mut emit) {
+                emit(DriveEvent::Failed(e));
+            }
+
+            // 优雅收场（子进程可能已经被终止掉了 —— 那时这里是空转）
+            mcp.shutdown();
+        })
+        .expect("起不了 drive 线程");
+
+    DriveHandle {
+        events,
+        child,
+        generation,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// UI 侧状态
+// ══════════════════════════════════════════════════════════════════
+
+/// 会话处在哪一步。
+///
+/// **用枚举而不是一个 u8 计数器**（`demo_stage` 那种）：这次的边界多得多
+/// ——断开、起进程、跑循环、收场、重连，每一步失败都有不同的收尾动作。
+/// 隐式状态机读不懂，也测不了。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DrivePhase {
+    /// 没在跑。设备归 GUI。
+    #[default]
+    Idle,
+    /// 正在让 GUI 断开 —— 要把串口让出去。
+    Disconnecting,
+    /// 子进程在跑，AI 在操作设备。
+    Running,
+    /// AI 干完了（或出错了），正在把设备连回来。
+    ///
+    /// **失败不走单独的状态**：一样要先把设备收回来，收回来之后
+    /// 「失败」这件事已经记在轨迹与日志里了，再挂一个状态只会多一处收尾要维护。
+    Reconnecting,
+}
+
+impl DrivePhase {
+    /// 设备此刻是不是**不在** GUI 手上。
+    ///
+    /// 界面上一堆控件要靠它来决定禁不禁用 —— 而这**不是 UI 的偏好，
+    /// 是串口独占的必然**：设备已经被让出去了，按钮点下去也连不上。
+    pub fn device_is_elsewhere(&self) -> bool {
+        !matches!(self, DrivePhase::Idle)
+    }
+
+    /// 会话还在进行中（可以终止）。
+    pub fn is_busy(&self) -> bool {
+        matches!(self, DrivePhase::Disconnecting | DrivePhase::Running)
+    }
+}
+
+/// 交出去那一刻的设备与链路快照。
+///
+/// 两个用途，都不是可有可无的：
+///
+/// 1. **provenance** —— AI 期间 GUI 处于断开状态，[`crate::app::App::link_description`]
+///    会输出「serial @ 921600」、`simulated` 会变成 false。**模拟器会被说成串口。**
+///    有这个快照，锚点行与证据包才说得出真话。
+/// 2. **「恢复我交出去之前的设置」** —— 用户点一下就按它重配。
+#[derive(Debug, Clone)]
+pub struct Handoff {
+    /// 链路的一句话描述（给人看，也进证据包）。
+    pub link: String,
+    /// 交出去时是不是模拟器。
+    pub simulated: bool,
+    /// 交出去时的设备配置回显。`None` = 当时没读到。
+    pub config: Option<scope_core::DeviceConfig>,
+    /// 重连用的目标 —— 与交给 AI 的**是同一个**。
+    pub transport: crate::msg::TransportKind,
+    /// 串口名。
+    pub port: String,
+    /// 波特率。
+    pub baud: u32,
+    /// 模拟器场景。
+    pub scenario: scope_sim::Scenario,
+}
+
+impl Handoff {
+    /// 交给子进程（以及重连时给 worker）的 `scope_connect` 参数。
+    ///
+    /// **同一个快照同时用于「交给 AI」和「收回来」** —— 两边各写一份的话，
+    /// 迟早有一处不一样，而那种错的表现是「AI 采的」与「你屏幕上看到的」
+    /// 是两台设备。
+    pub fn connect_args(&self) -> Value {
+        match self.transport {
+            crate::msg::TransportKind::Serial => json!({
+                "transport": "serial",
+                "port": self.port,
+                "baud": self.baud,
+            }),
+            crate::msg::TransportKind::Sim => json!({
+                "transport": "sim",
+                "sim_scenario": self.scenario.name(),
+            }),
+        }
+    }
+}
+
+/// 轨迹里的一条。
+///
+/// ⚠ **这不是聊天记录，是动作清单。** 用户要能看出「AI 改了哪个参数、
+/// 采了哪几窗」—— 因为在示波器上选错时基或触发电平会得到一份
+/// **看起来完全合理**的新波形，错误是沉默的。
+#[derive(Debug, Clone)]
+pub enum TrajectoryItem {
+    /// 阶段变化。
+    Phase(String),
+    /// AI 决定调用某个工具。
+    Call {
+        /// 工具名。
+        name: String,
+        /// 参数的紧凑描述。
+        args: String,
+    },
+    /// 工具执行完。
+    Result {
+        /// 工具名。
+        name: String,
+        /// 业务上成功了没有。
+        ok: bool,
+        /// 一句话摘要。
+        summary: String,
+    },
+    /// 工具返回里带的警告 —— **必须显式展示**。
+    ///
+    /// 采样率被量化、SW2/SW3 是手拨开关这类事，AI 与用户可能都不知道，
+    /// 而它们直接影响「AI 配的到底生效了没有」。
+    Warning(String),
+    /// 镜像回来的新采集。
+    Capture {
+        /// 采集编号。
+        id: u16,
+        /// 点数。
+        points: usize,
+        /// 通道数。
+        channels: usize,
+    },
+}
+
+/// 轨迹最多留多少条。
+///
+/// 24 轮 × 每条几项，不设上限能涨到几百条 —— 那是给人扫一眼用的，
+/// 不是归档。与 `App::note` 的 200 行同一个道理。
+pub const TRAJECTORY_CAP: usize = 200;
+
+/// 「让 AI 自己配置并采集」这一摊状态。
+///
+/// 单独成组而不是往 `App` 上再摊七八个字段：这块与设备 worker **互斥**
+/// （跑的时候设备不在 GUI 手上），收在一起才看得出这一点。
+#[derive(Default)]
+pub struct DriveState {
+    /// 现在到哪一步了。
+    pub phase: DrivePhase,
+    /// 正在跑的会话（有的话）。UI 靠它收事件、也靠它终止。
+    pub handle: Option<DriveHandle>,
+    /// 用户输入的需求（与单发分析的输入框共用同一个字段）。
+    pub task: String,
+    /// 动作轨迹 —— **给人看的，不是聊天记录**。
+    pub trajectory: Vec<TrajectoryItem>,
+    /// 交出去那一刻的设备与链路快照。
+    pub handoff: Option<Handoff>,
+    /// AI 的最终结论。
+    pub final_text: Option<String>,
+    /// 世代号：迟到的会话事件靠它丢弃。
+    generation: u64,
+}
+
+impl DriveState {
+    /// 开一次新会话要用的世代号。
+    pub fn next_generation(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+
+    /// 现在这条事件是不是本次会话的。
+    ///
+    /// 用户终止后又发起一次时，旧线程还可能吐几条出来 —— 没有这道闸，
+    /// 它们会混进新会话的轨迹里，而**表现与「AI 真的这么做了」完全一样**。
+    pub fn accepts(&self, generation: u64) -> bool {
+        generation == self.generation
+    }
+
+    /// 记一条轨迹。
+    pub fn push(&mut self, item: TrajectoryItem) {
+        if self.trajectory.len() >= TRAJECTORY_CAP {
+            self.trajectory.remove(0);
+        }
+        self.trajectory.push(item);
+    }
+
+    /// 开始一次新会话：清轨迹、清结论、丢掉旧句柄。
+    ///
+    /// ⚠ **丢掉旧句柄之前要先终止它** —— 调用方负责（见 `App::start_drive`）。
+    /// 这里只负责把自己这一摊清干净。
+    ///
+    /// **不动 `handoff`** —— 那是「恢复我原来的设置」的依据，
+    /// 要活到设备收回来之后。
+    pub fn begin(&mut self) {
+        self.trajectory.clear();
+        self.final_text = None;
+        self.handle = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1021,7 +1338,7 @@ mod tests {
     ///
     /// 为什么值得单独有一条：真跑一次完整会话要花 LLM 的钱，而镜像**不经过
     /// LLM** —— 把它单独拎出来验，既便宜又能定位问题（会话没出图时，
-    /// 一眼就能分清是镜像坏了还是模型根本没采）。
+    /// 一眼就能分清是镜像失效，还是模型压根未读取样点）。
     ///
     /// ```text
     /// ./host/run.sh test -p scope-gui -- --ignored mirror_pulls_a_capture --nocapture
@@ -1043,7 +1360,7 @@ mod tests {
         //
         // 第一版这里只 `unwrap_or_else` 处理传输错误，于是「工具被拒」
         // （例如传了 schema 里没有的参数）与「调用成功」表现完全一样 ——
-        // 我为此白跑了两轮才看出 store 是空的。
+        // 为此多跑了两轮才看出 store 是空的。
         let tool = |mcp: &mut McpProcess, name: &str, args: Value| {
             let r = mcp
                 .call("tools/call", json!({"name": name, "arguments": args}))
