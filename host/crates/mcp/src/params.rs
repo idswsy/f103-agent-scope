@@ -240,11 +240,18 @@ pub enum Coupling {
 }
 
 impl Coupling {
-    /// JSON 里的名字。
+    /// 协议里的取值（`proto/protocol.h` 的 `coupling_t`）。
     ///
-    /// 没提供 `as_u8()`（协议里 dc=0 / ac=1）：`SET_CHANNEL` 尚未接线上层，
-    /// 那个转换现在没人用。真接线时再加 —— 留着一个「以后可能有用」的死函数，
-    /// 正是编译器那条 dead_code 警告要拦下的东西。
+    /// 第一版没有它 —— 当时 `SET_CHANNEL` 还没接线，留着会是死代码。
+    /// 现在接了，它就有了使用者。
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Coupling::Dc => 0,
+            Coupling::Ac => 1,
+        }
+    }
+
+    /// JSON 里的名字。
     pub fn name(self) -> &'static str {
         match self {
             Coupling::Dc => "dc",

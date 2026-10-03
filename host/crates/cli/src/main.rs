@@ -274,7 +274,7 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
 
         Action::Status => {
             bus.connect()?;
-            let s = bus.get_status()?;
+            let s = bus.get_status()?.state;
             println!("状态: {} ({})", state_name(s), s as u8);
             if let Some(cfg) = &bus.config {
                 println!("采样率: {} Hz", cfg.rate_hz);

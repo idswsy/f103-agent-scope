@@ -18,9 +18,9 @@
 //! 这里没有这个问题。
 
 use crate::params::{
-    defaults, AcqMode, CaptureArgs, ConfigureArgs, ConnectArgs, DebugRawArgs, I2cDecodeArgs,
-    MeasureArgs, MetricKind, ReadWaveformArgs, SampleFormat, SaveCaptureArgs, SaveFormat,
-    SimSetScenarioArgs, TransportArg, TriggerEdge, TriggerMode, WatchArgs,
+    defaults, AcqMode, CaptureArgs, ConfigureArgs, ConnectArgs, Coupling, DebugRawArgs,
+    I2cDecodeArgs, MeasureArgs, MetricKind, ReadWaveformArgs, SampleFormat, SaveCaptureArgs,
+    SaveFormat, SimSetScenarioArgs, TransportArg, TriggerEdge, TriggerMode, WatchArgs,
 };
 use scope_core::acquire::MAX_TIMEOUT_MS;
 use scope_core::i2c_decode::{decode_capture, detect_channels, I2cDecodeConfig, Levels};
@@ -179,34 +179,6 @@ fn level_lsb(
     }
 }
 
-/// 把收到的通道配置描述成人话，用在「尚未接线」的警告里。
-///
-/// 从前那条警告是一句固定的「channel 配置暂未接线上层」，不看内容 ——
-/// Agent 无法从响应里看出自己的参数到底有没有被读到。
-fn describe_channel(c: &crate::params::ChannelArgs) -> String {
-    let mut parts = Vec::new();
-    if let Some(v) = c.ch {
-        parts.push(format!("ch={v}"));
-    }
-    if let Some(v) = c.enable {
-        parts.push(format!("enable={v}"));
-    }
-    if let Some(v) = c.range_idx {
-        parts.push(format!("range_idx={v}"));
-    }
-    if let Some(v) = c.coupling {
-        parts.push(format!("coupling={}", v.name()));
-    }
-    if let Some(v) = c.offset_lsb {
-        parts.push(format!("offset_lsb={v}"));
-    }
-    if parts.is_empty() {
-        "(空对象)".into()
-    } else {
-        parts.join(" ")
-    }
-}
-
 /// 收窄成 `u8` —— 通道号、量程档位这类。
 fn u8_field(v: u64, field: &str) -> std::result::Result<u8, ToolError> {
     narrow(v, 0, 255, field, "取值范围 0..=255")
@@ -305,7 +277,10 @@ impl Session {
         // `connect()` 只发 GET_INFO + GET_CONFIG，**不发 GET_STATUS**。
         // 不补这一次的话 `bus.state` 一直是 None，`guard_config_allowed`
         // 就失去判据 —— 已武装时照样能改配置。
-        let state = bus.get_status().unwrap_or(scope_core::State::Idle);
+        let state = bus
+            .get_status()
+            .map(|s| s.state)
+            .unwrap_or(scope_core::State::Idle);
         let cfg = bus.config.clone();
 
         // 换设备后 capture_id 从 1 重新分配，而 store 按 id 取数 —— 不清空的话
@@ -337,11 +312,25 @@ impl Session {
     /// `scope_status`。
     pub fn status(&mut self) -> R {
         let bus = self.bus("查询状态")?;
-        let state = bus.get_status().map_err(ToolError::from)?;
+        let st = bus.get_status().map_err(ToolError::from)?;
         Ok(json!({
             "link": bus.describe(),
             "simulated": bus.is_simulated(),
-            "state": state_name(state),
+            "state": state_name(st.state),
+            // 链路健康计数 —— 「这份采集可不可信」的判据。
+            // 从前 core 只读第一个字节就把 payload 丢了，这几个字段
+            // 一路都到不了 Agent。
+            "link_health": {
+                "overrun_samples": st.overrun_samples,
+                "rx_crc_err": st.rx_crc_err,
+                "rx_dropped": st.rx_dropped,
+                "tx_dropped": st.tx_dropped,
+                "last_error_code": st.last_error_code,
+                "err_flags": st.err_flags,
+                "clean": st.link_is_clean(),
+            },
+            "uptime_ms": st.uptime_ms,
+            "tick_us": st.tick_us,
             "config": bus.config.as_ref().map(config_json),
         }))
     }
@@ -533,16 +522,85 @@ impl Session {
         }
 
         if let Some(c) = &p.channel {
-            // 这一层还没接 `bus.set_channel()`。**回显收到的内容** ——
-            // 只说一句「暂未接线」的话，Agent 无从判断参数有没有被读到。
+            // 省略的子项：**能从 GET_CONFIG 读到的就沿用，读不到的就按 0 并明说**。
             //
-            // ⚠ 这里曾经写着「固件侧 SET_CHANNEL 已就绪」—— 而 `firmware/`
-            // 一行代码都没有。协议层面它是定义好的（`0x0202`），固件实现
-            // 属 P1，那句话说反了因果。
-            warnings.push(format!(
-                "channel 配置暂未接线上层（收到 {}）。协议侧 SET_CHANNEL(0x0202) 已定义，                 但主机侧还没接、固件侧也尚未实现（P1）",
-                describe_channel(c)
-            ));
+            // `GET_CONFIG` 只回报 `ch0_enable` 与 `ch0_coupling`，
+            // `range_idx` / `offset_lsb` 不在里面 —— 那两个没有「现值」可沿用，
+            // 只能按下发值走。**明说，不静默。**
+            //
+            // 回归：这个分支从前只推一条警告（「暂未接线上层」），一条命令都不发。
+            // 工具描述却写着「返回实际生效值」。
+            let cur = bus.config.clone();
+            let ch = match c.ch {
+                Some(v) => u8_field(v, "channel.ch")?,
+                None => 0,
+            };
+            let enable = match c.enable {
+                Some(v) => v,
+                None => cur.as_ref().map(|x| x.ch0_enable != 0).unwrap_or(true),
+            };
+            let coupling = match c.coupling {
+                Some(v) => v,
+                // 沿用现值：GET_CONFIG 报的是裸 u8，映射回枚举好让回显统一
+                None => match cur.as_ref().map(|x| x.ch0_coupling).unwrap_or(0) {
+                    0 => Coupling::Dc,
+                    _ => Coupling::Ac,
+                },
+            };
+            let range_idx = match c.range_idx {
+                Some(v) => u8_field(v, "channel.range_idx")?,
+                None => {
+                    warnings.push(
+                        "channel.range_idx 省略 → 按 0 下发（GET_CONFIG 不回报它，无法沿用现值）"
+                            .into(),
+                    );
+                    0
+                }
+            };
+            let offset_lsb = match c.offset_lsb {
+                Some(v) => v,
+                None => {
+                    warnings.push(
+                        "channel.offset_lsb 省略 → 按 0 下发（GET_CONFIG 不回报它，无法沿用现值）"
+                            .into(),
+                    );
+                    0
+                }
+            };
+
+            // **本板改不了的字段要明说。**
+            //
+            // SW2（AC/DC 耦合）与 SW3（X1/X50 量程）都是**手拨机械开关**
+            // （见 `docs/02-hardware.md` §5）—— 设备会记下并回显下发值，
+            // 但实际开关位置以硬件为准。不说的话，Agent 会以为耦合真的切到 AC 了，
+            // 然后拿一份和它以为的不一样的波形下结论。
+            if c.coupling.is_some() {
+                warnings.push(
+                    "本板的耦合开关 SW2 是手拨机械开关，AI 无法程控 —— 下发值会被记录并回显，\
+                     但实际耦合以硬件开关位置为准"
+                        .into(),
+                );
+            }
+            if c.range_idx.is_some() {
+                warnings.push(
+                    "本板的量程开关 SW3 是手拨机械开关，AI 无法程控 —— 下发值会被记录并回显，\
+                     但实际量程以硬件开关位置为准"
+                        .into(),
+                );
+            }
+
+            bus.set_channel(ch, enable, range_idx, coupling.as_u8(), offset_lsb)
+                .map_err(ToolError::from)?;
+            applied.insert(
+                "channel".into(),
+                json!({
+                    "ch": ch,
+                    "enable": enable,
+                    "range_idx": range_idx,
+                    "coupling": coupling.name(),
+                    "offset_lsb": offset_lsb,
+                }),
+            );
         }
 
         Ok(json!({ "applied": applied, "warnings": warnings }))
@@ -1199,6 +1257,10 @@ fn config_json(c: &scope_core::DeviceConfig) -> Value {
         "trigger_source": c.trigger_source,
         "trigger_edge": c.trigger_edge,
         "trigger_level_lsb": c.trigger_level_lsb,
+        // 通道 0 的使能与耦合。`GET_CONFIG` 里就这两个通道字段 ——
+        // 量程与偏移不在 payload 里，只能靠 `SET_CHANNEL` 的回显拿到。
+        "ch0_enable": c.ch0_enable,
+        "ch0_coupling": c.ch0_coupling,
     })
 }
 
@@ -1568,23 +1630,20 @@ mod tests {
 
     #[test]
     fn configure_echoes_the_channel_it_received() {
-        // channel 尚未接线，但**必须回显收到了什么** —— 只说一句「暂未接线」
-        // 的话，Agent 无从判断自己的参数有没有被读到。
+        // `channel` 从前只回显在一条警告的文本里（「暂未接线上层」），
+        // 现在它是真的下发并回读的 —— 回显也变成了 `applied.channel` 里的
+        // 结构化字段，Agent 不必去解析中文。
         let mut s = connected();
         let v = s
             .configure(&args(json!({
                 "channel": { "ch": 0, "enable": false, "coupling": "ac", "offset_lsb": -100 }
             })))
             .unwrap();
-        let w = v["warnings"].as_array().unwrap();
-        let joined = w
-            .iter()
-            .filter_map(|x| x.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(joined.contains("coupling=ac"), "实测 {joined}");
-        assert!(joined.contains("offset_lsb=-100"), "实测 {joined}");
-        assert!(joined.contains("enable=false"), "实测 {joined}");
+        let a = &v["applied"]["channel"];
+        assert_eq!(a["ch"], 0);
+        assert_eq!(a["enable"], false);
+        assert_eq!(a["coupling"], "ac");
+        assert_eq!(a["offset_lsb"], -100);
     }
 
     #[test]
@@ -1860,6 +1919,157 @@ mod tests {
     //
     // 这两个字段从前是**声明了但没人读**：传了照样返回成功，而工具说明
     // 写着「注入故障」。Agent 会拿着干净数据下结论，以为自己刚注入过。
+
+    // ── 通道配置：从「只回显」到「真的生效」────────────────────────
+
+    #[test]
+    fn configure_channel_actually_reaches_the_device() {
+        // 回归：这个分支从前**一条命令都不发**，只推一条「暂未接线上层」的
+        // 警告，而工具描述写着「返回实际生效值」。
+        let mut s = connected();
+        let v = s
+            .configure(&args(json!({ "channel": { "ch": 0, "enable": false } })))
+            .unwrap();
+        assert_eq!(v["applied"]["channel"]["enable"], false);
+
+        // 判据是**回读设备侧**，不是看回显 —— 回显是照着请求拼的
+        let st = s.status().unwrap();
+        assert_eq!(st["config"]["ch0_enable"], 0, "SET_CHANNEL 没真的下发");
+    }
+
+    #[test]
+    fn a_disabled_channel_actually_comes_back_flat() {
+        // 「存下来」不等于「生效」。这条测的是**可观察效果** ——
+        // 从前模拟器把 `ch0_enable` 存下来并在 GET_CONFIG 里回显，
+        // 但**没有任何代码用它**：关掉一个通道，采集数据一字不变。
+        let mut s = connected();
+        let before = s.capture(&args(json!({}))).unwrap();
+        assert!(
+            before["channels"][0]["pp_lsb"].as_i64().unwrap() > 1000,
+            "默认场景 CH1 应当是有信号的"
+        );
+
+        s.configure(&args(json!({ "channel": { "ch": 0, "enable": false } })))
+            .unwrap();
+        let after = s.capture(&args(json!({}))).unwrap();
+        assert_eq!(
+            after["channels"][0]["pp_lsb"], 0,
+            "关掉的通道应当是一条平线"
+        );
+        assert!(
+            after["channels"][1]["pp_lsb"].as_i64().unwrap() > 1000,
+            "另一个通道不该受影响"
+        );
+    }
+
+    #[test]
+    fn channel_offset_actually_shifts_the_trace() {
+        // 用**恒定**场景（dc）：触发点会随电平移动，用变化的波形比较均值
+        // 会掺进「这次采到的是哪一段」的影响 —— 第一版就是这样差了 2 LSB。
+        let mut s = Session::new();
+        s.connect(&args(json!({ "transport": "sim", "sim_scenario": "dc" })))
+            .unwrap();
+
+        let base = s.capture(&args(json!({}))).unwrap()["channels"][0]["mean_lsb"]
+            .as_f64()
+            .unwrap();
+
+        s.configure(&args(json!({ "channel": { "ch": 0, "offset_lsb": 200 } })))
+            .unwrap();
+        let shifted = s.capture(&args(json!({}))).unwrap()["channels"][0]["mean_lsb"]
+            .as_f64()
+            .unwrap();
+
+        assert!(
+            (shifted - base - 200.0).abs() < 0.5,
+            "偏移应当真的加到样点上：{base} → {shifted}"
+        );
+    }
+
+    #[test]
+    fn configuring_channel_1_does_not_touch_channel_0() {
+        // 回归：模拟器的 `cmd_set_channel` 从前无论 `ch` 是几都往 `ch0_*` 里写 ——
+        // 配 CH2 会**改掉 CH1 的配置**。
+        let mut s = connected();
+        s.configure(&args(json!({ "channel": { "ch": 1, "enable": false } })))
+            .unwrap();
+
+        let st = s.status().unwrap();
+        assert_eq!(st["config"]["ch0_enable"], 1, "配 CH2 不该动 CH1");
+
+        let cap = s.capture(&args(json!({}))).unwrap();
+        assert_eq!(cap["channels"][1]["pp_lsb"], 0, "CH2 应当被关掉");
+        assert!(
+            cap["channels"][0]["pp_lsb"].as_i64().unwrap() > 1000,
+            "CH1 应当没事"
+        );
+    }
+
+    #[test]
+    fn mechanical_switch_fields_are_flagged_not_silently_accepted() {
+        // 本板的耦合与量程是手拨机械开关，AI 无法程控。设备会记录并回显
+        // 下发值，但**实际开关位置以硬件为准** —— 不说的话 Agent 会以为
+        // 耦合真的切到 AC 了，然后拿一份和它以为的不一样的波形下结论。
+        let mut s = connected();
+        let v = s
+            .configure(&args(json!({
+                "channel": { "ch": 0, "coupling": "ac", "range_idx": 1 }
+            })))
+            .unwrap();
+        let w = v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(w.contains("SW2"), "耦合是机械开关，要说清：{w}");
+        assert!(w.contains("SW3"), "量程是机械开关，要说清：{w}");
+    }
+
+    #[test]
+    fn status_reports_real_link_counters() {
+        // 回归：core 的 `get_status` 从前**只读第一个字节**就把 33 字节的
+        // payload 丢了 —— 溢出计数、CRC 错误计数一路都到不了 Agent。
+        // 模拟器那边更早：这几个字段直接写死为 0。
+        let mut s = connected();
+
+        let st = s.status().unwrap();
+        assert_eq!(st["link_health"]["clean"], true, "刚连上应当是干净的：{st}");
+        assert_eq!(st["link_health"]["overrun_samples"], 0);
+
+        // 注入一次溢出 → 计数必须真的涨
+        s.sim_set_scenario(&args(json!({
+            "scenario": "i2c_100k",
+            "inject": { "force_overrun": true }
+        })))
+        .unwrap();
+        let _ = s.capture(&args(json!({}))).unwrap();
+
+        let st = s.status().unwrap();
+        assert!(
+            st["link_health"]["overrun_samples"].as_u64().unwrap() > 0,
+            "溢出计数应当真的涨上去：{st}"
+        );
+        assert_eq!(st["link_health"]["clean"], false);
+        assert_eq!(st["link_health"]["err_flags"], 1, "bit0 表示发生过溢出");
+    }
+
+    #[test]
+    fn status_counter_survives_a_reconnect_reset() {
+        // 计数器属于设备，不属于会话 —— 重连之后应当重新从新设备读。
+        // （这条同时守住「store 清空」与「计数器不清空」不会互相干扰。）
+        let mut s = connected();
+        let st = s.status().unwrap();
+        assert!(st["link_health"]["clean"].as_bool().unwrap_or(false));
+        s.connect(&args(json!({ "transport": "sim", "sim_scenario": "dc" })))
+            .unwrap();
+        let st = s.status().unwrap();
+        assert_eq!(
+            st["link_health"]["overrun_samples"], 0,
+            "新设备应当是干净的"
+        );
+    }
 
     #[test]
     fn sim_set_scenario_applies_the_seed() {

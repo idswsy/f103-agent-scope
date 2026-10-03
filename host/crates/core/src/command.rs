@@ -138,6 +138,96 @@ pub struct DeviceConfig {
     pub ch0_coupling: u8,
 }
 
+/// `GET_STATUS` 的完整响应（33 字节，见 `docs/03-protocol.md` §5.1）。
+///
+/// **为什么要有这个结构**：从前 `get_status()` 只读第一个字节（`state`），
+/// 把 payload 其余 32 字节**直接丢掉**。于是协议里定义的溢出计数、CRC 错误
+/// 计数、丢帧计数一路都到不了上层 —— 一个 Agent 读到「溢出 0 次」时，
+/// 那根本不是它采集下来的数据算出来的，而是**没人算过**。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceStatus {
+    /// 当前状态机状态。
+    pub state: State,
+    /// 错误标志位（含义见 `docs/03-protocol.md`）。
+    pub err_flags: u16,
+    /// 环缓冲里已填充的样点数。
+    pub ring_fill_samples: u16,
+    /// 最近一次采集的 id。
+    pub last_capture_id: u16,
+    /// 最近一次触发的样点下标；`None` = 还没触发过（线上是 `0xFFFFFFFF`）。
+    pub last_trigger_index: Option<u32>,
+    /// **累计被丢弃的样点数**（采集环溢出）。判断一份采集可不可信要看它。
+    pub overrun_samples: u32,
+    /// 累计收到的 CRC 错误帧数。
+    pub rx_crc_err: u16,
+    /// 累计丢弃的接收字节数（重同步时跳过的）。
+    pub rx_dropped: u16,
+    /// 累计丢弃的发送字节数。
+    pub tx_dropped: u32,
+    /// 设备开机以来的毫秒数。
+    pub uptime_ms: u32,
+    /// 设备侧微秒级 tick（时间对齐用）。
+    pub tick_us: u32,
+    /// 最近一次错误的错误码（0 = 无）。
+    pub last_error_code: u16,
+}
+
+impl DeviceStatus {
+    /// 从 33 字节 payload 解析。长度不足返回 `None`（**不 panic**）。
+    ///
+    /// 字段偏移见 `docs/03-protocol.md` §5.1 的 payload 定义：
+    ///
+    /// ```text
+    ///  0  state            u8
+    ///  1  err_flags        u16
+    ///  3  ring_fill        u16
+    ///  5  last_capture_id  u16
+    ///  7  last_trigger_idx u32
+    /// 11  overrun_samples  u32
+    /// 15  rx_crc_err       u16
+    /// 17  rx_dropped       u16
+    /// 19  tx_dropped       u32
+    /// 23  uptime_ms        u32
+    /// 27  tick_us          u32
+    /// 31  last_error_code  u16   → 共 33
+    /// ```
+    ///
+    /// ⚠ **这些偏移是手写的，错了不会编译不过。** 第一版从 `overrun_samples`
+    /// 起整体少了 2 字节，于是把「没有触发过」哨兵 `0xFFFFFFFF` 的高半字
+    /// 读成了溢出计数 —— 一台**刚连上、什么都没做**的设备报告「溢出 65535 次」。
+    /// `decode_reads_every_field_at_the_right_offset` 那条测试守着这件事。
+    pub fn decode(p: &[u8]) -> Option<DeviceStatus> {
+        if p.len() < 33 {
+            return None;
+        }
+        let u16at = |i: usize| u16::from_le_bytes([p[i], p[i + 1]]);
+        let u32at = |i: usize| u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
+        let ti = u32at(7);
+        Some(DeviceStatus {
+            state: State::from_u8(p[0]).unwrap_or(State::Idle),
+            err_flags: u16at(1),
+            ring_fill_samples: u16at(3),
+            last_capture_id: u16at(5),
+            // 协议里 `0xFFFFFFFF` 是「没有触发过」的哨兵，不是下标
+            last_trigger_index: (ti != 0xFFFF_FFFF).then_some(ti),
+            overrun_samples: u32at(11),
+            rx_crc_err: u16at(15),
+            rx_dropped: u16at(17),
+            tx_dropped: u32at(19),
+            uptime_ms: u32at(23),
+            tick_us: u32at(27),
+            last_error_code: u16at(31),
+        })
+    }
+
+    /// 这份数据可不可信 —— 有溢出或链路错误就不是干净的采集。
+    ///
+    /// 给上层一句话的判据，免得每个消费方各写一遍阈值。
+    pub fn link_is_clean(&self) -> bool {
+        self.overrun_samples == 0 && self.rx_crc_err == 0 && self.rx_dropped == 0
+    }
+}
+
 /// 一次特征（transaction）的结果。
 #[derive(Debug, Clone)]
 pub struct Response {
@@ -380,15 +470,18 @@ impl<P: DevicePort> CommandBus<P> {
     }
 
     /// `GET_STATUS`：任何状态下都可调用。
-    pub fn get_status(&mut self) -> Result<State> {
+    pub fn get_status(&mut self) -> Result<DeviceStatus> {
         let resp = self.transaction(Cmd::GetStatus, Vec::new(), TIMEOUT_CONTROL)?;
-        let state = resp
-            .payload
-            .first()
-            .and_then(|b| State::from_u8(*b))
-            .unwrap_or(State::Idle);
-        self.state = Some(state);
-        Ok(state)
+        // 解析失败**不当成 Idle 混过去** —— 那会让「设备回了一个我们不认识的
+        // 状态」看起来像「设备空闲」。宁可报错。
+        let st = DeviceStatus::decode(&resp.payload).ok_or_else(|| {
+            ScopeError::Unsupported(format!(
+                "GET_STATUS 响应长度 {} 字节，协议规定 33 字节",
+                resp.payload.len()
+            ))
+        })?;
+        self.state = Some(st.state);
+        Ok(st)
     }
 
     /// 重新读取设备配置真值。
@@ -597,9 +690,17 @@ impl<P: DevicePort> CommandBus<P> {
         p.extend_from_slice(&offset_lsb.to_le_bytes());
         let _ = self.transaction(Cmd::SetChannel, p, TIMEOUT_CONTROL)?;
 
-        if let Some(cfg) = &mut self.config {
-            cfg.ch0_enable = u8::from(enable);
-            cfg.ch0_coupling = coupling;
+        // 主机侧的配置镜像**只更新 ch0** —— `DeviceConfig` 就是照
+        // `GET_CONFIG` 的 17 字节建的，里面只有通道 0 的两个字段。
+        //
+        // 回归：这里从前无论 `ch` 是几都往 `ch0_*` 里写，于是「配一下 CH2」
+        // 会把镜像里的 CH1 使能改成 CH2 的 —— `scope_status` 报的是镜像，
+        // Agent 会看到 CH1 被关了，而设备上其实没有。
+        if ch == 0 {
+            if let Some(cfg) = &mut self.config {
+                cfg.ch0_enable = u8::from(enable);
+                cfg.ch0_coupling = coupling;
+            }
         }
         Ok(())
     }
@@ -779,5 +880,95 @@ pub fn parse_status_str(s: ParseStatus) -> &'static str {
         ParseStatus::CrcErr => "crc-error",
         ParseStatus::BadLen => "bad-len",
         ParseStatus::BadVer => "bad-version",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一个 33 字节的 `GET_STATUS` payload，每个字段给一个**唯一**的值。
+    ///
+    /// 唯一性是有意的：任何偏移错误都会让某个断言对不上，而用 0/1 之类的
+    /// 值就抓不出来（第一版的偏移错了 2 字节，正是因为哨兵和溢出计数
+    /// 恰好长得很像才差点蒙混过去）。
+    fn status_payload() -> Vec<u8> {
+        let mut p = Vec::with_capacity(33);
+        p.push(State::Fault as u8);
+        p.extend_from_slice(&0x1111u16.to_le_bytes());
+        p.extend_from_slice(&0x2222u16.to_le_bytes());
+        p.extend_from_slice(&0x3333u16.to_le_bytes());
+        p.extend_from_slice(&0x4444_4444u32.to_le_bytes());
+        p.extend_from_slice(&0x5555_5555u32.to_le_bytes());
+        p.extend_from_slice(&0x6666u16.to_le_bytes());
+        p.extend_from_slice(&0x7777u16.to_le_bytes());
+        p.extend_from_slice(&0x8888_8888u32.to_le_bytes());
+        p.extend_from_slice(&0x9999_9999u32.to_le_bytes());
+        p.extend_from_slice(&0xAAAA_AAAAu32.to_le_bytes());
+        p.extend_from_slice(&0xBBBBu16.to_le_bytes());
+        assert_eq!(p.len(), 33);
+        p
+    }
+
+    #[test]
+    fn decode_reads_every_field_at_the_right_offset() {
+        // 回归：第一版从 `overrun_samples` 起整体少了 2 字节。症状是
+        // 一台**刚连上、什么都没做**的设备报告「溢出 65535 次」——
+        // 那个 0xFFFF 其实是「没有触发过」哨兵 `0xFFFFFFFF` 的高半字。
+        // 一个 Agent 看到非零溢出，会开始怀疑一份本来完全干净的数据。
+        let st = DeviceStatus::decode(&status_payload()).expect("33 字节应当能解");
+        assert_eq!(st.state, State::Fault);
+        assert_eq!(st.err_flags, 0x1111);
+        assert_eq!(st.ring_fill_samples, 0x2222);
+        assert_eq!(st.last_capture_id, 0x3333);
+        assert_eq!(st.last_trigger_index, Some(0x4444_4444));
+        assert_eq!(st.overrun_samples, 0x5555_5555);
+        assert_eq!(st.rx_crc_err, 0x6666);
+        assert_eq!(st.rx_dropped, 0x7777);
+        assert_eq!(st.tx_dropped, 0x8888_8888);
+        assert_eq!(st.uptime_ms, 0x9999_9999);
+        assert_eq!(st.tick_us, 0xAAAA_AAAA);
+        assert_eq!(st.last_error_code, 0xBBBB);
+        assert!(!st.link_is_clean(), "有溢出就不该算干净");
+    }
+
+    #[test]
+    fn a_short_status_payload_is_rejected_not_guessed() {
+        assert!(
+            DeviceStatus::decode(&[0u8; 32]).is_none(),
+            "少一个字节也不行"
+        );
+        assert!(DeviceStatus::decode(&[]).is_none());
+    }
+
+    #[test]
+    fn the_no_trigger_sentinel_becomes_none_not_a_huge_index() {
+        let mut p = status_payload();
+        p[7..11].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        assert_eq!(
+            DeviceStatus::decode(&p).unwrap().last_trigger_index,
+            None,
+            "0xFFFFFFFF 是「没有触发过」，不是下标 4294967295"
+        );
+    }
+
+    #[test]
+    fn link_is_clean_only_when_all_three_counters_are_zero() {
+        let mut p = status_payload();
+        // 先把三个计数清零 —— 它是干净的
+        p[11..15].copy_from_slice(&0u32.to_le_bytes()); // overrun
+        p[15..17].copy_from_slice(&0u16.to_le_bytes()); // rx_crc_err
+        p[17..19].copy_from_slice(&0u16.to_le_bytes()); // rx_dropped
+        assert!(DeviceStatus::decode(&p).unwrap().link_is_clean());
+
+        // 任意一个非零就不干净 —— 逐个验，免得只挡了一个
+        for (name, at) in [("overrun", 11usize), ("rx_crc_err", 15), ("rx_dropped", 17)] {
+            let mut q = p.clone();
+            q[at] = 1;
+            assert!(
+                !DeviceStatus::decode(&q).unwrap().link_is_clean(),
+                "{name} 非零时不该算干净"
+            );
+        }
     }
 }

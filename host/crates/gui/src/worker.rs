@@ -207,7 +207,7 @@ impl WorkerState {
                         // `connect()` 只发 GET_INFO + GET_CONFIG，**不发 GET_STATUS**。
                         // 不补这一次的话 `bus.state` 一直是 None，
                         // `guard_config_allowed` 就失去判据 —— 已武装时照样能改配置。
-                        let state = bus.get_status().unwrap_or(State::Idle);
+                        let state = bus.get_status().map(|s| s.state).unwrap_or(State::Idle);
                         self.emit(Update::Connected {
                             info,
                             config: bus.config.clone(),
