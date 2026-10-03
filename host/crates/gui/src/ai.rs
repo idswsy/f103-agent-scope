@@ -42,6 +42,18 @@ const GLOBAL_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_TOKENS: u32 = 2048;
 
 /// 一次分析的结果。
+///
+/// # 为什么不带 token 用量
+///
+/// 响应里的 `usage.input_tokens` / `output_tokens` **对不上**，已实测：
+/// 一次真实请求的 body 是 3512 字符（其中 444 个中文字），服务端却报
+/// `input_tokens: 239` —— 合 14.7 字符/token，而**光那 444 个中文字就不止
+/// 239 个 token**。反方向也不成立：回复 344 字符却报 967 输出 token。
+///
+/// 既然这个数说不清是什么，**就不该显示给人看**。显示一个来路不明的数字，
+/// 比不显示更坏 —— 它会让人以为那是真的，并据此做成本判断。
+///
+/// 需要刻度时用**字符数**（`evidence.chars().count()`），那个是确定的。
 #[derive(Debug, Clone)]
 pub struct AiAnswer {
     /// 模型给出的文字。
@@ -50,10 +62,6 @@ pub struct AiAnswer {
     pub model: String,
     /// 耗时。
     pub elapsed: Duration,
-    /// 输入 token 数（服务端报的）。
-    pub input_tokens: u64,
-    /// 输出 token 数。
-    pub output_tokens: u64,
 }
 
 /// 一次失败。**`hint` 是必填的** —— 界面上要显示「怎么办」。
@@ -147,7 +155,11 @@ const SYSTEM_PROMPT: &str = "\
 - 数据源标注为模拟器时，须说明结论不适用于真实硬件。
 - 信息不足时须直说缺什么，不得杜撰。
 
-输出中文，按上面三节书写。**全文 300 字以内** —— 宁可短而准。";
+输出中文，按上面三节书写。**全文 300 字以内** —— 宁可短而准。
+
+**输出会原样显示在纯文本区，不要使用任何 markdown 记号**
+（`**粗体**`、`#` 标题、`-` 列表、反引号）。要分节就直接写「总线状态」这样的
+小标题，星号和井号会被原样显示出来。数字与字母照常写。";
 
 /// 构造请求体（Anthropic Messages 格式）。
 ///
@@ -226,7 +238,9 @@ pub fn parse_response(
         ));
     }
 
-    let usage = v.get("usage");
+    // 响应里还有 `usage.input_tokens` / `output_tokens` —— **故意不取**。
+    // 实测那两个数与请求体大小对不上（见 [`AiAnswer`] 的说明），
+    // 说不清含义的数字不该往上传，免得界面把它当成真的显示出去。
     Ok(AiAnswer {
         text,
         model: v
@@ -235,14 +249,6 @@ pub fn parse_response(
             .unwrap_or(fallback_model)
             .to_string(),
         elapsed,
-        input_tokens: usage
-            .and_then(|u| u.get("input_tokens"))
-            .and_then(|t| t.as_u64())
-            .unwrap_or(0),
-        output_tokens: usage
-            .and_then(|u| u.get("output_tokens"))
-            .and_then(|t| t.as_u64())
-            .unwrap_or(0),
     })
 }
 
@@ -658,8 +664,6 @@ mod tests {
             text: text.into(),
             model: "m".into(),
             elapsed: Duration::from_millis(1200),
-            input_tokens: 10,
-            output_tokens: 20,
         }
     }
 
@@ -927,8 +931,24 @@ mod tests {
         let a = parse_response(200, body, "fallback", Duration::from_millis(1500)).unwrap();
         assert_eq!(a.text, "结论：一切正常");
         assert_eq!(a.model, "deepseek-flash");
-        assert_eq!(a.input_tokens, 1234);
-        assert_eq!(a.output_tokens, 56);
+    }
+
+    /// **响应里的 `usage` 字段被有意丢弃。**
+    ///
+    /// 实测它与请求体大小对不上（3512 字符的中文请求报 239 输入 token），
+    /// 含义说不清就不该往上传。这条测试钉住「解析时不再读它」——
+    /// 免得以后有人顺手又把它接回界面。
+    #[test]
+    fn usage_fields_are_deliberately_ignored() {
+        let body = r#"{
+            "model": "m",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 1234, "output_tokens": 56}
+        }"#;
+        let a = parse_response(200, body, "m", Duration::from_millis(1)).unwrap();
+        assert_eq!(a.text, "ok");
+        // `AiAnswer` 上根本没有这两个字段 —— 编译期就挡住了。
+        // 这条测试的意义是：那个响应**能被正常解析**（丢弃 usage 不影响别的）。
     }
 
     /// thinking 块是模型的内部推理，**不该显示给用户**。
@@ -1226,18 +1246,23 @@ mod tests {
         let answer = ask(&cfg, &evidence, &cancel).expect("真实调用应当成功 —— 失败看上面的错误");
 
         // ── 5) 打印基线 ──
+        //
+        // 基线**只记字符数**，不记 token —— 服务端那个用量字段与请求体大小
+        // 对不上（见 `AiAnswer` 的说明）。字符数是确定的，才是能拿来比的刻度。
         println!("══ 基线 ══");
         println!("模型      : {}", answer.model);
         println!("用时      : {:.2} s", answer.elapsed.as_secs_f32());
-        println!("输入 token: {}", answer.input_tokens);
-        println!("输出 token: {}", answer.output_tokens);
+        println!("证据包    : {} 字符", evidence.chars().count());
         println!("回复字数  : {}", answer.text.chars().count());
         println!("\n── 回复全文 ──\n{}\n", answer.text);
 
         // 断的是「真的拿到了东西」，不是措辞
         assert!(!answer.text.trim().is_empty(), "回复是空的");
-        assert!(answer.input_tokens > 0, "服务端没报输入用量");
-        assert!(answer.output_tokens > 0, "服务端没报输出用量");
+        assert!(
+            answer.text.chars().count() > 20,
+            "回复只有 {} 字 —— 短得不像一份诊断",
+            answer.text.chars().count()
+        );
 
         // 提示词要求「不复述界面上已有的数值」，模型应当给的是诊断而非抄数
         println!("（人工核对：上面这段有没有在复述峰峰值/频率/占空比？）");

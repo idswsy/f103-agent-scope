@@ -255,25 +255,35 @@ impl Transaction {
     /// 一份完全健康的读数看起来像出了错，一个 Agent 几乎必然会据此
     /// 报出一个不存在的问题。
     pub fn has_nack(&self) -> bool {
-        // 读事务才可能由主机发收尾 NACK
+        self.events.iter().enumerate().any(|(i, e)| match &e.kind {
+            EventKind::Address(a) => !a.acked,
+            EventKind::Data { acked, .. } => !*acked && !self.is_master_terminating_nack(i),
+            _ => false,
+        })
+    }
+
+    /// 第 `i` 个事件是不是「读事务末尾由**主机**发出的收尾 NACK」。
+    ///
+    /// 读操作的最后一个字节，主机回 NACK 的意思是「我读够了」—— 那是**正常收尾**，
+    /// 不是从机故障。所以它不该和「从机没应答」共用一个记号。
+    ///
+    /// **这条规则只在这里定义一次。** [`Self::has_nack`] 与 `report.rs` 的证据包
+    /// 都调它 —— 两边各写一份判断，迟早只改一处（本项目最熟的那类缺陷）。
+    pub fn is_master_terminating_nack(&self, i: usize) -> bool {
+        // 只有读事务才可能由主机发收尾 NACK
         let reading = matches!(&self.address, Some(a) if a.read);
-        // 最后一个数据字节的下标
+        if !reading {
+            return false;
+        }
         let last_data = self
             .events
             .iter()
             .rposition(|e| matches!(&e.kind, EventKind::Data { .. }));
-
-        self.events.iter().enumerate().any(|(i, e)| match &e.kind {
-            EventKind::Address(a) => !a.acked,
-            EventKind::Data { acked, .. } => {
-                if *acked {
-                    false
-                } else {
-                    !(reading && Some(i) == last_data)
-                }
-            }
-            _ => false,
-        })
+        Some(i) == last_data
+            && matches!(
+                self.events.get(i).map(|e| &e.kind),
+                Some(EventKind::Data { acked: false, .. })
+            )
     }
 }
 

@@ -324,9 +324,11 @@ fn decode_section(s: &mut String, input: &EvidenceInput<'_>) {
     if d.transactions.is_empty() {
         let _ = writeln!(s, "（一帧都没解出来）");
     } else {
+        let _ = writeln!(s, "帧表（每个地址 / 数据字节后的标记）:");
         let _ = writeln!(
             s,
-            "帧表（每个地址 / 数据字节后的 +A = 从机应答，+N = 从机未应答）:"
+            "  +A = 从机应答    +N = 从机未应答（可能是故障）    \
+             +E = 读事务末字节的主机收尾 NACK（正常）"
         );
         for (i, t) in d.transactions.iter().take(MAX_FRAMES).enumerate() {
             let payload = frame_payload(t);
@@ -415,11 +417,27 @@ fn footer_section(s: &mut String, input: &EvidenceInput<'_>) {
 /// **是一次真跑的模型回复指出来的**：它说「帧表未列出 ACK/NAK 位，
 /// 从机是否应答无法从证据确认」。这种「缺失」只有拿真实数据跑才看得见。
 ///
-/// 格式取 `+A` / `+N`：一行一帧，且 19 帧的常见情形下只多几十个字符。
+/// # 三种标记，不是一个「未应答」
+///
+/// 第二次真跑又暴露了一层：模型看到读帧末尾的 `+N` 说
+/// 「读事务末尾的 N 被标为从机未应答……按 I2C 惯例那由主机发出，属正常收尾」。
+/// **它说得对** —— 而我的图例把 `+N` 一概解释成「从机未应答」，**在读帧末尾是错的**。
+///
+/// 这正是 `Transaction::has_nack` 的文档里预警过的事：
+/// 「一份完全健康的读数看起来像出了错，一个 Agent 几乎必然会据此报出一个
+/// 不存在的问题」。我加应答位的时候把那个修复又绕过去了。
+///
+/// 所以标记分三种，判断规则**复用** [`Transaction::is_master_terminating_nack`]：
+///
+/// | 标记 | 含义 |
+/// |---|---|
+/// | `+A` | 从机应答 |
+/// | `+N` | **从机**未应答 —— 这才可能是故障 |
+/// | `+E` | 读事务末字节由**主机**回的 NACK，正常收尾（E = End） |
 fn frame_payload(t: &Transaction) -> String {
     use crate::i2c_decode::EventKind;
     let mut s = String::new();
-    for ev in &t.events {
+    for (i, ev) in t.events.iter().enumerate() {
         match &ev.kind {
             EventKind::Address(a) => {
                 let _ = write!(
@@ -427,26 +445,24 @@ fn frame_payload(t: &Transaction) -> String {
                     "0x{:02X}({}){}  ",
                     a.value,
                     if a.read { "R" } else { "W" },
-                    ack_mark(a.acked)
+                    if a.acked { "+A" } else { "+N" }
                 );
             }
             EventKind::Data { value, acked } => {
-                let _ = write!(s, "{value:02X}{}  ", ack_mark(*acked));
+                let mark = if *acked {
+                    "+A"
+                } else if t.is_master_terminating_nack(i) {
+                    "+E"
+                } else {
+                    "+N"
+                };
+                let _ = write!(s, "{value:02X}{mark}  ");
             }
             // START / STOP / 截断标记在帧级别已经表达过了，不重复
             _ => {}
         }
     }
     s.trim_end().to_string()
-}
-
-/// 应答位的紧凑标记。
-fn ack_mark(acked: bool) -> &'static str {
-    if acked {
-        "+A"
-    } else {
-        "+N"
-    }
 }
 
 /// 数一数有多少帧没正常收尾。
@@ -615,6 +631,76 @@ mod tests {
         hold!(HIGH, HIGH, 4); // STOP
 
         let mut cap = Capture::new(9, rate, 2, scl.len() as u32);
+        cap.channels = vec![scl, sda];
+        cap
+    }
+
+    /// 造一份最常见的 I2C 时序：**写寄存器 → 重复起始 → 读两字节**。
+    ///
+    /// 读事务的最后一字节由**主机**回 NACK（「我读够了」）—— 那是正常收尾。
+    /// `nacked_i2c_capture` 造的是另一回事：从机拒绝了写数据。
+    fn read_transaction_capture() -> Capture {
+        let rate = 800_000u32;
+        let mut scl: Vec<u16> = Vec::new();
+        let mut sda: Vec<u16> = Vec::new();
+
+        macro_rules! hold {
+            ($sv:expr, $dv:expr, $n:expr) => {
+                for _ in 0..$n {
+                    scl.push($sv);
+                    sda.push($dv);
+                }
+            };
+        }
+        macro_rules! bit {
+            ($sv:expr) => {{
+                let d = if $sv { HIGH } else { LOW };
+                for _ in 0..4 {
+                    scl.push(LOW);
+                    sda.push(d);
+                }
+                for _ in 0..4 {
+                    scl.push(HIGH);
+                    sda.push(d);
+                }
+            }};
+        }
+        macro_rules! byte_with_ack {
+            ($b:expr, $acked:expr) => {{
+                for i in (0..8).rev() {
+                    bit!(($b >> i) & 1 == 1);
+                }
+                bit!(!$acked);
+            }};
+        }
+
+        // START：SCL 高时 SDA 由高变低
+        hold!(HIGH, HIGH, 4);
+        hold!(HIGH, LOW, 4);
+        hold!(LOW, LOW, 4);
+        // 写：地址 0x44(W) + 寄存器号 0x00
+        byte_with_ack!(0x88u8, true);
+        byte_with_ack!(0x00u8, true);
+        // 重复起始。
+        //
+        // ⚠ 别和 STOP 搞混：两者都在 SCL 高时动 SDA，
+        // **Sr 是「高→低」、STOP 是「低→高」**。
+        // 上一版这里写成了低→高，于是解出来是个 STOP，整个读帧都没了 ——
+        // 测试直接报「没有读帧」。
+        hold!(LOW, HIGH, 4); // SCL 低时先把 SDA 放回高
+        hold!(HIGH, HIGH, 4); // SCL 拉高（此时总线处于空闲态的样子）
+        hold!(HIGH, LOW, 4); // ← Sr：SCL 高时 SDA 由高变低
+        hold!(LOW, LOW, 4);
+        // 读：地址 0x44(R)，两个字节，最后一字节由主机回 NACK
+        byte_with_ack!(0x89u8, true);
+        byte_with_ack!(0x01u8, true);
+        byte_with_ack!(0x2Cu8, false); // ← 主机收尾 NACK
+                                       // STOP：SCL 高时 SDA 由低变高
+        hold!(LOW, LOW, 4);
+        hold!(HIGH, LOW, 4);
+        hold!(HIGH, HIGH, 4);
+
+        let mut cap = Capture::new(11, rate, 2, scl.len() as u32);
         cap.channels = vec![scl, sda];
         cap
     }
@@ -814,6 +900,52 @@ mod tests {
 
         assert!(text.contains("从机应答"), "缺图例：{text}");
         assert!(text.contains("从机未应答"), "缺图例：{text}");
+        assert!(
+            text.contains("主机收尾"),
+            "缺「+E 是主机收尾 NACK」这一条 —— 少了它，读帧末尾的 NACK \
+             会被当成从机故障：{text}"
+        );
+    }
+
+    /// **读事务末尾的 NACK 不能标成「从机未应答」。**
+    ///
+    /// 这是第二次真跑暴露出来的：模型看到读帧末尾的 `+N` 说
+    /// 「读操作最后一个字节的 ACK/NACK 由主机发出，NACK 表示结束读取，
+    /// 属正常收尾，不宜据此判从机故障」—— **它说得对**。
+    ///
+    /// 一份完全健康的「写寄存器 → 读回」读数，末尾那个 NACK 是主机发的，
+    /// 标成从机故障等于**报一个不存在的问题**。`has_nack()` 的文档里
+    /// 早就预警过这件事，是我加应答位时绕过去了。
+    #[test]
+    fn a_read_frames_trailing_nack_is_not_blamed_on_the_slave() {
+        // 「写 0x44 → 重复起始 → 读」—— 最常见的 I2C 时序
+        let cap = read_transaction_capture();
+        let d = decode_capture(&cap, &I2cDecodeConfig::default()).unwrap();
+
+        let read_frame = d
+            .transactions
+            .iter()
+            .find(|t| t.address.as_ref().is_some_and(|a| a.read))
+            .expect("测试数据里没有读帧 —— 这条测试失去意义");
+
+        let payload = frame_payload(read_frame);
+        assert!(
+            payload.contains("+E"),
+            "读帧末尾的主机收尾 NACK 应当标成 +E：{payload}"
+        );
+        assert!(
+            !read_frame.events.iter().enumerate().any(|(i, e)| matches!(
+                &e.kind,
+                crate::i2c_decode::EventKind::Data { acked: false, .. }
+            ) && !read_frame
+                .is_master_terminating_nack(i)),
+            "读帧里不该有「从机未应答」"
+        );
+        // 而且这一帧整体不算故障
+        assert!(
+            !read_frame.has_nack(),
+            "一份健康的读事务不该被判定为有 NACK"
+        );
     }
 
     // ── 坑 2 的回归：通道是用户选的就要说 ────────────────────────────
