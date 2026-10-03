@@ -387,11 +387,22 @@ fn main() -> Result<()> {
 /// 协议版本。客户端给别的值也照常工作，只是回我们支持的这一版。
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// `scope_debug_raw` 的注册条件：`SCOPE_MCP_DEBUG` **精确等于 `"1"`**。
+///
+/// 这里刻意不用 `is_ok()`（只判变量是否存在）：`scope_debug_raw` 是逃生门，
+/// 能发任意命令码，含 `MEM_WRITE`。只判存在的话，`SCOPE_MCP_DEBUG=0`
+/// 或空串这类「看起来是关掉」的误设，反而会把它暴露给模型 ——
+/// 暴露条件必须是一次**显式**的 `=1`。
+fn debug_tools_enabled(flag: Option<&str>) -> bool {
+    flag == Some("1")
+}
+
 /// 跑 stdio 循环：一行一条 JSON-RPC 消息，读到 EOF 就退出。
 fn serve() -> Result<()> {
     use std::io::{BufRead, Write};
 
-    let debug_tools = std::env::var("SCOPE_MCP_DEBUG").is_ok();
+    let flag = std::env::var("SCOPE_MCP_DEBUG").ok();
+    let debug_tools = debug_tools_enabled(flag.as_deref());
     let mut session = session::Session::new();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -821,6 +832,24 @@ mod tests {
         for t in TOOLS {
             assert!(seen.insert(t.name), "工具名重复：{}", t.name);
         }
+    }
+
+    /// 钉住「显式 `=1` 才暴露逃生门」。
+    ///
+    /// 这条测试存在的理由：实现原本是 `is_ok()`（判存在），于是
+    /// `SCOPE_MCP_DEBUG=0` 和空串都会把 `scope_debug_raw` 注册出去 ——
+    /// 与 `--list-tools` 自己打印的「仅 SCOPE_MCP_DEBUG=1」相反。
+    /// 把 `flag == Some("1")` 改回 `flag.is_some()`，前两条断言立刻变红。
+    #[test]
+    fn debug_tools_require_an_exact_one() {
+        assert!(!debug_tools_enabled(None), "未设置时不得注册");
+        assert!(!debug_tools_enabled(Some("0")), "=0 是关，不是开");
+        assert!(!debug_tools_enabled(Some("")), "空串不得注册");
+        assert!(
+            !debug_tools_enabled(Some("true")),
+            "只认 1，不认别的真值写法"
+        );
+        assert!(debug_tools_enabled(Some("1")));
     }
 
     /// 走一遍协议层调用工具，返回**工具自己的响应体**（已解掉 MCP 的
