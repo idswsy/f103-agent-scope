@@ -1084,15 +1084,15 @@ pub fn ai_panel(app: &mut App, ui: &mut egui::Ui) {
         ui.weak("（该结果迟于请求返回：此前已取消，或已发起新的分析。）");
     }
 
+    // 只报模型与耗时。
+    //
+    // **不显示 token 用量**：响应里的 `usage` 字段与请求体大小对不上
+    // （实测 3512 字符的请求报 239 输入 token，中文按那个比值不可能），
+    // 含义说不清就不该摆出来 —— 显示一个来路不明的数字比不显示更坏，
+    // 它会让人当成真的并据此做成本判断。刻度用字符数，那个是确定的。
     ui.horizontal_wrapped(|ui| {
         ui.small(format!("模型 {}", answer.model));
         ui.small(format!("· 用时 {:.1} s", answer.elapsed.as_secs_f32()));
-        if answer.input_tokens > 0 || answer.output_tokens > 0 {
-            ui.small(format!(
-                "· {} + {} tokens",
-                answer.input_tokens, answer.output_tokens
-            ));
-        }
     });
     ui.add_space(4.0);
 
@@ -1195,13 +1195,13 @@ fn start_analysis(app: &mut App) {
     let capture_id = cap.id;
     let anchor = app.capture_anchor();
 
-    // 证据包多大 —— 用户会想知道自己花了多少 token
+    // 证据包多大。**只报字符数，不折算 token** ——
+    // 服务端那个用量字段与请求体对不上（见 `AiAnswer` 的说明），
+    // 而自己拿 chars/3 估一个出来同样是在给一个说不清的数字。
+    // 字符数是确定的，够用了。
     let chars = evidence.chars().count();
     if app.ai.start(evidence, capture_id, anchor) {
-        app.note(format!(
-            "AI 分析已发起（证据包 {chars} 字符，约 {} token）。",
-            chars / 3
-        ));
+        app.note(format!("AI 分析已发起（证据包 {chars} 字符）。"));
     }
 }
 
@@ -1213,7 +1213,7 @@ fn export_answer(app: &mut App, cap: &scope_core::Capture, answer: &crate::ai::A
          - 链路：{}\n\
          - 采样率：{} Hz\n\
          - 触发点：{}\n\
-         - 模型：{}（用时 {:.1} s，{} + {} tokens）\n\n\
+         - 模型：{}（用时 {:.1} s）\n\n\
          ---\n\n{}\n",
         cap.id,
         app.link_description(),
@@ -1223,8 +1223,6 @@ fn export_answer(app: &mut App, cap: &scope_core::Capture, answer: &crate::ai::A
             .unwrap_or_else(|| "无".into()),
         answer.model,
         answer.elapsed.as_secs_f32(),
-        answer.input_tokens,
-        answer.output_tokens,
         answer.text,
     );
     match std::fs::write(&path, body) {

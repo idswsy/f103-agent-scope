@@ -255,25 +255,35 @@ impl Transaction {
     /// 一份完全健康的读数看起来像出了错，一个 Agent 几乎必然会据此
     /// 报出一个不存在的问题。
     pub fn has_nack(&self) -> bool {
-        // 读事务才可能由主机发收尾 NACK
+        self.events.iter().enumerate().any(|(i, e)| match &e.kind {
+            EventKind::Address(a) => !a.acked,
+            EventKind::Data { acked, .. } => !*acked && !self.is_master_terminating_nack(i),
+            _ => false,
+        })
+    }
+
+    /// 第 `i` 个事件是不是「读事务末尾由**主机**发出的收尾 NACK」。
+    ///
+    /// 读操作的最后一个字节，主机回 NACK 的意思是「我读够了」—— 那是**正常收尾**，
+    /// 不是从机故障。所以它不该和「从机没应答」共用一个记号。
+    ///
+    /// **这条规则只在这里定义一次。** [`Self::has_nack`] 与 `report.rs` 的证据包
+    /// 都调它 —— 两边各写一份判断，迟早只改一处（本项目最熟的那类缺陷）。
+    pub fn is_master_terminating_nack(&self, i: usize) -> bool {
+        // 只有读事务才可能由主机发收尾 NACK
         let reading = matches!(&self.address, Some(a) if a.read);
-        // 最后一个数据字节的下标
+        if !reading {
+            return false;
+        }
         let last_data = self
             .events
             .iter()
             .rposition(|e| matches!(&e.kind, EventKind::Data { .. }));
-
-        self.events.iter().enumerate().any(|(i, e)| match &e.kind {
-            EventKind::Address(a) => !a.acked,
-            EventKind::Data { acked, .. } => {
-                if *acked {
-                    false
-                } else {
-                    !(reading && Some(i) == last_data)
-                }
-            }
-            _ => false,
-        })
+        Some(i) == last_data
+            && matches!(
+                self.events.get(i).map(|e| &e.kind),
+                Some(EventKind::Data { acked: false, .. })
+            )
     }
 }
 
@@ -321,8 +331,8 @@ pub enum I2cWarning {
     },
     /// 有样点落在判决带内。占比偏高说明门限没设对。
     DecisionBandSamples {
-        /// 通道号。
-        channel: u8,
+        /// 哪条线。
+        line: I2cLine,
         /// 落在带内的样点数。
         count: u32,
         /// 首个落在带内的样点号。
@@ -330,8 +340,8 @@ pub enum I2cWarning {
     },
     /// 实测高电平只比 `VIH` 高一点点 —— 上拉偏弱或驱动不足。
     MarginalHigh {
-        /// 通道号。
-        channel: u8,
+        /// 哪条线。
+        line: I2cLine,
         /// 实测高电平。
         high_lsb: u16,
         /// 配置的高电平门限。
@@ -339,6 +349,37 @@ pub enum I2cWarning {
     },
     /// 采集窗口在帧中间结束，最后一帧不完整。
     TruncatedFrame,
+}
+
+/// 告警针对的是哪条线。
+///
+/// # 为什么是枚举而不是 `u8`
+///
+/// 这里原本是 `channel: u8`，值取 0（SCL 轨）/ 1（SDA 轨），文案却写成
+/// `"CH{channel}"` —— 于是**一条轨的内部序号被当成通道号印了出来**。
+///
+/// 后果：用户在界面上把 SCL 选在 CH2、SDA 选在 CH3，告警照样说「CH0」「CH1」，
+/// 与任何真实通道都对不上。而这类「一个含义被读错的整数」正是枚举能根除的 ——
+/// 叫 `line` 就只能填 [`I2cLine::Scl`] 或 [`I2cLine::Sda`]，填不成通道号。
+///
+/// ⚠ 注意它与**采集通道号**是两回事：通道号取决于用户在界面上把 SCL/SDA
+/// 选到了哪一路，只有 `I2cDecodeConfig` 知道。所以这里根本不该印通道号。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum I2cLine {
+    /// 时钟线。
+    Scl,
+    /// 数据线。
+    Sda,
+}
+
+impl I2cLine {
+    /// 中文名，用于告警文案。
+    pub fn name(self) -> &'static str {
+        match self {
+            I2cLine::Scl => "SCL",
+            I2cLine::Sda => "SDA",
+        }
+    }
 }
 
 /// 信号质量统计 —— 从数字通路能看出来的部分。
@@ -512,18 +553,22 @@ fn warning_text(w: &I2cWarning) -> String {
             format!("SDA 全程停在{level}；有 SCL 但无数据（SDA 未接？从机未上电？）")
         }
         I2cWarning::DecisionBandSamples {
-            channel,
+            line,
             count,
             first_sample,
         } => format!(
-            "CH{channel} 有 {count} 个样点落在判决带内（首个 @{first_sample}），门限可能没设对"
+            "{} 有 {count} 个样点落在判决带内（首个 @{first_sample}），门限可能没设对",
+            line.name()
         ),
         I2cWarning::MarginalHigh {
-            channel,
+            line,
             high_lsb,
             vih_lsb,
         } => {
-            format!("CH{channel} 实测高电平仅 {high_lsb} LSB（门限 {vih_lsb}），上拉偏弱或驱动不足")
+            format!(
+                "{} 实测高电平仅 {high_lsb} LSB（门限 {vih_lsb}），上拉偏弱或驱动不足",
+                line.name()
+            )
         }
         I2cWarning::TruncatedFrame => "采集窗口在帧中间结束，最后一帧不完整".to_string(),
     }
@@ -938,27 +983,30 @@ pub fn decode(
 
     if let Some(first) = scl_track.first_unknown {
         warnings.push(I2cWarning::DecisionBandSamples {
-            channel: 0,
+            line: I2cLine::Scl,
             count: scl_track.unknown,
             first_sample: first,
         });
     }
     if let Some(first) = sda_track.first_unknown {
         warnings.push(I2cWarning::DecisionBandSamples {
-            channel: 1,
+            line: I2cLine::Sda,
             count: sda_track.unknown,
             first_sample: first,
         });
     }
 
     // 高电平只比门限高一点点 → 上拉偏弱
-    for (ch, high) in [(0u8, scl_track.high_max), (1u8, sda_track.high_max)] {
+    for (line, high) in [
+        (I2cLine::Scl, scl_track.high_max),
+        (I2cLine::Sda, sda_track.high_max),
+    ] {
         if high > 0 && high >= levels.vih_lsb {
             let margin = high.saturating_sub(levels.vih_lsb);
             let headroom = FULL_SCALE.saturating_sub(levels.vih_lsb);
             if headroom > 0 && u32::from(margin) * 10 < u32::from(headroom) {
                 warnings.push(I2cWarning::MarginalHigh {
-                    channel: ch,
+                    line,
                     high_lsb: high,
                     vih_lsb: levels.vih_lsb,
                 });
@@ -1362,10 +1410,46 @@ mod tests {
             r.quality.unknown_sda > 0,
             "判决带内的样点必须被计数，而不是被猜成 0 或 1"
         );
-        assert!(r
-            .warnings
-            .iter()
-            .any(|w| matches!(w, I2cWarning::DecisionBandSamples { channel: 1, .. })));
+        assert!(r.warnings.iter().any(|w| matches!(
+            w,
+            I2cWarning::DecisionBandSamples {
+                line: I2cLine::Sda,
+                ..
+            }
+        )));
+    }
+
+    /// 告警文案必须说 **SCL / SDA**，不能印通道号。
+    ///
+    /// 回归：文案曾经是 `"CH{channel}"`，而那个 `channel` 装的是**轨序号**
+    /// （0=SCL 轨、1=SDA 轨），不是采集通道号。于是用户在界面上把 SCL 选在
+    /// CH2、SDA 选在 CH3，告警照样说「CH0」「CH1」—— 与任何真实通道都对不上。
+    ///
+    /// 判据：文案里出现 SCL / SDA，且**不出现任何 `CH` + 数字**。
+    #[test]
+    fn warnings_name_the_line_not_a_channel_number() {
+        for line in [I2cLine::Scl, I2cLine::Sda] {
+            let w = I2cWarning::MarginalHigh {
+                line,
+                high_lsb: 2900,
+                vih_lsb: 2866,
+            };
+            let t = w.text();
+            assert!(t.contains(line.name()), "文案应点名 {}：{t}", line.name());
+            assert!(
+                !t.contains("CH"),
+                "文案里不得出现通道号写法（那个下标不是通道号）：{t}"
+            );
+        }
+
+        let t = I2cWarning::DecisionBandSamples {
+            line: I2cLine::Scl,
+            count: 3,
+            first_sample: 12,
+        }
+        .text();
+        assert!(t.contains("SCL"), "应点名 SCL：{t}");
+        assert!(!t.contains("CH"), "不得出现通道号写法：{t}");
     }
 
     #[test]

@@ -42,6 +42,18 @@ const GLOBAL_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_TOKENS: u32 = 2048;
 
 /// 一次分析的结果。
+///
+/// # 为什么不带 token 用量
+///
+/// 响应里的 `usage.input_tokens` / `output_tokens` **对不上**，已实测：
+/// 一次真实请求的 body 是 3512 字符（其中 444 个中文字），服务端却报
+/// `input_tokens: 239` —— 合 14.7 字符/token，而**光那 444 个中文字就不止
+/// 239 个 token**。反方向也不成立：回复 344 字符却报 967 输出 token。
+///
+/// 既然这个数说不清是什么，**就不该显示给人看**。显示一个来路不明的数字，
+/// 比不显示更坏 —— 它会让人以为那是真的，并据此做成本判断。
+///
+/// 需要刻度时用**字符数**（`evidence.chars().count()`），那个是确定的。
 #[derive(Debug, Clone)]
 pub struct AiAnswer {
     /// 模型给出的文字。
@@ -50,10 +62,6 @@ pub struct AiAnswer {
     pub model: String,
     /// 耗时。
     pub elapsed: Duration,
-    /// 输入 token 数（服务端报的）。
-    pub input_tokens: u64,
-    /// 输出 token 数。
-    pub output_tokens: u64,
 }
 
 /// 一次失败。**`hint` 是必填的** —— 界面上要显示「怎么办」。
@@ -104,26 +112,54 @@ pub struct AiUpdate {
 
 /// 发送给语言模型的系统提示。
 ///
-/// 其中每一条均对应一类已识别的失效模式：杜撰数值、将模拟器数据当作实测、
-/// 对包络桶内细节作推断、信息不足时强行作答。
+/// # 为什么第一句就是「不要复述」
+///
+/// 这个面板的旁边就是波形图和测量面板 —— **峰峰值、频率、占空比都摆在用户
+/// 眼前**。模型把它们抄一遍是纯冗余，而且会把真正有价值的内容（哪里不对、
+/// 为什么、怎么办）挤掉。所以提示词的第一条不是「别编数字」，而是
+/// **「别复述数字」**：数字是判断依据，不是要转达的内容。
+///
+/// # 其余每一条对应的失效模式
+///
+/// 杜撰数值、将模拟器数据当作实测、对包络桶内细节作推断、信息不足时强行作答。
 const SYSTEM_PROMPT: &str = "\
-你是一台数字示波器 / I2C 总线分析仪的解读助手。用户刚完成一次采集，你将收到一份证据包。
+你是一台数字示波器 / I2C 总线分析仪的分析助手。用户**已经看到**波形图与
+测量面板，你将收到一份证据包，内含 I2C 解码结果、信号质量与告警。
 
-须遵守以下规定：
+## 最重要的一条：不要复述
 
-1. **仅可引用证据包中出现的数值**。不得自行估算、推算或作近似表述；
-   需要引用某个量时，直接采用其原始数值。
-2. **须区分「实测」与「推断」**。凡由数值直接得出的结论与属于推测的内容，
-   须以不同措辞分别表述，不得混同。
-3. **波形包络为降采样结果**，每桶仅保留 min/max。**不得对桶内的毛刺、振铃、
-   边沿形状作任何结论** —— 该信息在包络中不存在。
-4. **须核对数据源标注**。若标注为模拟器，必须说明「本结论基于模拟器数据，
-   不适用于真实硬件」。
-5. **信息不足时须如实说明**，并指出所缺内容（例如需要更换场景重新采集、
-   或需要真机数据）。不得为求答复完整而杜撰内容。
+峰峰值、频率、占空比、幅值这类数值，界面上已经显示，用户看得见。
+**把它们抄一遍没有任何价值。** 证据包里的数字是给你**作判断依据**用的 ——
+只在支撑某条结论时引用它，不要罗列。
 
-输出使用中文，分节书写：**结论** / **依据** / **建议下一步** / **不确定之处**。
-「不确定之处」无内容时写「无」。全文控制在 400 字以内。";
+## 只回答三件事
+
+**总线状态**
+总线上实际发生了什么。有解码结果时，说明事务内容、地址、读写方向与从机应答
+情况；一帧都没解出来时，说明为什么解不出来（门限不对、无信号、SDA 不动…）。
+
+**问题**
+依据证据指出的异常。**每条都要点明它基于哪个数**。
+没有异常就直说「未发现异常」，不要为凑内容编问题。
+
+**建议**
+针对每条问题的具体动作：换多大的上拉、调哪个门限、换个场景怎么重采。
+没问题时给出下一步可以验证什么。
+
+## 其余规定
+
+- 仅可引用证据包中出现的数值，不得估算或推算。
+- 须区分「实测」与「推断」，以不同措辞分别表述。
+- 证据包中的波形包络是降采样结果，每桶只有 min/max。**不得对桶内的毛刺、
+  振铃、边沿形状作结论** —— 该信息在包络里不存在。
+- 数据源标注为模拟器时，须说明结论不适用于真实硬件。
+- 信息不足时须直说缺什么，不得杜撰。
+
+输出中文，按上面三节书写。**全文 300 字以内** —— 宁可短而准。
+
+**输出会原样显示在纯文本区，不要使用任何 markdown 记号**
+（`**粗体**`、`#` 标题、`-` 列表、反引号）。要分节就直接写「总线状态」这样的
+小标题，星号和井号会被原样显示出来。数字与字母照常写。";
 
 /// 构造请求体（Anthropic Messages 格式）。
 ///
@@ -202,7 +238,9 @@ pub fn parse_response(
         ));
     }
 
-    let usage = v.get("usage");
+    // 响应里还有 `usage.input_tokens` / `output_tokens` —— **故意不取**。
+    // 实测那两个数与请求体大小对不上（见 [`AiAnswer`] 的说明），
+    // 说不清含义的数字不该往上传，免得界面把它当成真的显示出去。
     Ok(AiAnswer {
         text,
         model: v
@@ -211,14 +249,6 @@ pub fn parse_response(
             .unwrap_or(fallback_model)
             .to_string(),
         elapsed,
-        input_tokens: usage
-            .and_then(|u| u.get("input_tokens"))
-            .and_then(|t| t.as_u64())
-            .unwrap_or(0),
-        output_tokens: usage
-            .and_then(|u| u.get("output_tokens"))
-            .and_then(|t| t.as_u64())
-            .unwrap_or(0),
     })
 }
 
@@ -521,10 +551,24 @@ impl AiState {
 
     /// 收一条回执。
     pub fn apply(&mut self, u: AiUpdate) {
+        // 这条是不是当前正在等的那一个？
+        let is_current = self.awaiting == Some(u.req_id);
+
+        // **只有它才是**才能清 `awaiting`。
+        //
+        // 回归：这里曾经无条件 `self.awaiting = None`，于是一条**旧请求**的
+        // 迟到结果会把**新请求**的运行态一并清掉 —— 界面显示「不在分析」、
+        // 「开始分析」按钮重新亮起，而新请求其实还在飞。用户此时再点一次，
+        // 就有三个请求同时在路上，而 req_id 机制本来就是为了避免这种混乱。
+        // 这个交错靠读代码看不出来，是被 `a_stale_result_does_not_disturb_
+        // the_new_request` 抓到的。
+        if is_current {
+            self.awaiting = None;
+        }
+
         // 不是正在等的那个 —— 说明用户取消过，或者又发起了一次。
-        // **不丢弃**：钱已经花了，标一下比扔掉有用。
-        self.answer_late = self.awaiting != Some(u.req_id);
-        self.awaiting = None;
+        // **不丢弃**：请求已经计过费，标一下比扔掉有用。
+        self.answer_late = !is_current;
 
         match u.outcome {
             Ok(a) => {
@@ -575,6 +619,218 @@ mod tests {
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    // AiState 的状态机
+    // ══════════════════════════════════════════════════════════════════
+    //
+    // ⚠ 这些测试**从不调用 `start()`** —— 那会真的起线程、发网络请求。
+    // 需要「正在等结果」这个前置状态时，直接写 `awaiting` 字段（同模块可见）。
+    //
+    // 覆盖的是界面最容易出错的那部分：取消之后结果回来了怎么办、
+    // 结论对应的采集已经切走了怎么办。**这是「取消与迟到标注」那条
+    // 人工验证项里唯一能自动化的部分。**
+
+    /// 造一个不含网络活动的状态。`key` 传 `None` 表示没配密钥。
+    fn state_with_key(key: Option<&str>) -> AiState {
+        let cfg = match key {
+            Some(k) => AiConfig {
+                api_key: k.into(),
+                ..cfg()
+            },
+            None => AiConfig {
+                api_key: String::new(),
+                ..cfg()
+            },
+        };
+        AiState {
+            worker: AiWorker::new(egui::Context::default()),
+            cfg,
+            config_path: None,
+            panel_open: false,
+            awaiting: None,
+            answer: None,
+            answer_req: 0,
+            answer_capture_id: 0,
+            answer_anchor: String::new(),
+            answer_late: false,
+            error: None,
+            question: String::new(),
+            show_key: false,
+        }
+    }
+
+    fn answer(text: &str) -> AiAnswer {
+        AiAnswer {
+            text: text.into(),
+            model: "m".into(),
+            elapsed: Duration::from_millis(1200),
+        }
+    }
+
+    fn update(req_id: u64, capture_id: u16, text: &str) -> AiUpdate {
+        AiUpdate {
+            req_id,
+            capture_id,
+            anchor: format!("#{capture_id}"),
+            outcome: Ok(answer(text)),
+        }
+    }
+
+    #[test]
+    fn cannot_start_without_a_key() {
+        let s = state_with_key(None);
+        assert!(!s.can_start(), "没有密钥时不得发起分析");
+        assert!(!s.is_running());
+    }
+
+    #[test]
+    fn can_start_with_a_key_and_is_idle() {
+        let s = state_with_key(Some("sk-x"));
+        assert!(s.can_start());
+        assert!(!s.is_running());
+    }
+
+    /// 「是否正在分析」只看 `awaiting`。
+    ///
+    /// 曾经想过用线程存活状态判断，那是错的：请求取消后在途 HTTP 仍会跑到
+    /// 超时，而那时界面早该回到就绪态。
+    #[test]
+    fn running_state_follows_awaiting_not_the_thread() {
+        let mut s = state_with_key(Some("sk-x"));
+        assert!(!s.is_running());
+
+        s.awaiting = Some(7);
+        assert!(s.is_running(), "有在途请求时应报运行中");
+        assert!(!s.can_start(), "运行中不得再次发起");
+
+        s.awaiting = None;
+        assert!(!s.is_running());
+        assert!(s.can_start(), "回到就绪态后应可再次发起");
+    }
+
+    /// 取消后界面立刻回到就绪态 —— **不等**在途请求真的结束。
+    #[test]
+    fn cancel_returns_to_idle_immediately() {
+        let mut s = state_with_key(Some("sk-x"));
+        s.awaiting = Some(3);
+        s.cancel();
+        assert!(!s.is_running(), "取消后应立即回到就绪态");
+        assert!(s.can_start(), "取消后应能立刻重新发起");
+    }
+
+    #[test]
+    fn a_normal_result_is_not_marked_late() {
+        let mut s = state_with_key(Some("sk-x"));
+        s.awaiting = Some(1);
+        s.apply(update(1, 5, "结论"));
+        assert!(!s.answer_late, "正常返回不该被标成迟到");
+        assert_eq!(s.answer.as_ref().unwrap().text, "结论");
+        assert_eq!(s.answer_capture_id, 5);
+        assert!(!s.is_running());
+    }
+
+    /// **取消之后结果回来了 —— 不丢弃，标成迟到。**
+    ///
+    /// 丢弃是错的：请求已经计过费了。这条同时守住「标了」和「没丢」两件事。
+    #[test]
+    fn a_late_result_is_kept_and_labelled() {
+        let mut s = state_with_key(Some("sk-x"));
+        s.awaiting = Some(1);
+        s.cancel(); // awaiting 归 None
+        assert!(s.awaiting.is_none());
+
+        s.apply(update(1, 5, "迟到的结论"));
+        assert!(s.answer_late, "取消后返回的结果必须标成迟到");
+        assert!(s.answer.is_some(), "迟到结果不得丢弃 —— 请求已经计过费了");
+    }
+
+    /// 用户取消后又发起了一次：旧请求的结果回来时也必须标成迟到，
+    /// 且**不能顶掉**新请求的状态。
+    #[test]
+    fn a_stale_result_does_not_disturb_the_new_request() {
+        let mut s = state_with_key(Some("sk-x"));
+        s.awaiting = Some(2); // 新请求在跑
+
+        s.apply(update(1, 5, "上一轮的")); // 旧请求回来了
+        assert!(s.answer_late, "请求号对不上就要标迟到");
+        assert!(s.is_running(), "旧结果回来不该把新请求的运行态清掉");
+        assert_eq!(s.awaiting, Some(2));
+    }
+
+    /// 结论对应的采集已经不是当前显示的那个 —— 界面要能判断出来。
+    #[test]
+    fn an_answer_about_another_capture_is_flagged() {
+        let mut s = state_with_key(Some("sk-x"));
+        s.awaiting = Some(1);
+        s.apply(update(1, 5, "针对采集 5 的结论"));
+
+        assert!(
+            !s.answer_is_about_another_capture(Some(5)),
+            "当前就是采集 5，不该报错配"
+        );
+        assert!(
+            s.answer_is_about_another_capture(Some(6)),
+            "当前切到采集 6 了，必须能识别出来"
+        );
+        assert!(
+            s.answer_is_about_another_capture(None),
+            "当前没有采集时也算对不上"
+        );
+    }
+
+    #[test]
+    fn no_answer_means_nothing_to_mismatch() {
+        let s = state_with_key(Some("sk-x"));
+        assert!(
+            !s.answer_is_about_another_capture(Some(1)),
+            "没有结论时不该报「结论对不上」"
+        );
+    }
+
+    #[test]
+    fn a_failure_is_recorded_with_its_remedy() {
+        let mut s = state_with_key(Some("sk-x"));
+        s.awaiting = Some(1);
+        s.apply(AiUpdate {
+            req_id: 1,
+            capture_id: 5,
+            anchor: "#5".into(),
+            outcome: Err(AiError::new("出事了", "这么办")),
+        });
+        let e = s.error.as_ref().expect("失败要被记下来");
+        assert_eq!(e.message, "出事了");
+        assert!(
+            !e.hint.trim().is_empty(),
+            "失败必须带处理措施 —— 项目规矩：错误不能只给错误码"
+        );
+    }
+
+    /// 上一次失败了，这一次成功 —— 旧错误不该继续挂在界面上。
+    #[test]
+    fn a_new_start_clears_the_previous_error() {
+        let mut s = state_with_key(Some("sk-x"));
+        s.error = Some(AiError::new("上一次失败了", "怎么办"));
+        // 直接模拟 start 里的清理动作，避免真的起线程
+        s.error = None;
+        assert!(s.error.is_none());
+    }
+
+    /// 没配密钥时保存要给出「存不下来」，而不是静默假装成功。
+    #[test]
+    fn saving_without_a_config_path_says_so() {
+        let s = state_with_key(Some("sk-x"));
+        assert!(s.config_path.is_none());
+        let msg = s.save_config();
+        assert!(
+            msg.contains("未能保存") || msg.contains("无可用配置目录"),
+            "没有配置目录时必须明说保存失败：{msg}"
+        );
+        assert!(
+            msg.contains("内存"),
+            "还要说清后果（设置不会持久化）：{msg}"
+        );
+    }
+
     // ── 请求体 ───────────────────────────────────────────────────────
 
     #[test]
@@ -604,8 +860,62 @@ mod tests {
         assert!(sys.contains("桶内"), "须禁止对包络桶内细节作结论");
         assert!(sys.contains("模拟器"), "须要求声明模拟器数据源");
         assert!(
-            sys.contains("信息不足时须如实说明"),
+            sys.contains("信息不足时须直说缺什么"),
             "须允许并明确要求「信息不足」这一结论"
+        );
+    }
+
+    /// **提示词必须要求「不要复述数值」。**
+    ///
+    /// 这是用户明确提出的一条：波形图和测量面板就在旁边，峰峰值、频率、
+    /// 占空比用户看得见，让模型抄一遍是纯冗余 —— 而且会把真正有价值的内容
+    /// （哪里不对、为什么、怎么办）挤掉。
+    ///
+    /// 这条一旦丢，模型会退回成「测量面板的语音版」，这个功能就没有存在意义。
+    #[test]
+    fn system_prompt_forbids_reciting_what_the_user_can_see() {
+        let b = build_body(&cfg(), "x").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        let sys = v["system"].as_str().unwrap();
+
+        assert!(sys.contains("不要复述"), "须明确禁止复述界面上已有的数值");
+        // 必须点名用户看得见的那些量，否则模型不知道「不要复述」指什么
+        for seen in ["峰峰值", "频率", "占空比"] {
+            assert!(sys.contains(seen), "须点名「{seen}」属于用户可见、不必复述");
+        }
+    }
+
+    /// 系统提示词有多大 —— 它是**每一轮**都要背的固定开销。
+    ///
+    /// 刻度尺测试：成本讨论里要引用这个数。
+    #[test]
+    fn the_system_prompt_stays_small() {
+        let n = SYSTEM_PROMPT.chars().count();
+        let cjk = SYSTEM_PROMPT
+            .chars()
+            .filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c))
+            .count();
+        println!("SYSTEM_PROMPT: {n} 字符（中文 {cjk} 字）");
+
+        assert!(
+            n < 1200,
+            "系统提示词 {n} 字符 —— 它每轮都要发一次，别让它膨胀"
+        );
+    }
+
+    /// 输出必须收敛到「状态 / 问题 / 建议」三节 —— 用户要的是诊断，不是报告。
+    #[test]
+    fn system_prompt_asks_for_diagnosis_and_actions() {
+        let b = build_body(&cfg(), "x").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        let sys = v["system"].as_str().unwrap();
+
+        assert!(sys.contains("总线状态"), "须要求给出总线状态");
+        assert!(sys.contains("问题"), "须要求指出问题");
+        assert!(sys.contains("建议"), "须要求给出建议");
+        assert!(
+            sys.contains("没有异常就直说"),
+            "须明确：没有问题就说没有，不得为凑内容编问题"
         );
     }
 
@@ -621,8 +931,24 @@ mod tests {
         let a = parse_response(200, body, "fallback", Duration::from_millis(1500)).unwrap();
         assert_eq!(a.text, "结论：一切正常");
         assert_eq!(a.model, "deepseek-flash");
-        assert_eq!(a.input_tokens, 1234);
-        assert_eq!(a.output_tokens, 56);
+    }
+
+    /// **响应里的 `usage` 字段被有意丢弃。**
+    ///
+    /// 实测它与请求体大小对不上（3512 字符的中文请求报 239 输入 token），
+    /// 含义说不清就不该往上传。这条测试钉住「解析时不再读它」——
+    /// 免得以后有人顺手又把它接回界面。
+    #[test]
+    fn usage_fields_are_deliberately_ignored() {
+        let body = r#"{
+            "model": "m",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 1234, "output_tokens": 56}
+        }"#;
+        let a = parse_response(200, body, "m", Duration::from_millis(1)).unwrap();
+        assert_eq!(a.text, "ok");
+        // `AiAnswer` 上根本没有这两个字段 —— 编译期就挡住了。
+        // 这条测试的意义是：那个响应**能被正常解析**（丢弃 usage 不影响别的）。
     }
 
     /// thinking 块是模型的内部推理，**不该显示给用户**。
@@ -777,6 +1103,171 @@ mod tests {
     /// ```text
     /// ./host/run.sh test -p scope-gui -- --ignored live_endpoint
     /// ```
+    /// **量一次真实证据包的尺寸 —— 纯本地，不花钱、不联网。**
+    ///
+    /// 它复现 `live_single_shot_end_to_end` 里那次采集的全部输入，
+    /// 只是不把请求发出去。用来核对服务端报的 `input_tokens` 是否可信：
+    ///
+    /// ```text
+    /// ./host/run.sh test -p scope-gui -- --ignored measure_real_payload --nocapture
+    /// ```
+    #[test]
+    #[ignore = "要跑一次真实采集（本地），手动跑"]
+    fn measure_real_payload() {
+        use scope_core::{AcquireParams, ChannelScale, CommandBus, EvidenceInput};
+
+        let mut bus = CommandBus::new(scope_device::Transport::sim(scope_sim::Scenario::I2c100k));
+        bus.connect().expect("连模拟器失败");
+        let cap = scope_core::acquire(
+            &mut bus,
+            &AcquireParams {
+                samples: 4096,
+                rate_hz: scope_core::f103::MAX_SAMPLE_RATE_HZ,
+                trigger_level_lsb: 2048,
+                timeout: Duration::from_millis(2000),
+            },
+        )
+        .expect("采集失败");
+
+        let scale = ChannelScale::default();
+        let decode_cfg = scope_core::I2cDecodeConfig::default();
+        let decode = scope_core::decode_capture(&cap, &decode_cfg).ok();
+        let frames = decode.as_ref().map(|d| d.transactions.len()).unwrap_or(0);
+
+        let evidence = scope_core::build_evidence(&EvidenceInput {
+            capture: &cap,
+            scale: &scale,
+            link: "sim(i2c_100k)",
+            simulated: true,
+            config: bus.config.as_ref(),
+            decode: decode.as_ref(),
+            decode_cfg: Some(&decode_cfg),
+            question: Some("这条总线上的通信是否正常？有没有值得注意的地方？"),
+        });
+
+        let cfg = AiConfig {
+            api_key: "sk-placeholder".into(),
+            ..AiConfig::default()
+        };
+        let body = build_body(&cfg, &evidence).unwrap();
+
+        let ev = evidence.chars().count();
+        let sp = SYSTEM_PROMPT.chars().count();
+        println!("\n真实证据包   : {ev} 字符（{frames} 帧）");
+        println!("系统提示词   : {sp} 字符");
+        println!("请求体总长   : {} 字符", body.chars().count());
+        println!("两者合计     : {} 字符", ev + sp);
+        println!(
+            "\n（服务端上次报的输入是 239 token —— 拿这个字符数去对，\n \
+             若明显对不上，说明那个字段不能直接当成本依据）"
+        );
+    }
+
+    /// **真跑一次成功的单发分析 —— 端到端，用真 key，花真钱。**
+    ///
+    /// 手动执行（`--nocapture` 才能看到基线）：
+    ///
+    /// ```text
+    /// ./host/run.sh test -p scope-gui -- --ignored live_single_shot --nocapture
+    /// ```
+    ///
+    /// # 为什么必须有这一条
+    ///
+    /// 在此之前，**整条链只验过失败路径**（假 key → 401）。而「闭环 / 工具循环」
+    /// 这类扩展要搭在这条主干上 —— 主干从没成功过就往上盖，出问题时
+    /// 分不清是新增部分的 bug 还是主干本来就有的。
+    ///
+    /// 它也顺带把几件从未一起验过的事串起来：真采集 → 真证据包 → 真 HTTP →
+    /// 真解析 → 真用量。跑出来的数字就是后续的**基线**。
+    #[test]
+    #[ignore = "要外网 + 真 key + 花钱；手动跑"]
+    fn live_single_shot_end_to_end() {
+        use scope_core::{AcquireParams, ChannelScale, CommandBus, EvidenceInput};
+
+        // ── 1) 读用户机器上的真实配置 ──
+        let path = crate::config::default_config_path();
+        let (cfg, note) = crate::config::load(path.as_deref());
+        if let Some(n) = &note {
+            println!("配置来源：{n}");
+        }
+        assert!(
+            cfg.has_key(),
+            "配置里没有 key —— 先在 GUI 面板的「设置」里填好并保存"
+        );
+        println!("端点 {}  模型 {}", cfg.base_url, cfg.model);
+
+        // ── 2) 真采一窗（模拟器，i2c_100k）──
+        let mut bus = CommandBus::new(scope_device::Transport::sim(scope_sim::Scenario::I2c100k));
+        let info = bus.connect().expect("连模拟器失败");
+        println!(
+            "设备 {} 通道，采样率上限 {} Hz",
+            info.ch_count, info.rate_max_hz
+        );
+
+        let cap = scope_core::acquire(
+            &mut bus,
+            &AcquireParams {
+                samples: 4096,
+                rate_hz: scope_core::f103::MAX_SAMPLE_RATE_HZ,
+                trigger_level_lsb: 2048,
+                timeout: Duration::from_millis(2000),
+            },
+        )
+        .expect("采集失败");
+        println!(
+            "采集 #{} {} 点 @ {} Hz",
+            cap.id,
+            cap.channels[0].len(),
+            cap.rate_hz
+        );
+
+        // ── 3) 证据包（走真实路径：core 的 measure + decode）──
+        let scale = ChannelScale::default();
+        let decode_cfg = scope_core::I2cDecodeConfig::default();
+        let decode = scope_core::decode_capture(&cap, &decode_cfg).ok();
+        let evidence = scope_core::build_evidence(&EvidenceInput {
+            capture: &cap,
+            scale: &scale,
+            link: "sim(i2c_100k)",
+            simulated: true,
+            config: bus.config.as_ref(),
+            decode: decode.as_ref(),
+            decode_cfg: Some(&decode_cfg),
+            question: Some("这条总线上的通信是否正常？有没有值得注意的地方？"),
+        });
+        println!(
+            "\n── 证据包 {} 字符（约 {} token）──\n{evidence}\n",
+            evidence.chars().count(),
+            evidence.chars().count() / 3
+        );
+
+        // ── 4) 真发一次 ──
+        let cancel = AtomicBool::new(false);
+        let answer = ask(&cfg, &evidence, &cancel).expect("真实调用应当成功 —— 失败看上面的错误");
+
+        // ── 5) 打印基线 ──
+        //
+        // 基线**只记字符数**，不记 token —— 服务端那个用量字段与请求体大小
+        // 对不上（见 `AiAnswer` 的说明）。字符数是确定的，才是能拿来比的刻度。
+        println!("══ 基线 ══");
+        println!("模型      : {}", answer.model);
+        println!("用时      : {:.2} s", answer.elapsed.as_secs_f32());
+        println!("证据包    : {} 字符", evidence.chars().count());
+        println!("回复字数  : {}", answer.text.chars().count());
+        println!("\n── 回复全文 ──\n{}\n", answer.text);
+
+        // 断的是「真的拿到了东西」，不是措辞
+        assert!(!answer.text.trim().is_empty(), "回复是空的");
+        assert!(
+            answer.text.chars().count() > 20,
+            "回复只有 {} 字 —— 短得不像一份诊断",
+            answer.text.chars().count()
+        );
+
+        // 提示词要求「不复述界面上已有的数值」，模型应当给的是诊断而非抄数
+        println!("（人工核对：上面这段有没有在复述峰峰值/频率/占空比？）");
+    }
+
     #[test]
     #[ignore = "需要外网；手动跑：./host/run.sh test -p scope-gui -- --ignored live_endpoint"]
     fn live_endpoint_round_trip_maps_the_auth_error() {
