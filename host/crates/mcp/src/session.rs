@@ -533,10 +533,14 @@ impl Session {
         }
 
         if let Some(c) = &p.channel {
-            // 固件侧 SET_CHANNEL 已就绪，但这一层还没接。**回显收到的内容** ——
+            // 这一层还没接 `bus.set_channel()`。**回显收到的内容** ——
             // 只说一句「暂未接线」的话，Agent 无从判断参数有没有被读到。
+            //
+            // ⚠ 这里曾经写着「固件侧 SET_CHANNEL 已就绪」—— 而 `firmware/`
+            // 一行代码都没有。协议层面它是定义好的（`0x0202`），固件实现
+            // 属 P1，那句话说反了因果。
             warnings.push(format!(
-                "channel 配置暂未接线上层（收到 {}；固件侧 SET_CHANNEL 已就绪）",
+                "channel 配置暂未接线上层（收到 {}）。协议侧 SET_CHANNEL(0x0202) 已定义，                 但主机侧还没接、固件侧也尚未实现（P1）",
                 describe_channel(c)
             ));
         }

@@ -141,7 +141,11 @@ BNC ──► SW3（X1 直连 / X50 衰减）──► SW2（AC/DC 耦合）─�
 ### ⚠️ 量程切换是机械拨动开关
 
 **SW2（AC/DC）与 SW3（X1/X50）都是手拨的机械开关，AI 无法程控。**
-要支持自动量程必须改板（换继电器/模拟开关，如 CD4053）。见 ADR-010。
+要支持自动量程必须改板（换继电器/模拟开关，如 CD4053）。
+
+> 这是一条**硬件**约束，不是软件待办 —— 决策记录里没有对应条目（ADR-001~011
+> 都不涉及量程开关）。相关讨论在本节与 [`README`](../README.md) 的「硬件上必须
+> 先知道的三件事」第 3 条。
 
 ### ⚠️ TL072 带宽偏软
 
@@ -211,8 +215,13 @@ TL072 的 GBW 只有 3 MHz，对 400 kHz I2C 的 300 ns 边沿已经偏软，
 | PCB焊接辅助工具-简易数字示波器V1.2.html | 交互式点选定位器件 |
 | 简易数字示波器-装配图.pdf | 装配 |
 
-直链见 `hardware/README.md`。这些文件体积大，**不入库**（`.gitignore` 已排除
-`hardware/upstream/downloads/`），用 `hardware/fetch-upstream.sh` 重新拉取。
+这些文件体积大，**不入库**（`.gitignore` 已排除 `hardware/upstream/downloads/`）。
+**直链写在 [`hardware/fetch-upstream.sh`](../hardware/fetch-upstream.sh) 里**
+（`hardware/README.md` 只列了名称、大小与用途，没有 URL）—— 或者干脆直接跑它：
+
+```bash
+./hardware/fetch-upstream.sh
+```
 
 ---
 

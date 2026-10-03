@@ -23,9 +23,11 @@
 
 # 用法
 
-    export DEEPSEEK_API_KEY=...        # 或 ANTHROPIC_API_KEY
-    python tools/agent_demo/agent.py --out docs/08-agent-walkthrough.md
+    ./host/run.sh build -p scope-mcp          # 先构建
+    export DEEPSEEK_API_KEY=...               # 或 ANTHROPIC_API_KEY
+    python tools/agent_demo/agent.py
 
+跑完会把完整轨迹写到 `--dump` 指定的文件（默认 `tools/agent_demo/last_run.json`）。
 见同目录的 README.md。
 """
 
@@ -65,6 +67,24 @@ MAX_TURNS = 24
 RESULT_CHAR_CAP = 12_000
 
 
+#: 会在这些位置按顺序找 MCP server。
+#:
+#: 为什么不止一个：`host/run.sh` 在**路径含非 ASCII 字符**时会把
+#: `CARGO_TARGET_DIR` 改到 `~/.cargo-target/i2c-scope-f103`（MinGW 的
+#: `ld.exe` 打不开 CJK 路径），那时二进制就不在 `host/target/` 下。
+#: 只写死一个路径的话，症状是「刚构建完却说找不到 server」。
+def server_candidates(explicit: str | None) -> list[str]:
+    if explicit:
+        return [explicit]
+    home = os.path.expanduser("~")
+    return [
+        "host/target/debug/scope-mcp.exe",
+        "host/target/debug/scope-mcp",
+        os.path.join(home, ".cargo-target/i2c-scope-f103/debug/scope-mcp.exe"),
+        os.path.join(home, ".cargo-target/i2c-scope-f103/debug/scope-mcp"),
+    ]
+
+
 def env_key() -> tuple[str, str]:
     """返回 (api_key, 环境变量名)。两个名字都认，方便换供应商。"""
     for name in ("DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY"):
@@ -97,12 +117,18 @@ class McpClient:
     def __init__(self, exe: str) -> None:
         # 转成绝对路径再起进程：相对路径跟随调用方的 cwd，
         # 而这个脚本会被从仓库根目录、从 tools/ 目录、从 CI 里分别调用。
-        exe = os.path.abspath(exe)
-        if not os.path.isfile(exe):
+        tried = [os.path.abspath(p) for p in server_candidates(exe or None)]
+        found = next((p for p in tried if os.path.isfile(p)), None)
+        if found is None:
             sys.exit(
-                f"找不到 MCP server：{exe}\n"
-                "先构建：  ./host/run.sh build -p scope-mcp"
+                "找不到 MCP server。找过这些位置：\n"
+                + "".join(f"  {p}\n" for p in tried)
+                + "\n先构建：  ./host/run.sh build -p scope-mcp\n"
+                "（路径含非 ASCII 字符时 run.sh 会把 target 改到 "
+                "~/.cargo-target/i2c-scope-f103 —— 上面已经找过那里；"
+                "也可以用 --exe 直接指定。）"
             )
+        exe = found
         self.proc = subprocess.Popen(
             [exe],
             stdin=subprocess.PIPE,
@@ -353,9 +379,21 @@ def log_console(msg: str) -> None:
 
 
 def main() -> int:
+    # Windows 控制台是 GBK：这里全是中文，不重配的话在 Git Bash / cmd 里
+    # 会印成乱码（`✓` 变成 `✓`、中文变成问号）。errors="replace" 是为了
+    # 即使对面真的是个不支持 UTF-8 的终端，也不会抛 UnicodeEncodeError。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+
     ap = argparse.ArgumentParser(description="用 LLM 的原生工具调用驱动 MCP 示波器")
-    ap.add_argument("--exe", default="host/target/debug/scope-mcp.exe", help="MCP server 可执行文件")
-    ap.add_argument("--base-url", default=os.environ.get("AGENT_BASE_URL", "https://api.deepseek.com/anthropic/v1/messages"))
+    ap.add_argument("--exe", default=None, help="MCP server 可执行文件（默认自动找）")
+    ap.add_argument(
+        "--base-url",
+        default=os.environ.get("AGENT_BASE_URL", "https://api.deepseek.com/anthropic/v1/messages"),
+    )
     ap.add_argument("--model", default=os.environ.get("AGENT_MODEL", "deepseek-flash"))
     ap.add_argument("--task", default=DEFAULT_TASK)
     ap.add_argument("--dump", default="tools/agent_demo/last_run.json", help="把完整轨迹写到这里")
@@ -364,7 +402,7 @@ def main() -> int:
     key, keyname = env_key()
     log_console(f"用 {keyname} 驱动 {args.model} @ {args.base_url}")
 
-    out = run(args.exe, Llm(key, args.base_url, args.model), args.task, log_console)
+    out = run(args.exe or "", Llm(key, args.base_url, args.model), args.task, log_console)
 
     os.makedirs(os.path.dirname(args.dump) or ".", exist_ok=True)
     with open(args.dump, "w", encoding="utf-8") as f:

@@ -12,12 +12,13 @@
 | **git** | ≥ 2.30 | 版本管理 | 全员 |
 | **Rust** (rustup) | stable | 上位机 | 上位机 + Agent |
 | **Python** | ≥ 3.8 | 生成黄金测试向量 | 全员（跑测试要用） |
-| **C 编译器** | C11 | 协议层测试 | 固件 |
+| **C 编译器** (gcc) | C11 | 协议层测试（`./proto/run_tests.sh`） | **全员** —— 见下方说明 |
 | **Keil MDK** | ≥ 5.36 + AC6 | 固件编译 | 固件 |
 | **DAP-Link** | — | 烧录 | 固件 |
 
-> Python **不是可选项** —— `proto/tests/vectors.json` 由 `gen_vectors.py` 生成，
-> C 端测试也依赖它把 JSON 转成头文件。不装 Python 就跑不了协议测试。
+> **Python 与 gcc 都不是可选项。** `proto/tests/vectors.json` 由 `gen_vectors.py`
+> 生成，C 端测试又依赖 `gen_header.py` 把它转成头文件，再交给 gcc 编译 —— 三步缺一不可。
+> 协议是三方交汇点，**谁改了协议都要自己先跑一遍两端测试**，所以三个人都需要它们。
 
 ### 安装命令
 
@@ -62,8 +63,8 @@ brew install gcc python3                        # macOS
 ## 2. 跑通验证（10 分钟）
 
 ```bash
-git clone <repo-url>
-cd F103
+git clone https://github.com/idswsy/f103-agent-scope.git
+cd f103-agent-scope
 
 # ── 1. C 端协议测试 ──────────────────────────────────
 ./proto/run_tests.sh
@@ -71,7 +72,10 @@ cd F103
 
 # ── 2. Rust 上位机测试 ───────────────────────────────
 ./host/run.sh test
-# 期望：所有 test result: ok，共 57 项
+# 期望：所有 test result: ok，0 failed
+#       **不写死条数** —— 这个数字每加一个测试就过期一次，
+#       而且它曾经在 README 和这里各写了一个不同的值（61 / 57）。
+#       判断标准只有一个：所有 test result 都是 ok。
 
 # ── 3. 端到端：对着模拟器抓一次波形 ──────────────────
 ./host/run.sh run -p scope-cli -- sim capture --scenario sine_1k_3v3 -n 1024 -o wave.csv
@@ -97,8 +101,13 @@ cd F103
 | 列出可用串口 | `./host/run.sh run -p scope-cli -- ports` |
 | 连真机抓波形 | `./host/run.sh run -p scope-cli -- serial --port COM3 capture -n 2048 -o wave.csv` |
 | 对模拟器开发 | `./host/run.sh run -p scope-cli -- sim capture --scenario i2c_100k -n 4096 -o i2c.csv` |
+| 打开桌面 GUI | `./host/run.sh run -p scope-gui -- --demo --scenario i2c_100k` |
+| 只跑某个 crate | `./host/run.sh test -p scope-mcp` |
 
 > **始终用 `./host/run.sh` 而不是直接 `cargo`** —— 见下面的坑 #1。
+>
+> ⚠ 它内部会 `cd` 到 `host/`，所以上面那条命令的 `-o wave.csv` 会落在
+> **`host/wave.csv`**，不是仓库根目录。要放别处就写相对 `host/` 的路径或绝对路径。
 
 ---
 
@@ -108,8 +117,20 @@ cd F103
 2. 安装 **STM32F1xx DFP**（Device Family Pack）
 3. 打开 `firmware/MDK-ARM/<工程名>.uvprojx`
    > ⚠️ **工程文件尚未创建**（`firmware/MDK-ARM/` 现在是空目录，`.uvprojx` 是 **P1 任务**）。
-   > 在那之前，固件侧的协议逻辑可以先用 PC 上的 gcc 编译测试：
-   > `gcc -std=c11 -Iproto proto/protocol.c proto/tests/test_vectors.c`
+   > 在那之前，固件侧的协议逻辑可以先用 PC 上的 gcc 编译测试 —— 直接跑
+   > `./proto/run_tests.sh` 就行：它会自己生成向量头、决定编译参数、跑完报数。
+
+想手工编的话**必须带上生成目录** —— `vectors.h` 是生成物，不在 `proto/` 下：
+
+```bash
+python proto/tests/gen_header.py proto/tests/vectors.json > proto/build/vectors.h
+gcc -std=c11 -Iproto -Iproto/build -o /tmp/tv \
+    proto/protocol.c proto/tests/test_vectors.c \
+    && /tmp/tv
+```
+
+> 回归：这里从前写的命令是 `gcc -std=c11 -Iproto proto/protocol.c proto/tests/test_vectors.c`
+> —— **照抄一定失败**（`vectors.h: No such file or directory`），少了 `-Iproto/build`。
 4. 调试器选 **DAP-Link**（ST-Link 在 Win11 上可能与 DAPLink 驱动冲突）
 
 ### 烧录方式
@@ -137,18 +158,15 @@ P2 起：USB CDC    → PA11 / PA12            ← 板载 Type-C，带宽高
 
 ### VS Code 推荐配置
 
-`.vscode/settings.json`（已提交）：
+[`.vscode/settings.json`](../.vscode/settings.json) 已经提交进仓库，**别在这里再抄一份** ——
+之前这里贴的那份和实际文件差了好几个键（`${env:HOME}` vs `${env:USERPROFILE}`、
+少了 `targetDir` / `files.exclude` / `[json]` 等），两份各自腐烂。
 
-```json
-{
-  "rust-analyzer.cargo.extraEnv": {
-    "CARGO_TARGET_DIR": "${env:HOME}/.cargo-target/i2c-scope-f103"
-  },
-  "rust-analyzer.check.command": "clippy",
-  "files.associations": { "*.h": "c" },
-  "C_Cpp.default.cStandard": "c11"
-}
-```
+抄了也对不上，直接看那个文件。其中只有一项值得解释：
+
+**`rust-analyzer.cargo.extraEnv.CARGO_TARGET_DIR`** 指向 `${env:USERPROFILE}/.cargo-target/...`
+—— 理由见坑 #1：`ld.exe` 打不开 CJK 路径。用 `USERPROFILE` 而不是 `HOME`，
+是因为 Windows 的 VS Code 里 `HOME` 未必被设置。
 
 ### 协议改动的工作流
 

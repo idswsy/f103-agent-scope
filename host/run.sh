@@ -2,9 +2,12 @@
 #
 # host/run.sh —— 跨平台 cargo 包装
 #
-# 解决的问题：项目路径含中文（`I2C示波器`）时，Windows + GNU 工具链的
-# MinGW `ld.exe` 打不开带 CJK 的路径，链接阶段会报一堆
+# 解决的问题：项目路径含非 ASCII 字符时，Windows + GNU 工具链的 MinGW
+# `ld.exe` 打不开带 CJK 的路径，链接阶段会报一堆
 # "cannot find ...rcgu.o: No such file or directory"。
+#
+# 当前 checkout 是纯 ASCII（.../Desktop/I2C/F103），不会触发；但把仓库
+# 放到任何中文目录下就会，所以这套探测与绕行保留。
 #
 # 对策：路径含非 ASCII 字符时，自动把 target 目录指到一个纯 ASCII 的位置。
 # Linux/macOS/纯 ASCII 路径下完全无副作用。

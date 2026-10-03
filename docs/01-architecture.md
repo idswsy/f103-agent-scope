@@ -6,17 +6,22 @@
 ┌─────────────────────────────────────────────────────────────────────┐
 │  L5  Agent 层           Claude / 任意 LLM                           │
 │                          ↕ MCP (JSON-RPC over stdio)                │
-│  L4  MCP Server        14 个粗粒度工具，schema 手写（待改 schemars）│
-│                          ↕ 直接调用 scope-core 的 async API         │
+│  L4  MCP Server        14 个粗粒度工具，schema 由参数类型生成       │
+│                          ↕ 直接调用 scope-core（**阻塞**，无 async） │
 │  L3  命令层 scope-core  CommandBus：编码 / seq / 超时重试 / 状态缓存│
 │                          ↕ DevicePort (trait)                       │
-│  L2  传输层             UART(tokio-serial) │ sim │ tcp(可选)        │
+│  L2  传输层             UART(serialport) │ sim                      │
 │                          ↕ AA55 帧 / CRC16 / 分片                   │
 │  L1  设备层             STM32F103C8T6 固件                          │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-**解耦点只有一个**：`DevicePort`。L3 以上完全不关心背后是真硬件、模拟器还是 TCP。
+**解耦点只有一个**：`DevicePort`（6 个方法）。L3 以上完全不关心背后是真硬件还是模拟器 ——
+换一种链路 = 实现这一个 trait，其余一行不动。
+
+> 全栈是**同步阻塞**的：`CommandBus` 的每个命令调用都会等到设备回包或超时。
+> 没有 async runtime，`Cargo.toml` 里也没有 tokio。GUI 那边之所以要 worker 线程，
+> 是因为绘制不能阻塞，不是为了并发 IO。
 
 ---
 
@@ -152,9 +157,17 @@ proto/
 
 | 组件 | 作用 |
 |---|---|
-| `host/crates/sim` | 实现同一 `DevicePort`，内含 F103 真实档位表、ARM/触发/环缓冲语义、按波特率模拟的分片节奏 |
-| 故障注入 | `drop_every_n_frames` / `crc_err_every_n` / `latency_spike_ms` / `no_trigger` |
-| `MockDevice` | 进程内，供 `cargo test` 与 MCP 开发 |
+| `host/crates/sim` | 实现同一 `DevicePort`，内含 F103 真实档位表、ARM/触发/环缓冲语义、状态机约束（`ARMED` 下发配置回 `BUSY`）、seq 去重缓存 |
+| 故障注入 | [`FaultInjection`](../host/crates/sim/src/device.rs) 六个字段：`drop_every_n_frames` / `crc_err_every_n_frames` / `latency_spike_probability` / `latency_spike_ms` / `no_trigger` / `force_overrun` |
+| `host/crates/device` | `Transport` enum：运行时在模拟器与串口之间切换（`Box<dyn DevicePort>` 不行的原因见该 crate 的文档头） |
 | C 端纯逻辑测试 | `App/` 层不依赖 HAL → PC 上 gcc 编译跑同一批黄金向量 |
 
-三种传输（UART / sim / tcp）即插即用，切到 `transport='sim'` 后 **Agent 逻辑零改动**。
+两种传输（`serialport` 串口 / `sim`）即插即用，切到 `transport='sim'` 后 **Agent 逻辑零改动**。
+
+> **模拟器不受波特率限制。** `SimDevice::byte_rate()` 返回 `u32::MAX`，
+> 它不会按波特率节流 —— 那样只会让测试变慢。`byte_rate` 的唯一用途是让
+> 命令层**估算超时**（波特率越低，等一个分片要越久）。
+>
+> 回归：这句话在三个地方被写反过（本文件、`README.md`、以及
+> `sim/device.rs` 的模块注释），都说成「按波特率模拟分片节奏」。
+> 一份会让人以为「模拟器跑得慢是正常的」的文档，比没有文档更糟。
