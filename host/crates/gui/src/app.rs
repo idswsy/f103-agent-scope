@@ -10,6 +10,7 @@
 //! | 「期望值」与「回显值」 | **分开存** | 采样率会被量化，界面必须能画出「请求 vs 实际」的差异 |
 
 use crate::ai::AiState;
+use crate::drive::{self, DriveEvent, DrivePhase, DriveState, Handoff, TrajectoryItem};
 use crate::font::FontOutcome;
 use crate::msg::{Request, TransportKind, Update};
 use crate::panels;
@@ -104,6 +105,12 @@ pub struct App {
     /// 单独成组是有意的：这块**不碰设备**，和 `worker` 那条链路没有任何交集
     /// 除了「读当前采集」。共用一个 `AiState` 字段比往 `App` 上再摊十几个字段好读。
     pub(crate) ai: AiState,
+
+    /// 「让 AI 自己配置并采集」的状态（阶段、会话句柄、轨迹、交接快照）。
+    ///
+    /// ⚠ 与 `worker` 是**互斥**的：这个非 Idle 时设备在子进程手上，
+    /// `worker` 那边即使还活着也够不到设备 —— 见 [`DrivePhase::device_is_elsewhere`]。
+    pub(crate) drive: DriveState,
 }
 
 impl App {
@@ -162,6 +169,7 @@ impl App {
             demo_stage: if demo { 0 } else { 3 },
 
             ai,
+            drive: DriveState::default(),
         };
 
         // 字体去向写进日志 —— 加载成功也留一条，方便排查「为什么中文是方框」
@@ -186,6 +194,212 @@ impl App {
         app
     }
 
+    // ══════════════════════════════════════════════════════════════
+    // AI 驱动设备：交接 / 状态机 / 事件
+    // ══════════════════════════════════════════════════════════════
+
+    /// 设备此刻是不是不在 GUI 手上。
+    ///
+    /// 界面上一堆控件靠它禁用 —— 而这**不是 UI 的偏好，是串口独占的必然**：
+    /// 设备已经让给子进程了，那些按钮点下去也够不到东西。
+    pub(crate) fn device_is_elsewhere(&self) -> bool {
+        self.drive.phase.device_is_elsewhere()
+    }
+
+    /// 现在能不能把设备交给 AI。
+    pub(crate) fn can_start_drive(&self) -> bool {
+        self.connected && !self.is_busy() && !self.drive.phase.is_busy()
+    }
+
+    /// 用户点了「交给 AI」：**先把设备让出去**。
+    ///
+    /// 顺序不能反 —— 必须先 `Disconnect` 把串口放开，子进程才连得上。
+    /// 真正的会话在 [`Self::step_drive`] 里等 `Update::Disconnected` 之后才起。
+    pub(crate) fn start_drive(&mut self) {
+        if !self.can_start_drive() {
+            return;
+        }
+        let task = self.ai.question.trim().to_string();
+        if task.is_empty() {
+            self.note("需求为空。请在输入框中填写。");
+            return;
+        }
+
+        // 快照 —— 会话期间与收回来之后都要靠它说真话
+        self.drive.handoff = Some(Handoff {
+            link: self.link_description(),
+            simulated: self.simulated,
+            config: self.config.clone(),
+            transport: self.transport_kind,
+            port: self.port.clone(),
+            baud: self.baud,
+            scenario: self.scenario,
+        });
+        self.drive.task = task;
+        self.drive.begin();
+        self.drive.phase = DrivePhase::Disconnecting;
+
+        // 停掉 --demo 自动机 —— 否则它会在 AI 跑的时候插一脚
+        self.demo_stage = 3;
+
+        self.note("设备交接：GUI 断开，释放串口");
+        self.worker.send(Request::Disconnect);
+    }
+
+    /// 推一步状态机。在 `logic()` 里每帧调用。
+    pub(crate) fn step_drive(&mut self, ctx: &egui::Context) {
+        match self.drive.phase {
+            // 断开完成 → 起会话
+            DrivePhase::Disconnecting if !self.connected => {
+                self.spawn_drive(ctx);
+            }
+            // 重新连上 → 回到 Idle
+            DrivePhase::Reconnecting if self.connected => {
+                self.drive.phase = DrivePhase::Idle;
+                self.note(format!(
+                    "设备已收回。AI 的改动保留在设备上，可用「{}」改回",
+                    drive::RESTORE_LABEL
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    /// 真正起会话线程（设备已经让出去了）。
+    fn spawn_drive(&mut self, ctx: &egui::Context) {
+        let Some(h) = self.drive.handoff.clone() else {
+            self.drive.phase = DrivePhase::Idle;
+            return;
+        };
+        let job = drive::DriveJob {
+            task: self.drive.task.clone(),
+            cfg: self.ai.cfg.clone(),
+            connect_args: h.connect_args(),
+        };
+        let generation = self.drive.next_generation();
+        self.drive.handle = Some(drive::spawn_session(job, generation, ctx.clone()));
+        self.drive.phase = DrivePhase::Running;
+    }
+
+    /// 收一条会话事件。
+    fn apply_drive(&mut self, e: DriveEvent) {
+        match e {
+            DriveEvent::Phase(p) => {
+                self.drive.push(TrajectoryItem::Phase(p.clone()));
+                self.note(format!("AI：{p}"));
+            }
+            DriveEvent::ToolCall { name, args } => {
+                self.drive.push(TrajectoryItem::Call {
+                    name: name.clone(),
+                    args,
+                });
+            }
+            DriveEvent::ToolResult { name, ok, summary } => {
+                self.drive.push(TrajectoryItem::Result {
+                    name: name.clone(),
+                    ok,
+                    summary,
+                });
+            }
+            DriveEvent::Warnings(ws) => {
+                for w in ws {
+                    self.drive.push(TrajectoryItem::Warning(w.clone()));
+                    self.note(format!("AI 警告：{w}"));
+                }
+            }
+            DriveEvent::Capture(c) => {
+                let cap = *c;
+                self.drive.push(TrajectoryItem::Capture {
+                    id: cap.id,
+                    points: cap.channels.first().map(|v| v.len()).unwrap_or(0),
+                    channels: cap.channels.len(),
+                });
+                self.note(format!(
+                    "AI 采到 #{}（{} 点）—— 已上屏",
+                    cap.id,
+                    cap.channels.first().map(|v| v.len()).unwrap_or(0)
+                ));
+                // 与 worker 那条路走同一套：进历史、换当前显示、标脏重算解码
+                self.store.push(cap.clone());
+                self.capture = Some(cap);
+                self.decode_dirty.store(true, Ordering::Relaxed);
+                self.fit_pending = true;
+            }
+            DriveEvent::Finished {
+                text,
+                turns,
+                hit_limit,
+            } => {
+                self.drive.final_text = Some(text);
+                self.drive.push(TrajectoryItem::Phase(if hit_limit {
+                    format!("已达轮数上限而停止（{turns} 轮）")
+                } else {
+                    format!("跑完（{turns} 轮）")
+                }));
+                self.return_device();
+            }
+            // ⚠ 出错也**必须**把设备收回来 —— 否则界面永远停在
+            // 「AI 正在操作设备」，而设备谁也拿不回来。
+            DriveEvent::Failed(e) => {
+                self.note(format!("AI 会话失败：{}（{}）", e.message, e.hint));
+                self.drive.push(TrajectoryItem::Phase(format!(
+                    "✗ {} —— {}",
+                    e.message, e.hint
+                )));
+                self.return_device();
+            }
+        }
+    }
+
+    /// 把设备收回来 —— 按交接快照连回**同一个目标**。
+    fn return_device(&mut self) {
+        let Some(h) = self.drive.handoff.clone() else {
+            self.drive.phase = DrivePhase::Idle;
+            return;
+        };
+        self.drive.phase = DrivePhase::Reconnecting;
+        self.note("会话结束，正在收回设备");
+        self.worker.send(Request::Connect {
+            transport: h.transport,
+            port: h.port,
+            baud: h.baud,
+            scenario: h.scenario,
+        });
+    }
+
+    /// 用户点了「终止」。
+    ///
+    /// **直接杀**，不走优雅收场 —— 用户点了终止就该立刻停。
+    /// 代价是真机可能停在 Armed：重连读到状态后会提示点复位。
+    pub(crate) fn stop_drive(&mut self) {
+        let Some(h) = self.drive.handle.take() else {
+            return;
+        };
+        // 作废这一代 —— 旧线程还会吐几条事件出来，不能混进下一次会话
+        self.drive.next_generation();
+        h.terminate();
+        self.note("会话已终止（子进程已结束）。设备上保留其最后的配置。");
+        self.return_device();
+    }
+
+    /// 按交接快照把设备设置改回去。
+    pub(crate) fn restore_handoff_config(&mut self) {
+        let Some(h) = self.drive.handoff.as_ref() else {
+            return;
+        };
+        let Some(c) = h.config.as_ref() else {
+            self.note("交接时未读到设备配置，无法恢复");
+            return;
+        };
+        // 把「期望值」同步成快照 —— 用户点一次「应用到设备」即可
+        self.want_rate = c.rate_hz;
+        self.want_samples = c.capture_samples;
+        self.want_trigger_mode = c.trigger_mode;
+        self.want_trigger_edge = c.trigger_edge;
+        self.want_trigger_level = c.trigger_level_lsb;
+        self.note("「期望配置」已填回交接时的值，由「应用到设备」下发");
+    }
+
     /// 记一行日志。
     pub(crate) fn note(&mut self, line: impl Into<String>) {
         self.log.push(line.into());
@@ -204,7 +418,20 @@ impl App {
     ///
     /// **模拟器要写出场景名**：用户在界面上换了场景之后，证据包里
     /// 如果只写「模拟器」，模型就没法把结论和具体波形对上。
+    ///
+    /// # ⚠ AI 期间要用交接快照，不能按当前状态拼
+    ///
+    /// AI 跑的时候 GUI 是**断开**的：`connected=false`、`simulated=false`、
+    /// `port` 是空的。照着当前状态拼会输出「serial @ 921600」——
+    /// **把模拟器说成串口**，而且这话会进证据包、进锚点行，没人看得出来。
+    ///
+    /// 所以设备不在手上时，一律用交接那一刻的快照。
     pub(crate) fn link_description(&self) -> String {
+        if self.device_is_elsewhere() {
+            if let Some(h) = &self.drive.handoff {
+                return h.link.clone();
+            }
+        }
         if self.simulated {
             format!("sim({})", self.scenario.name())
         } else if self.port.trim().is_empty() {
@@ -212,6 +439,20 @@ impl App {
         } else {
             format!("{} @ {}", self.port, self.baud)
         }
+    }
+
+    /// 当前这份数据是不是模拟器产生的。
+    ///
+    /// 与 [`Self::link_description`] 同理：AI 期间按当前状态读会得到 `false`，
+    /// 于是证据包里那句「这是【模拟器】数据」就没了 ——
+    /// 而那正是最不该丢的一句。
+    pub(crate) fn evidence_simulated(&self) -> bool {
+        if self.device_is_elsewhere() {
+            if let Some(h) = &self.drive.handoff {
+                return h.simulated;
+            }
+        }
+        self.simulated
     }
 
     /// 面板顶部那行锚点，例如 `#3 · 4096 点 @ 857142 Hz · sim(i2c_100k) · 触发点 9`。
@@ -248,12 +489,22 @@ impl App {
         let link = self.link_description();
         let question = self.ai.question.trim();
 
+        // ⚠ 数据源与配置**都要走「设备不在手上时用交接快照」那条路** ——
+        // AI 期间按当前状态读会得到 simulated=false、config=None，
+        // 于是证据包里「这是模拟器数据」这句会消失，而那正是最不该丢的一句。
+        let simulated = self.evidence_simulated();
+        let config = if self.device_is_elsewhere() {
+            self.drive.handoff.as_ref().and_then(|h| h.config.as_ref())
+        } else {
+            self.config.as_ref()
+        };
+
         Some(scope_core::build_evidence(&scope_core::EvidenceInput {
             capture: cap,
             scale: &scale,
             link: &link,
-            simulated: self.simulated,
-            config: self.config.as_ref(),
+            simulated,
+            config,
             decode: self.decode.as_ref(),
             decode_cfg: Some(&self.decode_cfg),
             question: if question.is_empty() {
@@ -409,7 +660,7 @@ impl App {
 
 impl eframe::App for App {
     /// 非绘制逻辑。**worker 消息只在这里排空。**
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut pending: Vec<Update> = Vec::new();
         self.worker.drain(|u| pending.push(u));
         for u in pending {
@@ -431,6 +682,23 @@ impl eframe::App for App {
                     Some(("后台工作线程已退出".into(), Some("重启应用即可恢复".into())));
             }
         }
+
+        // ── AI 驱动会话 ──
+        //
+        // 先收事件（收进 Vec 再处理，避免在闭包里可变借走 App），
+        // 再推状态机。迟到的会话事件靠世代号丢弃。
+        let mut drive_events = Vec::new();
+        let mut gen = 0;
+        if let Some(h) = &self.drive.handle {
+            gen = h.generation;
+            h.drain(|e| drive_events.push(e));
+        }
+        for e in drive_events {
+            if self.drive.accepts(gen) {
+                self.apply_drive(e);
+            }
+        }
+        self.step_drive(ctx);
 
         // --demo：先连模拟器，连上了再采一次。
         // 用级联的 stage 而不是一个 bool —— 连接是异步的，得等回执。
@@ -536,6 +804,17 @@ impl eframe::App for App {
     /// 收尾。注意签名**不带 `glow::Context`** —— eframe 0.36 的默认渲染后端是
     /// wgpu，`glow` 是可选特性，没开时 trait 用的是这个无参版本。
     fn on_exit(&mut self) {
+        // ⚠ **先杀 AI 的子进程，再关 worker。**
+        //
+        // 从前这里只 shutdown worker。而 `scope-mcp` 子进程**不归它管** ——
+        // AI 跑着的时候关窗口，会留下一个**孤儿 `scope-mcp` 一直占着 COM7**，
+        // 下次开程序连不上，而且任务管理器里那个进程看起来跟本程序无关。
+        //
+        // `terminate()` 内部是 kill + wait：wait 不能省，Windows 上句柄没释放，
+        // 下次重连会偶发「端口被占用」。
+        if let Some(h) = self.drive.handle.take() {
+            h.terminate();
+        }
         self.worker.shutdown();
     }
 }

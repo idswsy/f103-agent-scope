@@ -18,11 +18,19 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
 
         let busy = app.is_busy();
         let connected = app.connected;
+        // 设备让给 AI 期间，这几个按钮点下去也够不到设备 —— 禁用，
+        // 并用 hover 说明**为什么**，否则用户会以为界面异常
+        let driving = app.device_is_elsewhere();
+        let why = "设备已交给 AI —— 左侧控件停用是交接的必然，不是界面故障";
 
-        if ui
-            .add_enabled(connected && !busy, egui::Button::new(acq_label(busy)))
-            .clicked()
-        {
+        let mut acq = ui.add_enabled(
+            connected && !busy && !driving,
+            egui::Button::new(acq_label(busy)),
+        );
+        if driving {
+            acq = acq.on_disabled_hover_text(why);
+        }
+        if acq.clicked() {
             app.worker.send(Request::Acquire {
                 samples: app.want_samples,
                 rate_hz: app.want_rate,
@@ -39,8 +47,11 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
             app.worker.cancel();
         }
 
-        if ui
-            .add_enabled(connected && !busy, egui::Button::new("复位"))
+        let mut rst = ui.add_enabled(connected && !busy && !driving, egui::Button::new("复位"));
+        if driving {
+            rst = rst.on_disabled_hover_text(why);
+        }
+        if rst
             .on_hover_text("RESET。设备进入 Fault 态后这是唯一的出路")
             .clicked()
         {
@@ -122,7 +133,12 @@ pub fn device(app: &mut App, ui: &mut egui::Ui) {
                         }
                     });
             });
-            if app.connected && ui.button("切换场景").clicked() {
+            if app.connected
+                && ui
+                    .add_enabled(!app.device_is_elsewhere(), egui::Button::new("切换场景"))
+                    .on_disabled_hover_text("设备已交给 AI")
+                    .clicked()
+            {
                 app.worker.send(Request::SetScenario(app.scenario));
             }
         }
@@ -162,7 +178,14 @@ pub fn device(app: &mut App, ui: &mut egui::Ui) {
             app.worker.send(Request::ListPorts);
         }
         if app.connected {
-            if ui.add_enabled(!busy, egui::Button::new("断开")).clicked() {
+            if ui
+                .add_enabled(
+                    !busy && !app.device_is_elsewhere(),
+                    egui::Button::new("断开"),
+                )
+                .on_disabled_hover_text("设备已交给 AI")
+                .clicked()
+            {
                 app.worker.send(Request::Disconnect);
             }
         } else if ui.add_enabled(!busy, egui::Button::new("连接")).clicked() {
@@ -284,7 +307,11 @@ pub fn config(app: &mut App, ui: &mut egui::Ui) {
         }
 
         ui.add_space(4.0);
-        if ui.button("应用到设备").clicked() {
+        if ui
+            .add_enabled(!app.device_is_elsewhere(), egui::Button::new("应用到设备"))
+            .on_disabled_hover_text("设备已交给 AI —— 它的改动由它自己下发")
+            .clicked()
+        {
             app.worker.send(Request::ApplyConfig {
                 rate_hz: app.want_rate,
                 samples: app.want_samples,
@@ -351,16 +378,25 @@ pub fn faults(app: &mut App, ui: &mut egui::Ui) {
         });
 
     ui.checkbox(&mut f.no_trigger, "永不触发")
-        .on_hover_text("验证「等触发超时」这条路不会卡死界面");
+        .on_hover_text("验证「等待触发超时」时界面不会阻塞");
     ui.checkbox(&mut f.force_overrun, "强制溢出")
-        .on_hover_text("验证界面会如实标记数据不完整，而不是假装正常");
+        .on_hover_text("验证界面会如实标记数据不完整");
 
     ui.horizontal(|ui| {
-        if ui.button("注入").clicked() {
+        let can_inject = !app.device_is_elsewhere();
+        if ui
+            .add_enabled(can_inject, egui::Button::new("注入"))
+            .on_disabled_hover_text("设备已交给 AI")
+            .clicked()
+        {
             app.worker
                 .send(Request::SetFaults(Box::new(app.faults.clone())));
         }
-        if ui.button("清除全部").clicked() {
+        if ui
+            .add_enabled(can_inject, egui::Button::new("清除全部"))
+            .on_disabled_hover_text("设备已交给 AI")
+            .clicked()
+        {
             app.faults = scope_sim::FaultInjection::default();
             app.worker
                 .send(Request::SetFaults(Box::new(app.faults.clone())));
@@ -1012,26 +1048,53 @@ pub fn ai_panel(app: &mut App, ui: &mut egui::Ui) {
 
     ui.add_space(6.0);
 
-    // ── 分析要求 ──
+    // ── 交出去 / 自己分析 ──
     let has_capture = app.capture.is_some();
     let can_start = app.ai.can_start() && has_capture;
     let running = app.ai.is_running();
+    let driving = app.device_is_elsewhere();
 
-    ui.label("分析要求（留空则对本次采集作一般性解释）");
+    ui.label("需求 / 分析要求");
     ui.add_enabled(
-        !running,
+        !running && !driving,
         egui::TextEdit::multiline(&mut app.ai.question)
             .desired_rows(2)
-            .hint_text("示例：该总线是否存在异常？"),
+            .hint_text("示例：看看这条总线上在发生什么"),
     );
 
     ui.horizontal(|ui| {
+        // 「交给 AI 采集」—— AI 接管设备，自行配置并按需重采
+        let can_drive = app.can_start_drive() && app.ai.cfg.has_key();
+        let drive_btn = ui.add_enabled(can_drive, egui::Button::new("交给 AI 采集"));
+        let drive_btn = if !app.connected {
+            drive_btn.on_disabled_hover_text("尚未连接设备。连接后方可交接。")
+        } else if !app.ai.cfg.has_key() {
+            drive_btn.on_disabled_hover_text("未配置 API 密钥。请在「设置」中填写。")
+        } else if driving {
+            drive_btn.on_disabled_hover_text("设备当前由 AI 持握。")
+        } else {
+            // 可用时也要说明它**做什么**。按钮上只放得下两个字，而它实际
+            // 会配置、按需重采并分析，期间设备控件全部停用。
+            drive_btn.on_hover_text(
+                "AI 接管设备：自行配置、采集并分析，必要时会重采。\
+                 期间界面上的设备控件停用；结束后设备自动交还。",
+            )
+        };
+        if drive_btn.clicked() {
+            app.start_drive();
+        }
+
+        // 「分析当前采集」—— 只解释屏幕上这一窗，不碰设备。
+        //
+        // 「当前」不是「这次」：代码里管这一窗就叫「当前采集」
+        // （`app.capture`、以及「结论对不上当前采集」那句提示），
+        // 界面上换个说法就是又一处同一件事两种叫法。
         let btn = egui::Button::new(if running {
             "分析中…"
         } else {
-            "开始分析"
+            "分析当前采集"
         });
-        let resp = ui.add_enabled(can_start, btn);
+        let resp = ui.add_enabled(can_start && !driving, btn);
         let resp = if !has_capture {
             resp.on_disabled_hover_text("无采集数据。请先连接设备并执行一次采集。")
         } else if !app.ai.cfg.has_key() {
@@ -1049,11 +1112,36 @@ pub fn ai_panel(app: &mut App, ui: &mut egui::Ui) {
         }
     });
 
+    // ── 设备在 AI 手上 ──
+    if driving {
+        ui.add_space(4.0);
+        ui.colored_label(
+            egui::Color32::from_rgb(230, 160, 30),
+            "⚠ 设备已交给 AI —— 左侧所有设备控件已停用",
+        );
+
+        // ⚠ 只在 `Running` 阶段给终止。
+        //
+        // `Disconnecting` 时会话还没起、句柄还是空的，点了什么也终止不了 ——
+        // 摆一个按下去没反应的按钮比不给更糟。而那个窗口只有约一秒
+        // （断开本身很快），之后就能终止了。
+        let can_stop = app.drive.phase == crate::drive::DrivePhase::Running;
+        if ui
+            .add_enabled(can_stop, egui::Button::new("终止"))
+            .on_disabled_hover_text("正在让出设备，会话尚未开始")
+            .clicked()
+        {
+            app.stop_drive();
+        }
+    }
+
     if running {
         ui.small("分析在后台线程执行，界面保持响应。分析期间可继续缩放、浏览历史或重新采集。");
     }
 
     ui.separator();
+
+    drive_section(app, ui);
 
     // ── 结果 ──
     if let Some(err) = app.ai.error.clone() {
@@ -1116,6 +1204,112 @@ pub fn ai_panel(app: &mut App, ui: &mut egui::Ui) {
         }
     });
     ui.small("分析结果仅保存在内存中，应用退出后不保留。如需留存请执行导出。");
+}
+
+/// AI 驱动会话的那一段：阶段 + 动作轨迹 + 结论 + 恢复设置。
+///
+/// # 为什么是「动作清单」而不是聊天记录
+///
+/// 示波器上选错时基或触发电平，会得到一份**看起来完全合理**的新波形，
+/// 而模型会带着同样的自信下结论 —— 错误是沉默的。用户恰恰是为了
+/// 「不再关心这些参数」才用这个功能，所以**「改了什么」必须看得见**。
+fn drive_section(app: &mut App, ui: &mut egui::Ui) {
+    use crate::drive::{DrivePhase, TrajectoryItem};
+
+    if app.drive.phase == DrivePhase::Idle && app.drive.trajectory.is_empty() {
+        return; // 没跑过 —— 不占地方
+    }
+
+    ui.heading("AI 动作");
+
+    // 阶段横幅
+    let (label, color) = match &app.drive.phase {
+        DrivePhase::Idle => ("已结束".to_string(), egui::Color32::GRAY),
+        DrivePhase::Disconnecting => ("正在让出设备…".to_string(), egui::Color32::YELLOW),
+        DrivePhase::Running => (
+            "AI 正在操作设备".to_string(),
+            egui::Color32::from_rgb(230, 160, 30),
+        ),
+        DrivePhase::Reconnecting => ("正在收回设备…".to_string(), egui::Color32::YELLOW),
+    };
+    ui.colored_label(color, label);
+
+    // 轨迹
+    egui::ScrollArea::vertical()
+        .id_salt("drive_trace")
+        .max_height(180.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for item in &app.drive.trajectory {
+                match item {
+                    TrajectoryItem::Phase(p) => {
+                        ui.small(egui::RichText::new(format!("· {p}")).weak());
+                    }
+                    TrajectoryItem::Call { name, args } => {
+                        ui.small(format!("→ {name}  {args}"));
+                    }
+                    TrajectoryItem::Result { name, ok, summary } => {
+                        let mark = if *ok { "✓" } else { "✗" };
+                        let text = format!("   {mark} {name}：{summary}");
+                        if *ok {
+                            ui.small(text);
+                        } else {
+                            ui.small(egui::RichText::new(text).color(egui::Color32::RED));
+                        }
+                    }
+                    // 警告要显眼 —— 它讲的往往是「用户以为已生效，实际未生效」
+                    TrajectoryItem::Warning(w) => {
+                        ui.small(
+                            egui::RichText::new(format!("   ⚠ {w}"))
+                                .color(egui::Color32::from_rgb(230, 160, 30)),
+                        );
+                    }
+                    TrajectoryItem::Capture {
+                        id,
+                        points,
+                        channels,
+                    } => {
+                        ui.small(format!(
+                            "   ▤ 采集 #{id}  {points} 点 × {channels} 通道 —— 已上屏"
+                        ));
+                    }
+                }
+            }
+        });
+
+    // AI 的最终结论
+    if let Some(text) = app.drive.final_text.clone() {
+        ui.add_space(4.0);
+        ui.label("结论");
+        // ⚠ 高度**随内容**，不写死。
+        //
+        // 写死 `desired_rows(10)` 时，一条一行的结论也占十行 ——
+        // 而它下面的「恢复交接前的设置」是「AI 改错了怎么改回去」的唯一入口，
+        // 被挤到滚动线以下就**不滚动看不到**，等于没有。
+        // （这个是盯着截图才发现的：读代码时那个按钮明明在那儿。）
+        let rows = text.lines().count().clamp(3, 16);
+        ui.add(
+            egui::TextEdit::multiline(&mut text.as_str())
+                .desired_width(f32::INFINITY)
+                .desired_rows(rows)
+                .font(egui::TextStyle::Monospace),
+        );
+    }
+
+    // 设备收回来之后才谈得上恢复设置
+    if app.drive.phase == DrivePhase::Idle && app.drive.handoff.is_some() {
+        ui.add_space(4.0);
+        if ui
+            .button(crate::drive::RESTORE_LABEL)
+            .on_hover_text("将「期望配置」填回交接时的值，由「应用到设备」下发")
+            .clicked()
+        {
+            app.restore_handoff_config();
+        }
+        ui.small("AI 的改动保留在设备上。左侧「配置」面板为设备回显值。");
+    }
+
+    ui.separator();
 }
 
 /// 设置区：key / 端点 / 模型。

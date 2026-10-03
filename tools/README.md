@@ -21,8 +21,7 @@ export DEEPSEEK_API_KEY=...        # 或 ANTHROPIC_API_KEY
 python tools/agent_demo/agent.py
 ```
 
-**零依赖** —— 只用 Python 标准库。它同时是一份**说明**：一个 MCP 客户端要多少代码，
-答案是一百多行。
+**零依赖** —— 只用 Python 标准库。它同时是一份**说明**：一个 MCP 客户端需要多少代码。
 
 产物是 [`docs/08-agent-walkthrough.md`](../docs/08-agent-walkthrough.md) ——
 一份真实跑出来的实录（不是整理的）。详见该目录的 README。

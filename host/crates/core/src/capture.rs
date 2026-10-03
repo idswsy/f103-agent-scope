@@ -327,7 +327,30 @@ impl CaptureStore {
     }
 
     /// 存入一次采集；超出容量时淘汰最旧的。
+    ///
+    /// # 同编号的旧条目会被替换掉（不是并列留存）
+    ///
+    /// 因为 [`Self::get`] 是按编号找**第一个**匹配 —— 一旦 store 里出现两个
+    /// 同编号的采集，`get` 就永远返回旧的那个，而调用方没有任何办法表达
+    /// 「我要的是新的那份」。
+    ///
+    /// 这个不变量是必须的：**设备每次（重）连之后编号会从 1 重新开始**
+    /// （模拟器 `SimDevice` 即如此），所以
+    ///
+    /// ```text
+    /// 连接 → 采集(#1) → 断开 → 连接 → 采集(#1) → ...
+    /// ```
+    ///
+    /// 是常规操作，不是边角情形。没有这条，历史面板会出现两行都写 `#1`、
+    /// 两行同时高亮（它只比编号），而点第二行显示的是**第一行的数据**。
+    ///
+    /// 替换而不是清空整个 store：历史是给人回看的，重连一次就全没了太糙；
+    /// 而按编号替换之后，`get` 的语义重新变得明确。
     pub fn push(&mut self, c: Capture) {
+        // 先摘掉同编号的旧条目（如果有）
+        if let Some(pos) = self.entries.iter().position(|old| old.id == c.id) {
+            self.entries.remove(pos);
+        }
         if self.entries.len() >= self.capacity {
             self.entries.pop_front();
         }
@@ -466,6 +489,83 @@ mod tests {
         assert_eq!(st.len(), 2);
         assert!(st.get(1).is_none(), "最旧的应被淘汰");
         assert!(st.get(3).is_some());
+    }
+
+    /// **同编号必须唯一 —— 否则 `get(id)` 永远拿到旧的那份。**
+    ///
+    /// 回归：`push` 从前是无条件 `push_back`，于是
+    ///
+    /// ```text
+    /// 连接 → 采集(#1) → 断开 → 连接 → 采集(#1)
+    /// ```
+    ///
+    /// 之后 store 里有两份 `#1`，而 `get(1)` 用 `.iter().find()` 返回**第一个**
+    /// —— 界面上表现为：历史面板两行都写 `#1`、两行同时高亮（它只比编号），
+    /// **点第二行显示的是第一行的数据**。
+    ///
+    /// 设备每次重连编号都会从 1 重新开始（模拟器 `SimDevice` 即如此），
+    /// 所以这是常规操作能走到的，不是边角情形。
+    #[test]
+    fn store_replaces_a_capture_with_the_same_id() {
+        let mut st = CaptureStore::default();
+        let mut old = Capture::new(1, 1000, 1, 8);
+        old.overrun = true; // 给旧的那份留个记号
+        let new = Capture::new(1, 2000, 1, 8);
+
+        st.push(old);
+        st.push(new);
+
+        assert_eq!(
+            st.len(),
+            1,
+            "同编号不该并列留存 —— get() 会永远拿到旧的那份"
+        );
+        let got = st.get(1).expect("应当还找得到");
+        assert_eq!(got.rate_hz, 2000, "拿到的应当是新的那份");
+        assert!(!got.overrun, "不该是旧的那份");
+    }
+
+    /// 替换**不该把不相关的采集挤掉** —— 它不占新槽位。
+    ///
+    /// ⚠ 这条测试第一版是假的：我选的场景（替换 1，然后断言 1 和 3 还在）
+    /// **在有无去重时结果相同** —— 淘汰掉的都是 1，断言照样过。
+    /// 是变异测试把它抓出来的（去掉去重只有另一条红，这条纹丝不动）。
+    ///
+    /// 换成能区分的场景：**替换的是 2，检查的是 1**。
+    ///
+    /// ```text
+    /// 有去重： [1, 2] → 摘掉旧的 2 → [1] → push 2' → [1, 2']   ← 1 保住
+    /// 无去重： [1, 2] → 计数已满 → 淘汰队首 1 → [2] → push 2' → [2, 2'] ← 1 丢了
+    /// ```
+    #[test]
+    fn replacing_a_capture_does_not_evict_an_unrelated_one() {
+        let mut st = CaptureStore::with_capacity(2);
+        st.push(Capture::new(1, 1000, 1, 1));
+        st.push(Capture::new(2, 1000, 1, 1));
+        st.push(Capture::new(2, 2000, 1, 1)); // 替换 2
+
+        assert!(
+            st.get(1).is_some(),
+            "替换 2 不该把 1 挤掉 —— 替换不占新槽位"
+        );
+        assert_eq!(st.get(1).unwrap().rate_hz, 1000, "1 应当原封不动");
+        assert_eq!(st.get(2).unwrap().rate_hz, 2000, "2 应当是新份");
+        assert_eq!(st.len(), 2);
+    }
+
+    /// 容量上限仍要守 —— 替换是「摘掉再放」，不是「无条件多放一个」。
+    #[test]
+    fn store_still_respects_capacity_after_a_replacement() {
+        let mut st = CaptureStore::with_capacity(2);
+        st.push(Capture::new(1, 1000, 1, 1));
+        st.push(Capture::new(2, 1000, 1, 1));
+        st.push(Capture::new(2, 2000, 1, 1)); // 替换
+        st.push(Capture::new(3, 1000, 1, 1)); // 这次才该淘汰
+
+        assert_eq!(st.len(), 2, "不能超过容量");
+        assert!(st.get(3).is_some(), "新采的应当在");
+        assert_eq!(st.get(2).unwrap().rate_hz, 2000, "2 是替换过的新份");
+        assert!(st.get(1).is_none(), "最旧的 1 这时才该被淘汰");
     }
 
     #[test]

@@ -34,11 +34,11 @@
 
 ## 这个项目在解决什么
 
-要的是一台**能被 AI Agent 直接操控**的调试仪器：AI 一句话就能抓波形、解协议、判断信号质量，不用人坐在示波器前拧旋钮。
+要的是一台**能被 AI Agent 直接操控**的调试仪器：AI 一句话即可完成抓波形、解协议、判断信号质量，无需人工逐项配置。
 
-平台是**立创开源《简易数字示波器设计（入门版）》插件底板 + STM32F103C8T6 核心板**。它给了模拟前端和一路比较器，同时留下三条硬件硬约束（**无以太网、无 FSMC、只有 2 个 ADC**）和一片空白的接口层 —— 整个软件栈就是围着这几件事展开的，详见 [`docs/00-origin.md`](docs/00-origin.md)。
+平台是**立创开源《简易数字示波器设计（入门版）》插件底板 + STM32F103C8T6 核心板**。它给了模拟前端和一路比较器，同时留下三条硬件硬约束（**无以太网、无 FSMC、只有 2 个 ADC**）和一片空白的接口层 —— 整个软件栈围绕这三条约束展开，详见 [`docs/00-origin.md`](docs/00-origin.md)。
 
-**核心设计选择是双通路**：I2C 解码的瓶颈不是采样率，而是**边沿时间精度**。857 kSPS 的 ADC 要解 400 kHz 需要 3.33 MSPS，还伴随采样相位拍频（两颗晶振 40 ppm 频差会让解码周期性时好时坏），这是采样体制问题，软件补不了。而板上那颗 **LM393 滞回比较器**接到定时器输入捕获后，直接给出 **72 MHz / 13.9 ns 的边沿时间戳**（等效 ~72 MSPS），只占一个定时器通道，不吃 ADC、不吃内存带宽。
+**核心设计选择是双通路**：I2C 解码的瓶颈不是采样率，而是**边沿时间精度**。857 kSPS 的 ADC 要解 400 kHz 需要 3.33 MSPS，还伴随采样相位拍频（两颗晶振 40 ppm 频差会使解码周期性失效），属采样体制的固有限制，软件层无法弥补。而板上那颗 **LM393 滞回比较器**接到定时器输入捕获后，直接给出 **72 MHz / 13.9 ns 的边沿时间戳**（等效 ~72 MSPS），只占一个定时器通道，不占用 ADC 与内存带宽。
 
 两条通路的分工：
 
@@ -47,7 +47,7 @@
 | **协议通路**（权威） | LM393 → TIM 输入捕获 | 解码 I2C 帧、时序、时钟拉伸 | 100k / 400k / 1MHz **全部可靠**，13.9 ns 分辨率 |
 | **模拟通路**（差异化） | TL072 → ADC | 电平裕量、上拉强度、振铃、边沿形状 | 100 kHz 保证 / 400 kHz 有条件 / 1 MHz 不支持 |
 
-这是 10 元逻辑分析仪永远给不了、而万元示波器才有的组合：**协议对不对** + **信号好不好**，一次说清。
+该组合为低成本逻辑分析仪所不具备：**协议是否正确** 与 **信号是否良好**，一次给出。
 
 ---
 
@@ -76,17 +76,13 @@ F103/
 ├─ docs/          设计文档 00~08（起源 / 架构 / 硬件 / 协议 / 性能边界 /
 │                 路线图 / 决策记录 / 开发环境 / Agent 工作流实录）
 ├─ proto/         协议唯一真相源：C 头文件 + 纯 C 编解码 + 双端共用的黄金测试向量
-├─ firmware/      STM32F103 固件（C，分层 App/Hardware）—— ⚠ 尚未实现，见该目录 README
+├─ firmware/      STM32F103 固件（C，分层 App/Hardware）
 ├─ host/          Rust workspace，8 个 crate：
 │                   proto · core · transport-serial · sim · device · cli · gui · mcp
-├─ hardware/      立创底板资料与改板设计 —— ⚠ 尚未整理，见该目录 README
-├─ tools/         独立工具：agent_demo（已实现）；i2c_decode / csv_export（仅规划）
+├─ hardware/      立创底板资料与改板设计
+├─ tools/         独立工具：agent_demo
 └─ .github/       CI：5 个 job（C 向量 / Rust / GUI / 固件分层检查 / 端到端冒烟）
 ```
-
-> **三个目录是空的**：`firmware/`（0 行代码）、`hardware/`（只有说明）、
-> `tools/i2c_decode` 与 `tools/csv_export`（只有规划）。它们保留在树里是为了
-> 说明**打算往哪放**，各自的 README 写了完整设计 —— 别把规划当成已有实现。
 
 **协议真相源策略**：固件用 C、上位机用 Rust，跨语言无法靠编译器保证一致。
 所以把 [`proto/tests/vectors.json`](proto/tests/vectors.json) 当作唯一契约 —— 同一份黄金向量由 Rust `#[test]` 和「不依赖 HAL 的纯 C 测试」两端同时执行，漂移在测试期暴露。
@@ -96,21 +92,21 @@ F103/
 ## 快速开始
 
 > 全部命令都在**仓库根目录**（`F103/`）执行。
-> ⚠ **`-o` 的相对路径是相对 `host/` 的**，不是相对你敲命令的地方 ——
+> ⚠ **`-o` 的相对路径是相对 `host/` 的**，不相对调用目录 ——
 > `run.sh` 会先 `cd` 到 `host/` 再调 cargo。想让它落在仓库根目录就写
 > `-o ../wave.csv` 或给绝对路径。
 >
 > 用 `./host/run.sh` 而不是裸 `cargo`。它做两件事：把 `CARGO_TARGET_DIR` 指到
-> 一个纯 ASCII 路径（历史包袱 —— 项目路径曾经含中文，MinGW 的 `ld.exe` 会链接失败；
+> 一个纯 ASCII 路径（历史原因：项目路径曾经含中文，MinGW 的 `ld.exe` 会链接失败；
 > 现在 checkout 到中文目录仍然会踩，所以保留），以及统一构建参数。
 > 详见 [`docs/07-dev-env.md`](docs/07-dev-env.md) 坑 #1。
 
-### 路线 A：没有硬件也能开发（推荐先走这条）
+### 路线 A：无硬件开发（建议优先）
 
 ```bash
 # 1. 协议测试：C 与 Rust 两端跑同一份黄金向量
 ./proto/run_tests.sh            # C 端，50 项
-./host/run.sh test              # Rust 端，**全部 ok 即通过**（不写死条数 —— 会腐烂）
+./host/run.sh test              # Rust 端，**全部通过即成功**（不写死条数，避免过期）
 
 # 2. 对着模拟器抓一次波形
 ./host/run.sh run -p scope-cli -- sim capture --scenario sine_1k_3v3 -n 1024 -o wave.csv
@@ -137,13 +133,13 @@ F103/
 > 界面上。不发送原始样点。密钥存于用户配置目录，**明文**，详见帮助页「注意事项」。
 >
 > 它与 MCP 那条路**不是二选一**：真机串口是独占的，GUI 占着串口时
-> `scope-mcp` 打不开同一个口 —— 所以「分析你屏幕上这一窗」只能在 GUI 进程内做。
+> `scope-mcp` 打不开同一个口 —— 所以「分析界面上正在显示的这一窗」只能在 GUI 进程内做。
 
 模拟器实现同一套 `DevicePort`，内含 F103 真实档位表、ARM/触发语义、状态机约束、
 seq 去重缓存，以及六种故障注入（丢帧 / CRC 错 / 延迟尖峰 / 永不触发 / 强制溢出）。
 MCP / CLI / GUI 切到 `sim` 后 **Agent 逻辑零改动**。
 
-> 它**不按波特率节流** —— 那样只会让测试变慢。链路的快慢只影响命令层估算超时。
+> 它**不按波特率节流** —— 那只会拖慢测试。链路的快慢只影响命令层估算超时。
 
 ### 路线 B：有硬件
 
@@ -158,7 +154,7 @@ MCP / CLI / GUI 切到 `sim` 后 **Agent 逻辑零改动**。
 固件工程**尚未创建**（P1 任务）—— `firmware/README.md` 写了完整的分层结构与采样架构，
 拿到板子后照着建。烧录用 DAP-Link，接线见那份文档。
 
-### 路线 C：把它接到你自己的 Agent 上
+### 路线 C：接入外部 Agent
 
 `scope-mcp` 是标准 MCP server，跑在 stdio 上。任何 MCP 客户端都能接：
 
@@ -170,7 +166,7 @@ claude mcp add scope -- <仓库绝对路径>/host/target/debug/scope-mcp.exe
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ./host/target/debug/scope-mcp.exe
 ```
 
-`tools/agent_demo/` 里有一个**零依赖的最小客户端**（一百多行 Python），
+`tools/agent_demo/` 里有一个**零依赖的最小客户端**，
 做的是同样的事：`tools/list` 拿 schema → 转成 LLM 的工具表 → 跑 tool-use 循环。
 它同时是 [`docs/08-agent-walkthrough.md`](docs/08-agent-walkthrough.md)
 那份实录的生成程序 —— 想改造自己的用法，从它改起最快。
@@ -179,18 +175,6 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ./host/target/d
 > `capture_id` 作废，下次从 1 重新开始。所以「抓完再读」必须把
 > `scope_capture` 与后续的 `scope_read_waveform` / `scope_measure` /
 > `scope_i2c_decode` **一次喂进同一个进程**。
-
----
-
-## 团队分工（3 人）
-
-| 角色 | 负责 | 主战场 |
-|---|---|---|
-| **固件** | ADC/DMA、触发、协议解析、I2C 数字解码、屏幕 UI | `firmware/`、`proto/protocol.c` |
-| **上位机** | Rust workspace、传输层、模拟器、CLI/GUI、测量算法 | `host/` |
-| **Agent / 硬件** | MCP 工具、Agent 工作流、改板设计、BOM、焊接与实测 | `host/crates/mcp/`、`hardware/` |
-
-三人都在 `docs/03-protocol.md` 上对齐 —— 改协议必须先改这里。
 
 ---
 
@@ -204,11 +188,6 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ./host/target/d
 | **P3** | MCP + Agent | ✅ 完成，见 [`docs/08`](docs/08-agent-walkthrough.md) | Agent 一句话完成"抓一次 I2C 写时序并告诉我为什么 NACK" |
 | **P4** | 增强 | ⚠️ GUI / 历史 / 导出 / **AI 分析面板**已做；改板与自动量程未做 | 双通道改板、自动量程、等效时间采样 |
 | **P5** | 主板升级 STM32F407 | ❌ 未开始（后期计划） | 以太网 / FSMC / 三 ADC 三重解锁：7.2 MSPS、深存储、直接传原始波形 |
-
-> **一句话现状**：软件栈（协议 / 上位机 / 模拟器 / GUI / MCP / Agent / GUI 内嵌 AI）
-> 已完整可跑，固件的 `App/` 层（硬件无关的那一半）也已做完并可在 PC 上测试。
-> **但没有硬件** —— `firmware/Hardware/` 与 Keil 工程是空的，串口路径
-> **从未与真机对过话**。所有演示都跑在内置模拟器上。
 
 详见 [`docs/05-roadmap.md`](docs/05-roadmap.md)。
 

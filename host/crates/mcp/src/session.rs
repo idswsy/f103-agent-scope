@@ -977,6 +977,23 @@ impl Session {
     }
 
     /// `scope_list_captures`。
+    ///
+    /// # 为什么带 `device_tick_us` / `wall_time` / `expected_samples`
+    ///
+    /// 这三个字段此前**没有任何出口**。对 Agent 来说无所谓（它只看统计量），
+    /// 但对「**在另一个进程里重建同一个 `Capture`**」就是硬缺口：
+    ///
+    /// | 字段 | 拿不到的后果 |
+    /// |---|---|
+    /// | `device_tick_us` | 重建时只能填 0 |
+    /// | `wall_time` | `Capture::new` 会填成本地 now —— **静默不同** |
+    /// | `expected_samples` | ⚠ **`report.rs` 的「点数少于期望」告警永远不触发** |
+    ///
+    /// 最后一条是真问题：那个告警存在的意义就是「传输有缺口时别假装数据完整」，
+    /// 而期望值拿不到，它就等于被永久静音了。
+    ///
+    /// 加了之后，这个方法同时成为镜像侧的**唯一元数据源** —— 重建一个
+    /// `Capture` 所需的非样点字段全在这里，不必再去别处凑。
     pub fn list_captures(&self) -> R {
         let list: Vec<Value> = self
             .store
@@ -990,6 +1007,10 @@ impl Session {
                     "duration_ms": c.duration_us() as f64 / 1000.0,
                     "trigger_index": c.trigger_index,
                     "overrun": c.overrun,
+                    // 重建 Capture 所需的另外三个字段
+                    "device_tick_us": c.device_tick_us,
+                    "wall_time": c.wall_time,
+                    "expected_samples": c.expected_samples,
                 })
             })
             .collect();
@@ -1801,6 +1822,76 @@ mod tests {
         let arr = caps["captures"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["channels"], 1, "留下的应是新场景（单通道）的采集");
+    }
+
+    /// `list_captures` 要能让**另一个进程**重建出同一个 `Capture`。
+    ///
+    /// 用途是「GUI 起 scope-mcp 子进程、自己当显示端点」那条路：
+    /// AI 在子进程里采，GUI 要把那一窗画出来。重建方**只有这个接口**，
+    /// 缺一个字段就意味着重建出来的东西与子进程里那份不同 —— 而且**静默**。
+    ///
+    /// 最要命的是 `expected_samples`：缺了它，`report.rs` 的
+    /// 「实际点数少于期望」告警永远不触发，等于把「传输有缺口」这件事静音了。
+    ///
+    /// 这条测试逐字段对照 store 里的原件 —— **任何字段被删掉都会红**，
+    /// 所以它同时守住了「旧字段一个不少」。
+    #[test]
+    fn list_captures_exposes_everything_needed_to_rebuild_a_capture() {
+        let mut s = connected();
+        let summary = s.capture(&args(json!({}))).unwrap();
+        let id = summary["capture_id"].as_u64().unwrap() as u16;
+        let stored = s.store.get(id).expect("刚采的应当在 store 里");
+
+        let caps = s.list_captures().unwrap();
+        let row = caps["captures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["capture_id"].as_u64() == Some(id as u64))
+            .expect("刚采的应当在列表里");
+
+        // —— 原有的字段 ——
+        assert_eq!(
+            row["rate_hz"].as_u64(),
+            Some(stored.rate_hz as u64),
+            "rate_hz"
+        );
+        assert_eq!(
+            row["sample_count"].as_u64(),
+            Some(stored.len() as u64),
+            "sample_count"
+        );
+        assert_eq!(
+            row["channels"].as_u64(),
+            Some(stored.channels.len() as u64),
+            "channels"
+        );
+        assert_eq!(row["overrun"].as_bool(), Some(stored.overrun), "overrun");
+        match stored.trigger_index {
+            Some(i) => assert_eq!(
+                row["trigger_index"].as_u64(),
+                Some(i as u64),
+                "trigger_index"
+            ),
+            None => assert!(row["trigger_index"].is_null(), "trigger_index 应为 null"),
+        }
+
+        // —— 重建 Capture 必需的三个字段 ——
+        assert_eq!(
+            row["device_tick_us"].as_u64(),
+            Some(stored.device_tick_us as u64),
+            "device_tick_us 缺了就只能填 0"
+        );
+        assert_eq!(
+            row["wall_time"].as_u64(),
+            Some(stored.wall_time),
+            "wall_time 缺了会被重建方填成本地 now —— 静默不同"
+        );
+        assert_eq!(
+            row["expected_samples"].as_u64(),
+            Some(stored.expected_samples as u64),
+            "expected_samples 缺了 → report.rs 的缺口告警永久静音"
+        );
     }
 
     #[test]
