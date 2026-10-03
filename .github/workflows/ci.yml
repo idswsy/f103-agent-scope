@@ -151,6 +151,15 @@ jobs:
           fi
           echo "✓ App/ 层保持硬件无关"
 
+      # 上一条只是 grep 兜底；**这一条才是真正的验收** ——
+      # 真把 App/ 编译一遍。App/ 一旦真的依赖了 HAL，include 路径里
+      # 没有那些头，这里直接编译不过。比 grep 可靠：grep 挡不住
+      # 间接依赖、宏、或者换个写法的 include。
+      - name: 在 PC 上编译并运行 App/ 的测试
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc
+          ./firmware/run_tests.sh
+
       - name: 检查关键文档存在
         run: |
           for f in docs/03-protocol.md docs/04-performance.md proto/tests/vectors.json; do

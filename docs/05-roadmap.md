@@ -41,6 +41,17 @@ cd host && cargo test       # Rust 端全部测试
 | CLI | `host/crates/cli/` | `scope-cli capture -o wave.csv` 能出图 |
 | 标定表 | `host/crates/core/src/calib.rs` | 用已知直流电压反推 LSB/V，写进配置文件 |
 
+**已经先做掉的一部分**（不需要板子）：
+
+| 交付物 | 位置 | 状态 |
+|---|---|---|
+| `App/` 看到的硬件接口 | `firmware/App/hal.h` | ✅ 纯函数指针，无寄存器 —— ADR-008 那条纪律的落点 |
+| 触发搜索 | `firmware/App/trigger.c` | ✅ 施密特迟滞状态机，**状态跨块保留**；`tests/test_trigger.c` 覆盖四个边界用例 |
+| 采集状态机 | `firmware/App/acq.c` | ✅ ARM → 搜触发（可跨块）→ 收尾 → DONE；含 auto 超时与溢出检测 |
+
+跑法：`./firmware/run_tests.sh` —— **不需要板子、不需要 Keil、不需要交叉编译**，
+CI 里也跑它。这正是那条分层的意义：三个人里两个人不拿板子也能改采集逻辑。
+
 **验收**：接一个 1 kHz 方波信号发生器，CLI 抓回来的波形用 Python 画出来，周期测量误差 < 2%。
 
 **注意**：这一阶段**先不要碰屏幕 UI**。屏幕是干扰项，先用串口把数据链路打通。
