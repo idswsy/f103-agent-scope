@@ -60,6 +60,21 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
             app.show_help = !app.show_help;
         }
 
+        ui.separator();
+        // AI 面板开关。运行中时按钮上带个点，这样面板被收起也看得出还在等结果。
+        let ai_label = if app.ai.is_running() {
+            "AI 分析 ●"
+        } else {
+            "AI 分析"
+        };
+        if ui
+            .selectable_label(app.ai.panel_open, ai_label)
+            .on_hover_text("把这次采集的测量、解码帧与信号质量发给大模型，让它给一段解释")
+            .clicked()
+        {
+            app.ai.panel_open = !app.ai.panel_open;
+        }
+
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some(st) = app.state {
                 let color = match st {
@@ -401,6 +416,11 @@ pub fn help_page(app: &mut App, ui: &mut egui::Ui) {
                 "上升时间的分辨率下限为 1 个采样周期。",
                 "频率与占空比已排除事务之间的空闲区间；非周期信号报出的是边沿速率。",
                 "协议解码走数字通路（LM393 比较器 + 定时器输入捕获），与 ADC 采样率无关；ADC 通路负责信号质量评估。",
+                "AI 分析结果的正确性不作保证。其输入为本次采集的测量值、解码帧与信号质量，\
+                 输出文本应视为注释而非测量数据。",
+                "API 密钥以明文存储于用户配置目录（Windows: %APPDATA%\\scope-gui\\config.json）。\
+                 本应用不提供加密存储；该文件不得置于项目目录之内（应用会拒绝写入此类路径）。",
+                "AI 分析结果仅保存在内存中，应用退出后不保留。如需留存须执行导出。",
             ];
             for (i, t) in notes.iter().enumerate() {
                 ui.label(format!("    {}. {t}", i + 1));
@@ -435,7 +455,7 @@ fn section(ui: &mut egui::Ui, title: &str, rows: &[(&str, &str)]) {
 pub fn history(app: &mut App, ui: &mut egui::Ui) {
     ui.heading("历史采集");
     if app.store.is_empty() {
-        ui.weak("还没有采集。采集一次后会留在这里，点一下就能回看。");
+        ui.weak("无采集记录。执行采集后，记录将保留于此处，可选中回看。");
         return;
     }
 
@@ -963,6 +983,254 @@ fn capture_path(cap: &scope_core::Capture, ext: &str) -> String {
     // 用采集编号 + 采样率命名，不用墙钟（避免依赖时间函数，也便于复现）
     let name = format!("cap{}_{}Hz.{}", cap.id, cap.rate_hz, ext);
     dir.join(name).to_string_lossy().into_owned()
+}
+
+/// 右侧的 AI 分析面板。
+///
+/// # 这一栏里最要紧的东西是那行锚点
+///
+/// 三个独立设计都把「拿模拟器的结论当成自己板子的结论」列为最严重的风险。
+/// 所以「这是第几次采集 / 是不是模拟器」必须**常显**，不能折叠、不能滚走。
+pub fn ai_panel(app: &mut App, ui: &mut egui::Ui) {
+    ui.heading("AI 分析");
+    ui.add_space(4.0);
+
+    // ── 分析对象：常显，不折叠 ──
+    let anchor = app.capture_anchor();
+    if app.simulated {
+        ui.colored_label(egui::Color32::from_rgb(230, 160, 30), format!("⚠ {anchor}"));
+        ui.small("数据源为模拟器。结论不适用于真实硬件。");
+    } else {
+        ui.label(&anchor);
+    }
+    ui.separator();
+
+    // ── 设置 ──
+    egui::CollapsingHeader::new("设置（密钥 / 端点 / 模型）")
+        .default_open(!app.ai.cfg.has_key())
+        .show(ui, |ui| config_section(app, ui));
+
+    ui.add_space(6.0);
+
+    // ── 分析要求 ──
+    let has_capture = app.capture.is_some();
+    let can_start = app.ai.can_start() && has_capture;
+    let running = app.ai.is_running();
+
+    ui.label("分析要求（留空则对本次采集作一般性解释）");
+    ui.add_enabled(
+        !running,
+        egui::TextEdit::multiline(&mut app.ai.question)
+            .desired_rows(2)
+            .hint_text("示例：该总线是否存在异常？"),
+    );
+
+    ui.horizontal(|ui| {
+        let btn = egui::Button::new(if running {
+            "分析中…"
+        } else {
+            "开始分析"
+        });
+        let resp = ui.add_enabled(can_start, btn);
+        let resp = if !has_capture {
+            resp.on_disabled_hover_text("无采集数据。请先连接设备并执行一次采集。")
+        } else if !app.ai.cfg.has_key() {
+            resp.on_disabled_hover_text("未配置 API 密钥。请在「设置」中填写。")
+        } else {
+            resp
+        };
+        if resp.clicked() {
+            start_analysis(app);
+        }
+
+        if running && ui.button("取消").clicked() {
+            app.ai.cancel();
+            app.note("AI 分析已取消。在途请求将于超时后返回，届时应标记为迟到结果。");
+        }
+    });
+
+    if running {
+        ui.small("分析在后台线程执行，界面保持响应。分析期间可继续缩放、浏览历史或重新采集。");
+    }
+
+    ui.separator();
+
+    // ── 结果 ──
+    if let Some(err) = app.ai.error.clone() {
+        ui.colored_label(egui::Color32::RED, format!("✗ {}", err.message));
+        ui.small(format!("处理：{}", err.hint));
+        ui.separator();
+    }
+
+    let Some(answer) = app.ai.answer.clone() else {
+        ui.weak("无分析结果。");
+        return;
+    };
+
+    // 结果对应的采集已经不是当前显示的那个 —— 这条必须显眼
+    if app
+        .ai
+        .answer_is_about_another_capture(app.capture.as_ref().map(|c| c.id))
+    {
+        ui.colored_label(
+            egui::Color32::from_rgb(230, 160, 30),
+            format!(
+                "⚠ 下列结论对应 {}，非当前显示的采集。",
+                app.ai.answer_anchor
+            ),
+        );
+    }
+    if app.ai.answer_late {
+        ui.weak("（该结果迟于请求返回：此前已取消，或已发起新的分析。）");
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        ui.small(format!("模型 {}", answer.model));
+        ui.small(format!("· 用时 {:.1} s", answer.elapsed.as_secs_f32()));
+        if answer.input_tokens > 0 || answer.output_tokens > 0 {
+            ui.small(format!(
+                "· {} + {} tokens",
+                answer.input_tokens, answer.output_tokens
+            ));
+        }
+    });
+    ui.add_space(4.0);
+
+    // 正文用等宽 + 可选中：结论里全是数字，等宽好读也好复制
+    ui.add(
+        egui::TextEdit::multiline(&mut answer.text.as_str())
+            .desired_width(f32::INFINITY)
+            .desired_rows(16)
+            .font(egui::TextStyle::Monospace),
+    );
+
+    ui.horizontal(|ui| {
+        if ui.button("复制").clicked() {
+            ui.ctx().copy_text(answer.text.clone());
+            app.note("AI 结论已复制到剪贴板。");
+        }
+        if ui.button("导出 .md").clicked() {
+            if let Some(cap) = app.capture.clone() {
+                export_answer(app, &cap, &answer);
+            }
+        }
+    });
+    ui.small("分析结果仅保存在内存中，应用退出后不保留。如需留存请执行导出。");
+}
+
+/// 设置区：key / 端点 / 模型。
+fn config_section(app: &mut App, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.label("密钥");
+        ui.add(
+            egui::TextEdit::singleline(&mut app.ai.cfg.api_key)
+                .password(!app.ai.show_key)
+                .desired_width(180.0)
+                .hint_text("sk-…"),
+        );
+        ui.toggle_value(&mut app.ai.show_key, "👁")
+            // ⚠ 不要在这里写 markdown —— egui 的 Label 与 tooltip 都**不渲染**它，
+            // 星号会原样显示。这个坑 HANDOFF 里记着，我还是踩了一次。
+            .on_hover_text("明文显示 / 掩码显示。明文显示状态下，请确认当前屏幕无未授权旁观者。");
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("端点");
+        // 占满剩余宽度：这个 URL 很长，写死宽度会把 "/messages" 的尾巴裁掉,
+        // 而**恰好是那一截**决定了它是不是 messages 接口。
+        ui.add(
+            egui::TextEdit::singleline(&mut app.ai.cfg.base_url)
+                .desired_width(ui.available_width())
+                .hint_text(scope_gui_default_url()),
+        );
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("模型");
+        ui.add(egui::TextEdit::singleline(&mut app.ai.cfg.model).desired_width(180.0));
+    });
+
+    ui.horizontal(|ui| {
+        if ui.button("保存到配置文件").clicked() {
+            let msg = app.ai.save_config();
+            app.note(format!("AI 配置：{msg}"));
+        }
+        if ui.button("恢复默认端点").clicked() {
+            app.ai.cfg.base_url = crate::config::DEFAULT_BASE_URL.to_string();
+            app.ai.cfg.model = crate::config::DEFAULT_MODEL.to_string();
+        }
+    });
+
+    // ⚠ `config_note` **不在此处呈现**。
+    //
+    // 它讲的是「文件在哪、存没存过」这类部署细节，属于文档内容而非操作界面内容 ——
+    // 常驻显示只会挤占面板，而且每次重绘都在重复同一句话。
+    // 保存动作本身会在日志里留下结果（见下面 `save_config` 的调用），
+    // 存储方式的完整说明见帮助页「注意事项」。
+    //
+    // 只有**异常**才当场提示：端点用了明文 HTTP 时 key 会以明文过网，这不是
+    // 部署细节而是当前会话的安全状态，必须让操作者看得见。
+    if app.ai.cfg.is_plaintext_endpoint() {
+        ui.colored_label(
+            egui::Color32::RED,
+            "⚠ 端点协议为 http://，API key 将以明文传输",
+        );
+    }
+}
+
+/// 默认端点（拿来做输入框的占位提示）。
+fn scope_gui_default_url() -> &'static str {
+    crate::config::DEFAULT_BASE_URL
+}
+
+/// 发起一次分析：先把证据包冻结下来，再交给 AI 线程。
+fn start_analysis(app: &mut App) {
+    let Some(evidence) = app.build_evidence() else {
+        app.note("无可分析的采集数据。");
+        return;
+    };
+    let Some(cap) = app.capture.as_ref() else {
+        return;
+    };
+    let capture_id = cap.id;
+    let anchor = app.capture_anchor();
+
+    // 证据包多大 —— 用户会想知道自己花了多少 token
+    let chars = evidence.chars().count();
+    if app.ai.start(evidence, capture_id, anchor) {
+        app.note(format!(
+            "AI 分析已发起（证据包 {chars} 字符，约 {} token）。",
+            chars / 3
+        ));
+    }
+}
+
+/// 把结论导出成 Markdown。
+fn export_answer(app: &mut App, cap: &scope_core::Capture, answer: &crate::ai::AiAnswer) {
+    let path = capture_path(cap, "ai.md");
+    let body = format!(
+        "# AI 分析 · 采集 #{}\n\n\
+         - 链路：{}\n\
+         - 采样率：{} Hz\n\
+         - 触发点：{}\n\
+         - 模型：{}（用时 {:.1} s，{} + {} tokens）\n\n\
+         ---\n\n{}\n",
+        cap.id,
+        app.link_description(),
+        cap.rate_hz,
+        cap.trigger_index
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "无".into()),
+        answer.model,
+        answer.elapsed.as_secs_f32(),
+        answer.input_tokens,
+        answer.output_tokens,
+        answer.text,
+    );
+    match std::fs::write(&path, body) {
+        Ok(()) => app.note(format!("AI 结论已导出至 {path}。")),
+        Err(e) => app.note(format!("导出失败：{e}。请检查 captures/ 目录的写权限。")),
+    }
 }
 
 fn decode_panel(app: &mut App, ui: &mut egui::Ui) {

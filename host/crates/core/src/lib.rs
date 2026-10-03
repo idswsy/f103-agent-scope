@@ -38,6 +38,7 @@ pub mod device;
 pub mod error;
 pub mod i2c_decode;
 pub mod measure;
+pub mod report;
 
 pub use acquire::{acquire, acquire_cancellable, AcquireParams, TriggerEvent};
 pub use capture::{
@@ -54,6 +55,7 @@ pub use i2c_decode::{
     I2cWarning, Levels, SignalQuality, Transaction,
 };
 pub use measure::{measure, Measurements};
+pub use report::{build_evidence, EvidenceInput, MAX_CHARS, MAX_FRAMES, PREVIEW_POINTS};
 
 // 重导出协议类型，让上层不必直接依赖 scope-proto
 pub use scope_proto::{
