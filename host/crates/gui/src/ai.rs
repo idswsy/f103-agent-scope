@@ -126,7 +126,7 @@ pub struct AiUpdate {
 /// # 其余每一条对应的失效模式
 ///
 /// 杜撰数值、将模拟器数据当作实测、对包络桶内细节作推断、信息不足时强行作答。
-const SYSTEM_PROMPT: &str = "\
+pub(crate) const SYSTEM_PROMPT: &str = "\
 你是一台数字示波器 / I2C 总线分析仪的分析助手。用户**已经看到**波形图与
 测量面板，你将收到一份证据包，内含 I2C 解码结果、信号质量与告警。
 

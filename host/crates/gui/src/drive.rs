@@ -634,6 +634,10 @@ pub fn run_session(
         let body = json!({
             "model": job.cfg.model,
             "max_tokens": MAX_TOKENS,
+            // ⚠ **必须带 system**。回归：第一版这里没有它 —— 模型既不知道
+            // 输出该收敛成什么形状，也不知道界面上的通道是 CH1/CH2，
+            // 于是把接口的 0 起编号原样转述给了用户。
+            "system": drive_system_prompt(),
             "tools": tools,
             "messages": messages,
         });
@@ -781,6 +785,43 @@ pub fn to_llm_tools(resp: &Value) -> Value {
         })
         .unwrap_or_default();
     Value::Array(tools)
+}
+
+/// 驱动会话的系统提示。
+///
+/// = 单发那一份（不复述、三节、模拟器声明、不得杜撰）
+/// **+ 通道编号的换算规矩** —— 那是这一条路特有的。
+///
+/// # 为什么必须有
+///
+/// 工具返回里的通道号是**接口的内部编号（0 起）**：
+///
+/// ```text
+/// scope_capture    → channels[].channel = 0, 1
+/// scope_i2c_decode → scl_channel = 0, sda_channel = 1
+/// ```
+///
+/// 而用户界面上显示的是 **CH1 / CH2（1 起）**。模型如实转述接口编号，
+/// 用户看到的就是「CH0 = SCL」—— **对不上屏幕上那两条泳道**。
+///
+/// 这是「同一件事两个编号」的老毛病，但两个编号各有理由：
+/// 一个是数组下标，一个是给人看的标签。**不通信才是缺陷** ——
+/// 所以规矩写在这里，而不是去改接口的编号。
+///
+/// 回归：第一版这条路上**根本没发 system prompt**，模型无从知道界面怎么编号。
+fn drive_system_prompt() -> String {
+    format!(
+        "{}\n\n\
+         ## 通道编号的换算（这一条务必遵守）\n\n\
+         工具参数与工具返回里的通道号（`channel` / `scl_channel` / `sda_channel`）\
+         **从 0 起**，那是接口的内部编号。\n\n\
+         用户界面上显示的是 **CH1 / CH2（从 1 起）**。**向用户表述时必须换算**：\n\n\
+         | 接口里的编号 | 界面上叫 |\n|---|---|\n\
+         | 0 | CH1 |\n| 1 | CH2 |\n\n\
+         直接把接口编号写进回答，用户会对不上屏幕上的波形。\
+         自己推理时用哪个都行，但**写给人看的文字一律用 CH1 / CH2**。",
+        crate::ai::SYSTEM_PROMPT
+    )
 }
 
 /// 发一次 LLM 请求。形状与 `ai.rs` 的单发一致，多一个 `tools`。
@@ -1269,6 +1310,34 @@ mod tests {
             rebuild_capture(&m, vec![vec![1]]).unwrap().trigger_index,
             None
         );
+    }
+
+    // ── 驱动会话的系统提示 ───────────────────────────────────────────
+
+    /// **驱动会话必须告诉模型界面上的通道编号。**
+    ///
+    /// 回归：这条路第一版**根本没发 system prompt**。模型只能看到工具返回里的
+    /// `channel: 0` / `scl_channel: 0`（接口的内部编号），于是把它原样写进回答 ——
+    /// 用户看到「CH0 = SCL」，**对不上屏幕上那两条泳道（CH1 / CH2）**。
+    ///
+    /// 这不是模型算错：界面用 1 起、接口用 0 起，**而没人告诉过它这件事**。
+    #[test]
+    fn the_drive_prompt_teaches_the_display_channel_numbering() {
+        let p = drive_system_prompt();
+
+        assert!(
+            p.contains("CH1") && p.contains("CH2"),
+            "必须点名界面上用的两个编号：{p}"
+        );
+        assert!(
+            p.contains("0 起"),
+            "必须说清工具返回里的编号是从 0 起的：{p}"
+        );
+        assert!(p.contains("必须换算"), "必须明确要求换算：{p}");
+
+        // 单发那份纪律也要带上 —— 不然这条路会退化成「只报数字」
+        assert!(p.contains("不要复述"), "应复用单发那份的反复述纪律：{p}");
+        assert!(p.contains("模拟器"), "应复用「数据源须声明」那条：{p}");
     }
 
     // ── 工具表转换 ───────────────────────────────────────────────────
