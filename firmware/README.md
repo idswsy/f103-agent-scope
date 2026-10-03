@@ -99,13 +99,16 @@ grep -rn '#include.*\(stm32\|hal_\|gd32\|HAL\)' firmware/App/ && exit 1 || exit 
 
 ## 数据链路选型
 
-核心板**没有板载串口桥**（不是 CH340），Type-C 直连 PA11/PA12。
+核心板**板载 USB 转串口**，Type-C 连接后即出现一个 COM 口。
 
 | 优先级 | 链路 | 引脚 | 需要的额外硬件 |
 |---|---|---|---|
-| **P1 期** | USART1 | PA9 / PA10 | 一个 USB-TTL 小板 |
-| **P2 起** | USB CDC | PA11 / PA12 | 无（板载 Type-C） |
+| **P1 期主力** | USART1（板载 USB 转串口） | PA9 / PA10 | 一根 Type-C 线 |
+| **P2 起备选** | USB CDC | PA11 / PA12 | 自写 USB device 固件 |
 | 🚫 **禁用** | ~~USART2~~ | ~~PA2 / PA3~~ | 硬冲突：PA2 = PWM 输出，PA3 = 模拟输入 |
+
+> 板载 USB 转串口的芯片型号与最高波特率 `【待核实】`。
+> 若板载桥实测不稳，可在 PA9 / PA10 外接 USB-TTL 小板替代。
 
 **无论是哪条，上层都用同一个 `App/proto_task.c`** —— 链路差异只在 `Hardware/link_*.c` 里。
 

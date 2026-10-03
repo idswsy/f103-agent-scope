@@ -1,75 +1,117 @@
 # F103 Agent Scope
 
-> 一台**可被 AI Agent 直接操控**的数字示波器 / I2C 总线分析仪。
-> 硬件 = 立创开源《简易数字示波器设计（入门版）》插件底板 + 立创·**地阔星** `LCKFB-DKX-STM32F103C8T6` 核心板。
+[![CI](https://github.com/idswsy/f103-agent-scope/actions/workflows/ci.yml/badge.svg)](https://github.com/idswsy/f103-agent-scope/actions/workflows/ci.yml)
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│  AI Agent (Claude / 任意 LLM)        AI 分析面板（GUI 内嵌）   │
-│      │ MCP (JSON-RPC)                     │ HTTPS + 密钥      │
-│  ┌───▼─────────┐                     ┌────▼──────────────┐   │
-│  │ MCP Server  │  ← 工具 schema      │ scope-gui         │   │
-│  │             │    由 Rust 类型生成  │ （人操作的界面）   │   │
-│  └───┬─────────┘                     └────┬──────────────┘   │
-│      └──────────────┬───────────────────────┘                │
-│  ┌──────────────────▼──┐                                     │
-│  │ 命令层 core         │  CommandBus：编码 / seq / 超时重试   │
-│  └──────────────────┬──┘                     / 状态缓存      │
-│      │ DevicePort (trait)                                    │
-│  ┌───┴────┬──────────┬──────────┐                            │
-│ 传输:UART  USB CDC   模拟器 sim                             │
-└──────┬───────────────────────────────────────────────────────┘
-       │  AA55 帧 / CRC16 / 分片
-┌──────▼───────────────────────────────────────────────────────┐
-│  STM32F103C8T6 固件                                           │
-│   ├─ 模拟通路：TIM3_TRGO → ADC1/ADC2 同步 → DMA1Ch1 → 8KB 环   │
-│   └─ 协议通路：LM393 滞回比较器 → TIM 输入捕获 (13.9ns)        │
-└──────────────────────────────────────────────────────────────┘
-```
-
-> 两条通向模型的路，**服务的场景不同**：左边由 AI 主导（它决定采什么），
-> 右边由人主导（AI 解释屏幕上这一窗）。真机串口独占，二者不能同时连同一台设备。
+> 一台可由 AI Agent 直接操控的数字示波器与 I2C 总线分析仪。
+> 硬件：立创开源《简易数字示波器设计（入门版）》插件底板 +
+> STM32F103C8T6 最小系统板。
 
 ---
 
-## 这个项目在解决什么
+## 1 概述
 
-要的是一台**能被 AI Agent 直接操控**的调试仪器：AI 一句话即可完成抓波形、解协议、判断信号质量，无需人工逐项配置。
+### 1.1 项目定位
 
-平台是**立创开源《简易数字示波器设计（入门版）》插件底板 + STM32F103C8T6 核心板**。它给了模拟前端和一路比较器，同时留下三条硬件硬约束（**无以太网、无 FSMC、只有 2 个 ADC**）和一片空白的接口层 —— 整个软件栈围绕这三条约束展开，详见 [`docs/00-origin.md`](docs/00-origin.md)。
+本项目实现一台可由 AI Agent 直接操控的调试仪器：Agent 通过 MCP 工具调用完成
+波形采集、协议解码与信号质量判定，无需人工逐项配置。
 
-**核心设计选择是双通路**：I2C 解码的瓶颈不是采样率，而是**边沿时间精度**。857 kSPS 的 ADC 要解 400 kHz 需要 3.33 MSPS，还伴随采样相位拍频（两颗晶振 40 ppm 频差会使解码周期性失效），属采样体制的固有限制，软件层无法弥补。而板上那颗 **LM393 滞回比较器**接到定时器输入捕获后，直接给出 **72 MHz / 13.9 ns 的边沿时间戳**（等效 ~72 MSPS），只占一个定时器通道，不占用 ADC 与内存带宽。
+适用场合为低频信号观察与总线协议调试（电源纹波、音频级信号、I2C/UART/SPI）。
+本项目不作为计量仪器使用，不提供绝对精度指标。
 
-两条通路的分工：
+### 1.2 双通路设计
 
-| 通路 | 硬件 | 用途 | 能力 |
+I2C 解码的瓶颈是边沿时间精度，不是采样率。857 kSPS 的 ADC 解 400 kHz I2C
+需要 3.33 MSPS，且存在采样相位拍频问题（主从两侧晶振 40 ppm 频差导致解码
+周期性失效），属采样体制的固有限制，软件层无法补偿。
+
+底板上的 LM393 滞回比较器接至定时器输入捕获后，直接输出 72 MHz / 13.9 ns
+的边沿时间戳（等效约 72 MSPS），不占用 ADC 与内存带宽。表 1 给出两条通路的分工。
+
+**表 1. 通路分工**
+
+| 通路 | 硬件路径 | 用途 | 能力 |
 |---|---|---|---|
-| **协议通路**（权威） | LM393 → TIM 输入捕获 | 解码 I2C 帧、时序、时钟拉伸 | 100k / 400k / 1MHz **全部可靠**，13.9 ns 分辨率 |
-| **模拟通路**（差异化） | TL072 → ADC | 电平裕量、上拉强度、振铃、边沿形状 | 100 kHz 保证 / 400 kHz 有条件 / 1 MHz 不支持 |
+| 协议通路（权威） | LM393 → TIM 输入捕获 | I2C 帧解码、时序、时钟拉伸 | 100 kHz / 400 kHz / 1 MHz 全部可靠，13.9 ns 分辨率 |
+| 模拟通路（差异化） | TL072 → ADC | 电平裕量、上拉强度、振铃、边沿形状 | 100 kHz 保证 / 400 kHz 有条件 / 1 MHz 不支持 |
 
-该组合为低成本逻辑分析仪所不具备：**协议是否正确** 与 **信号是否良好**，一次给出。
+两条通路互补：低成本逻辑分析仪只给出协议是否正确，本项目同时给出协议是否正确
+与信号是否良好。
 
----
+### 1.3 硬件平台
 
-## 性能承诺与边界
-
-见 [`docs/04-performance.md`](docs/04-performance.md)。摘要：
-
-| 指标 | F103 版本能做的 | 明确做不到的 |
+| 部件 | 型号 | 说明 |
 |---|---|---|
-| 采样率 | 单通道 **857 kSPS**；单通道交织 1.71 MSPS（仅显示）<br>⚠ 双通道同步 857 kSPS/路 **要等 P4 改板** —— 底板只有一路模拟输入（[ADR-010](docs/06-decisions.md)） | 1 MSPS 与 USB 并存；三 ADC 交织 7.2 MSPS（主板升级后，见路线图 P5） |
-| I2C 解码 | **100k / 400k / 1MHz 全部可靠**（走数字通路） | 不测 I2C 时序合规性（tSU;DAT / tr 的 ns 级验证） |
-| 模拟带宽 | ≤ 100 kHz 保证 | > 0.5 MHz |
-| 存储深度 | 单次 **4096 点**（8 KB 环） | 深存储、外扩 SRAM（C8 无 FSMC） |
-| 上传 | 单次采集 8 KB ≈ 12 ms（USB）/ 91 ms（921600） | 1 MSPS 原始连续流 |
-| 测量 | Vpp / 频率 / 占空比 / RMS（定点） | THD / SFDR；12-bit 绝对精度 |
+| 插件底板 | 立创开源《简易数字示波器设计（入门版）》 | 模拟前端、比较器、TFT、编码器、按键 |
+| 核心板 | STM32F103C8T6 最小系统板 | 64 KB Flash / 20 KB SRAM，板载 USB 转串口 |
 
-> **一句话定位**：低频 / 电源纹波 / 音频级观察 + I2C·UART·SPI 总线协议调试。
-> 不是计量仪器，是**给 AI 用的调试眼睛**。
+平台的硬件约束（无以太网、无 FSMC、2 个 ADC）与选型过程见
+[docs/00-origin.md](docs/00-origin.md)、[docs/02-hardware.md](docs/02-hardware.md)。
 
 ---
 
-## 仓库结构
+## 2 能力与边界
+
+完整推导见 [docs/04-performance.md](docs/04-performance.md)。表 2 为摘要。
+
+**表 2. 能力与边界**
+
+| 指标 | 支持 | 不支持 |
+|---|---|---|
+| 采样率 | 单通道 **857.14 kSPS**（12 bit）；单通道交织 **1.7143 MSPS**（仅显示，不作解码依据） | 1 MSPS 与 USB 并存；双通道同步 857 kSPS/路（需 P4 改板，见 7.2 节） |
+| 存储深度 | 单次 **4096 点**（8 KB 环） | 深存储、外扩 SRAM（C8 无 FSMC） |
+| I2C 解码 | **100 kHz / 400 kHz / 1 MHz 全部可靠**（数字通路） | 时序合规性验证（t<sub>SU;DAT</sub> / t<sub>r</sub> 的 ns 级判定） |
+| 模拟带宽 | ≤ 100 kHz 保证 | > 0.5 MHz |
+| 上传 | 单次 8 KB：USB 约 12 ms / UART 921600 约 91 ms | 1.71 MB/s 原始数据连续流 |
+| 测量 | Vpp / 频率 / 占空比 / RMS（定点） | THD / SFDR / ENOB；12 bit 绝对精度 |
+| 量程切换 | — | 自动量程（SW2/SW3 为机械开关，见 7.3 节） |
+
+> 采样率上限为 857.14 kSPS，**不得写作 1 MSPS**。推导：PCLK2 = 72 MHz 时
+> ADCCLK 经 /6 得 12 MHz（/2、/4 超出 14 MHz 上限），12 bit 最短转换时间
+> 1.5 + 12.5 = 14 个 ADCCLK，即 1.1667 µs/点。
+
+---
+
+## 3 系统架构
+
+```
+  外部 Agent（Claude Code 等）        桌面 GUI（scope-gui）
+        │                                  │          │
+        │  MCP over stdio            HTTPS + 密钥      │ 启动子进程
+        ▼                                  ▼          ▼
+  ┌──────────────┐              ┌──────────────┐  ┌──────────────┐
+  │  scope-mcp   │              │  AI 分析面板  │  │  scope-mcp   │
+  │  MCP Server  │              │  单次提问     │  │  AI 自采集    │
+  └──────┬───────┘              └──────┬───────┘  └──────┬───────┘
+         └──────────────┬──────────────┴─────────────────┘
+                        ▼
+              ┌──────────────────┐
+              │  scope-core 命令层 │  CommandBus：编码 / seq / 超时重试 / 状态缓存
+              └────────┬─────────┘
+                       │  DevicePort（trait，唯一解耦点，6 个方法）
+          ┌────────────┼────────────┐
+          ▼            ▼            ▼
+   UART 921600     USB CDC      模拟器 sim
+          └────────────┴────────────┘
+                       │  AA55 帧 / CRC16 / 分片
+              ┌────────▼─────────┐
+              │ STM32F103C8T6 固件 │
+              │  ├ 模拟通路：TIM3_TRGO → ADC1/ADC2 → DMA1Ch1 → 8 KB 环
+              │  └ 协议通路：LM393 → TIM 输入捕获（13.9 ns）
+              └──────────────────┘
+```
+
+通往模型共三条路径，适用场合不同：
+
+1. **外部 Agent 走 MCP**（`scope-mcp`）—— Agent 主导，自行决定采什么。
+2. **GUI「AI 分析」面板** —— 人工主导，模型解释当前显示的一窗。
+3. **GUI「交给 AI 采集」** —— GUI 将设备让给 `scope-mcp` 子进程并充当
+   MCP 客户端，由 Agent 自行配置、采集、分析；详见 5.4.4 节。
+
+真机串口为独占资源，三条路径不能同时连接同一台设备。
+
+---
+
+## 4 仓库结构
 
 ```
 F103/
@@ -84,167 +126,251 @@ F103/
 └─ .github/       CI：5 个 job（C 向量 / Rust / GUI / 固件分层检查 / 端到端冒烟）
 ```
 
-**协议真相源策略**：固件用 C、上位机用 Rust，跨语言无法靠编译器保证一致。
-所以把 [`proto/tests/vectors.json`](proto/tests/vectors.json) 当作唯一契约 —— 同一份黄金向量由 Rust `#[test]` 和「不依赖 HAL 的纯 C 测试」两端同时执行，漂移在测试期暴露。
+**协议真相源策略。** 固件用 C、上位机用 Rust，跨语言一致性无法由编译器保证。
+[`proto/tests/vectors.json`](proto/tests/vectors.json) 是唯一契约：同一份黄金向量
+由 Rust `#[test]` 与不依赖 HAL 的纯 C 测试两端执行，漂移在测试期暴露。
+协议变更需同时修改四处（`docs/03-protocol.md`、`proto/protocol.h`、
+`host/crates/proto/src/lib.rs`、黄金向量），见
+[docs/07-dev-env.md](docs/07-dev-env.md) §5。
 
 ---
 
-## 快速开始
+## 5 快速开始
 
-> 全部命令都在**仓库根目录**（`F103/`）执行。
-> ⚠ **`-o` 的相对路径是相对 `host/` 的**，不相对调用目录 ——
-> `run.sh` 会先 `cd` 到 `host/` 再调 cargo。想让它落在仓库根目录就写
-> `-o ../wave.csv` 或给绝对路径。
->
-> 用 `./host/run.sh` 而不是裸 `cargo`。它做两件事：把 `CARGO_TARGET_DIR` 指到
-> 一个纯 ASCII 路径（历史原因：项目路径曾经含中文，MinGW 的 `ld.exe` 会链接失败；
-> 现在 checkout 到中文目录仍然会踩，所以保留），以及统一构建参数。
-> 详见 [`docs/07-dev-env.md`](docs/07-dev-env.md) 坑 #1。
+全部命令在仓库根目录执行。构建一律使用 `./host/run.sh`，不使用裸 `cargo`：
+该脚本把 `CARGO_TARGET_DIR` 指向纯 ASCII 路径（MinGW 的 `ld.exe` 无法打开
+含中文的路径；详见 [docs/07-dev-env.md](docs/07-dev-env.md) 坑 #1），并统一构建参数。
 
-### 路线 A：无硬件开发（建议优先）
+> ⚠ `run.sh` 内部会 `cd` 到 `host/`，因此 `-o` 的相对路径相对 `host/` 解析。
+> 需要落在仓库根目录时写 `-o ../wave.csv` 或使用绝对路径。
+
+环境要求与安装命令见 [docs/07-dev-env.md](docs/07-dev-env.md) §1。
+
+### 5.1 无硬件验证
+
+以下四条全部通过即表示环境就绪，不需要硬件。
 
 ```bash
 # 1. 协议测试：C 与 Rust 两端跑同一份黄金向量
 ./proto/run_tests.sh            # C 端，50 项
-./host/run.sh test              # Rust 端，**全部通过即成功**（不写死条数，避免过期）
+./host/run.sh test              # Rust 端：要求所有 test result 为 ok（条数不写死）
+./firmware/run_tests.sh         # 固件 App 层，129 项断言，在 PC 上运行
 
-# 2. 对着模拟器抓一次波形
+# 2. 对模拟器采集一次波形
 ./host/run.sh run -p scope-cli -- sim capture --scenario sine_1k_3v3 -n 1024 -o wave.csv
 
-# 3. 看一眼 I2C 双通道是什么样
+# 3. 查看 I2C 双通道解码
 ./host/run.sh run -p scope-cli -- sim capture --scenario i2c_100k -n 2048 -o i2c.csv
+./host/run.sh run -p scope-cli -- sim i2c --scenario i2c_100k -n 4096
 
-# 4. 打开桌面 GUI（自动连模拟器并采集一帧）
-./host/run.sh run -p scope-gui -- --demo --scenario i2c_100k
-
-# 5. MCP 工具链自检
+# 4. MCP 工具链自检
 ./host/run.sh run -p scope-mcp -- --selftest
 ```
 
-> GUI 是一个 **egui 桌面应用**（`host/crates/gui`）：设备 / 配置 / 波形
-> （泳道显示、缩放平移、触发点、判决带）/ I2C 解码面板（双泳道 + 色标 +
-> 交易表 + 信号质量）/ 历史采集 / 测量 / **AI 分析面板** / 导出 /
-> 模拟器故障注入 / 帮助页。
-> `--demo` 免点击直接出图；去掉它就是正常的连接流程。
-> `--scenario <名字>` 指定初始场景，`--font <路径>` 换中文字体。
-
-> **AI 分析面板**（工具条上的「AI 分析」）：把当前采集**已经算好的**证据
-> （测量值、I2C 帧表、信号质量、minmax 包络）发给语言模型，结论直接显示在
-> 界面上。不发送原始样点。密钥存于用户配置目录，**明文**，详见帮助页「注意事项」。
->
-> 它与 MCP 那条路**不是二选一**：真机串口是独占的，GUI 占着串口时
-> `scope-mcp` 打不开同一个口 —— 所以「分析界面上正在显示的这一窗」只能在 GUI 进程内做。
-
 模拟器实现同一套 `DevicePort`，内含 F103 真实档位表、ARM/触发语义、状态机约束、
-seq 去重缓存，以及六种故障注入（丢帧 / CRC 错 / 延迟尖峰 / 永不触发 / 强制溢出）。
-MCP / CLI / GUI 切到 `sim` 后 **Agent 逻辑零改动**。
+seq 去重缓存，以及 6 个故障注入字段（丢帧 / CRC 错 / 延迟尖峰概率 / 尖峰时长 /
+永不触发 / 强制溢出）。CLI、GUI、MCP 切至 `sim` 后 Agent 逻辑无需改动。
+模拟器不按波特率节流；链路的实际速率只影响命令层的超时估算。
 
-> 它**不按波特率节流** —— 那只会拖慢测试。链路的快慢只影响命令层估算超时。
-
-### 路线 B：有硬件
+### 5.2 桌面 GUI
 
 ```bash
-# 先看看板子插在哪个口
+# 自动连接模拟器并采集一帧
+./host/run.sh run -p scope-gui -- --demo --scenario i2c_100k
+```
+
+`scope-gui` 为 egui/eframe 0.36 桌面应用，默认窗口 1180×760。面板组成：
+设备、配置、波形（泳道显示、缩放平移、触发点、判决带）、I2C 解码（双泳道 +
+色标 + 交易表 + 信号质量）、历史采集、测量、导出（CSV / 解码结果 / 结论 .md）、
+AI 分析、故障注入、日志、帮助。
+
+启动参数：
+
+| 参数 | 作用 |
+|---|---|
+| `--demo` | 免交互启动并采集一帧 |
+| `--scenario <名称>` | 指定初始场景 |
+| `--font <路径>` | 指定中文字体 |
+| `--drive "<需求>"` | 无窗口启动一次 AI 自采集会话，见 5.4.4 节 |
+
+### 5.3 连接实机
+
+```bash
+# 列出可用串口
 ./host/run.sh run -p scope-cli -- ports
 
-# 连真机抓波形（注意 --port/--baud 在 serial 之后、子命令之前）
+# 连接实机采集（--port / --baud 位于 serial 之后、子命令之前）
 ./host/run.sh run -p scope-cli -- serial --port COM3 --baud 921600 capture -n 2048 -o wave.csv
 ```
 
-固件工程**尚未创建**（P1 任务）—— `firmware/README.md` 写了完整的分层结构与采样架构，
-拿到板子后照着建。烧录用 DAP-Link，接线见那份文档。
+串口默认参数 921600 8N1。`firmware/App/` 的硬件无关层（hal / trigger / acq /
+proto_task，覆盖 17 条命令）已实现并通过 129 项断言；`firmware/Hardware/` 与
+Keil 工程尚未创建。烧录路径与接线见 [firmware/README.md](firmware/README.md)
+与 [docs/02-hardware.md](docs/02-hardware.md) §3。
 
-### 路线 C：接入外部 Agent
+### 5.4 接入 AI Agent
 
-`scope-mcp` 是标准 MCP server，跑在 stdio 上。任何 MCP 客户端都能接：
+#### 5.4.1 MCP 服务
+
+`scope-mcp` 是运行在 stdio 上的标准 MCP Server，每行一条 JSON-RPC 消息。
+注册 14 个工具：
+
+`list_devices`、`connect`、`disconnect`、`status`、`configure`、`capture`、
+`read_waveform`、`measure`、`i2c_decode`、`list_captures`、`save_capture`、
+`watch`、`sim_set_scenario`、`debug_raw`。
+
+`scope_debug_raw` 仅在环境变量 `SCOPE_MCP_DEBUG=1` 时注册，故默认 `tools/list`
+返回 13 个。工具的参数 schema 由 Rust 参数类型（schemars）现场生成，
+并有测试钉住「schema 声明的字段集等于实现能解析的字段集」。
 
 ```bash
-# Claude Code
+# 接入 Claude Code
 claude mcp add scope -- <仓库绝对路径>/host/target/debug/scope-mcp.exe
 
-# 或者直接跟任意客户端/脚本用 JSON-RPC 对话（一行一条消息）
+# 或直接以 JSON-RPC 对话
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ./host/target/debug/scope-mcp.exe
+
+# 查看工具清单与三层 token 防护说明
+./host/run.sh run -p scope-mcp -- --list-tools
 ```
 
-`tools/agent_demo/` 里有一个**零依赖的最小客户端**，
-做的是同样的事：`tools/list` 拿 schema → 转成 LLM 的工具表 → 跑 tool-use 循环。
-它同时是 [`docs/08-agent-walkthrough.md`](docs/08-agent-walkthrough.md)
-那份实录的生成程序 —— 想改造自己的用法，从它改起最快。
+**三层 token 防护。** `scope_capture` 与 `scope_watch` 默认只返回统计量与
+不超过 256 点的 minmax 预览；`scope_read_waveform` 分页返回，默认 512 点，
+硬上限 4096 点，超出请求直接拒绝而不截断；全量数据只写入 capture store 与磁盘。
 
-> ⚠ **`capture_id` 是进程内的。** 一次管道输入就是一个会话，进程退出后
-> `capture_id` 作废，下次从 1 重新开始。所以「抓完再读」必须把
+> ⚠ `capture_id` 的作用域是进程。一次管道输入即一个会话，进程退出后
+> `capture_id` 作废，下次从 1 重新开始。因此「先采集后读取」必须把
 > `scope_capture` 与后续的 `scope_read_waveform` / `scope_measure` /
-> `scope_i2c_decode` **一次喂进同一个进程**。
+> `scope_i2c_decode` 送入同一个进程。
+
+#### 5.4.2 参考客户端
+
+[`tools/agent_demo/`](tools/agent_demo/) 是一个零依赖的 MCP 客户端（仅用 Python
+标准库）：启动 `scope-mcp` 子进程 → `tools/list` 取得 schema → 转换为语言模型的
+工具表 → 运行 tool-use 循环直至模型给出结论。它同时是
+[docs/08-agent-walkthrough.md](docs/08-agent-walkthrough.md) 那份实录的生成程序。
+
+```bash
+./host/run.sh build -p scope-mcp
+export DEEPSEEK_API_KEY=...        # 或 ANTHROPIC_API_KEY
+python tools/agent_demo/agent.py
+```
+
+#### 5.4.3 GUI「AI 分析」面板
+
+将当前采集**已经算好的**证据（链路与设备信息、配置回显、采集统计、通道测量、
+32 桶 minmax 包络、I2C 帧表与信号质量）发送至语言模型，结论直接显示在界面上。
+证据包由 `scope_core::report::build_evidence` 生成，只转述 `scope_core::measure`
+与解码器的计算结果，不含原始样点数组；上限 8000 字符、64 帧。
+
+请求格式为 Anthropic Messages 格式，经 HTTPS 单发。配置存于用户配置目录
+（Windows：`%APPDATA%\scope-gui\config.json`），**密钥为明文存储**。
+默认端点为 `api.deepseek.com/anthropic/v1/messages`，默认模型 `deepseek-flash`。
+分析在独立线程执行，连接超时 10 s、总超时 60 s、`max_tokens` 2048。
+
+#### 5.4.4 GUI「交给 AI 采集」
+
+工具栏的「交给 AI 采集」按钮执行设备交接：断开 GUI 与设备的连接以释放串口，
+启动 `scope-mcp` 子进程并由 GUI 充当 MCP 客户端，运行语言模型的原生工具调用
+循环，由 Agent 自行配置、采集与分析。
+
+| 参数 | 取值 |
+|---|---|
+| 工具循环上限 | 24 轮 |
+| 单次模型请求 | 8192 tokens |
+| 单条工具结果上限 | 12000 字符（超出时带说明截断） |
+| LLM 超时 | 180 s |
+| JSON-RPC 超时 | 30 s |
+
+Agent 采集到的新波形由 GUI 自行调用 `scope_list_captures` 与
+`scope_read_waveform` 取回并显示，这些调用不进入模型消息。会话结束或失败时，
+GUI 按交接快照自动重连设备；运行期间可「终止」；设备收回后可用
+「恢复交接前的设置」还原交接前的配置。交接期间设备控件全部停用。
+
+以下是已知限制：
+
+- **AI 操作期间 GUI 无法访问设备。** 串口为独占资源，这是链路层的必然结果，
+  非界面设计选择。界面在此期间显示设备已交出。
+- **AI 修改过的 `range_idx` 与 `offset_lsb` 在重连后无法读回。** `GET_CONFIG`
+  不回报这两个字段，因此只能在动作轨迹中如实记录。
+- `connect` 工具被 GUI 钉死为交接快照中的目标，Agent 不能连接其他设备。
 
 ---
 
-## 路线图
+## 6 路线图
+
+**表 3. 路线图**
 
 | 阶段 | 目标 | 状态 | 验收标准 |
 |---|---|---|---|
-| **P0** | 协议闭环（无硬件） | ✅ 完成 | 黄金向量在 C 与 Rust 两端全绿；`sim` 能跑通 capture |
-| **P1** | 最简硬件闭环 | ⚠️ 固件的 `App/` 层**硬件无关部分已做完**（hal / trigger / acq / proto_task，129 项断言在 PC 上跑）；`Hardware/` 与 Keil 工程未做 | F103 采 2048 点 → 串口 → CLI 落 CSV → 能画图 |
-| **P2** | 数字通路 I2C 解码 | ⚠️ 主机侧完成，硬件侧 0 | 100k/400k/1MHz 真实总线解码结果与逻辑分析仪一致 |
-| **P3** | MCP + Agent | ✅ 完成，见 [`docs/08`](docs/08-agent-walkthrough.md) | Agent 一句话完成"抓一次 I2C 写时序并告诉我为什么 NACK" |
-| **P4** | 增强 | ⚠️ GUI / 历史 / 导出 / **AI 分析面板**已做；改板与自动量程未做 | 双通道改板、自动量程、等效时间采样 |
-| **P5** | 主板升级 STM32F407 | ❌ 未开始（后期计划） | 以太网 / FSMC / 三 ADC 三重解锁：7.2 MSPS、深存储、直接传原始波形 |
+| P0 | 协议闭环（无硬件） | 完成 | 黄金向量在 C 与 Rust 两端全绿；`sim` 可完成 capture |
+| P1 | 最简硬件闭环 | 进行中：固件 `App/` 层硬件无关部分已完成（129 项断言）；`Hardware/` 与 Keil 工程未创建 | F103 采 2048 点 → 串口 → CLI 落 CSV → 绘图 |
+| P2 | 数字通路 I2C 解码 | 进行中：主机侧完成，硬件侧未开始 | 100 kHz / 400 kHz / 1 MHz 实总线解码结果与逻辑分析仪一致 |
+| P3 | MCP + Agent | 完成，见 [docs/08](docs/08-agent-walkthrough.md) | Agent 一句话完成「抓一次 I2C 写时序并说明 NACK 原因」 |
+| P4 | 增强 | 进行中：GUI、历史、导出、AI 分析面板已完成；改板与自动量程未做 | 双通道改板、自动量程、等效时间采样 |
+| P5 | 主板升级 STM32F407（后期计划） | 未开始 | 以太网 / FSMC / 3 个 ADC：7.2 MSPS、深存储、原始波形直传 |
 
-详见 [`docs/05-roadmap.md`](docs/05-roadmap.md)。
-
----
-
-## ⚠️ 硬件上必须先知道的三件事
-
-详见 [`docs/02-hardware.md`](docs/02-hardware.md)。
-
-### 1. 核心板没有板载串口桥
-
-地阔星**没有** CH340——Type-C 直连 MCU 的 PA11/PA12。上游 GD32 版"插上 Type-C 就有 COM 口"的能力**随核心板更换而消失**。
-
-| 优先级 | 链路 | 引脚 |
-|---|---|---|
-| P1 期主力 | USART1 + 外接 USB-TTL | PA9 / PA10 |
-| P2 起主力 | USB CDC | PA11 / PA12 |
-| 🚫 **禁用** | ~~USART2~~ | ~~PA2 / PA3~~（PA2 是底板 PWM，PA3 是模拟输入，**硬冲突**） |
-
-协议层不关心底层链路，换链路**协议一个字都不用改**（见 [ADR-009](docs/06-decisions.md)）。
-
-### 2. 底板只有一路模拟输入
-
-BNC → TL072 → **PA3/ADC_IN3**。而 I2C 解码需要 SCL/SDA **两路同时刻采样**。
-三条路可选（见 [ADR-010](docs/06-decisions.md)）：
-
-1. **改板加第二路前端** → 真正的双通道 I2C 示波器（推荐，P4 做）
-2. **单通道 ADC + 一路数字**【P0–P3 就用这条】→ 一路走 ADC 看模拟质量，一路走 LM393 → PA6 捕获解协议
-3. **纯数字双通路** → 加一颗比较器，两路都走定时器捕获，放弃模拟视图
-
-### 3. 耦合与量程是机械开关
-
-SW2（AC/DC 耦合）与 SW3（X1/X50 衰减）都是手拨开关，**AI 无法程控**。
-自动量程要改板（换继电器/模拟开关）。
-
-> **触发电平不在此列** —— 它是软件判定的（固件拿样点和 `trigger_level_lsb`
-> 比较），可以程控。此处小标题曾经写成「触发电平与量程是机械开关」，
-> 与它自己的正文（只提 SW2/SW3）矛盾，会让人以为触发电平也设不了。
->
-> 另外，数字通路那颗 LM393 的阈值是**电阻分压固定的**
-> （`Uth=2.214 V / Utl=2.172 V`，见 [`docs/02-hardware.md`](docs/02-hardware.md) §5），
-> **不受 `SET_TRIGGER.level_lsb` 影响** —— 那个电平只管模拟通路的触发搜索。
+详见 [docs/05-roadmap.md](docs/05-roadmap.md)。
 
 ---
 
-## 许可与致谢
+## 7 硬件约束
 
-本项目是**派生作品**，必须遵守上游许可：
+完整内容见 [docs/02-hardware.md](docs/02-hardware.md)。
+以下三条直接影响软件能力边界，接线前必须确认。
+
+### 7.1 数据链路
+
+当前核心板板载 USB 转串口，Type-C 连接后即出现 COM 口，无需外接 USB-TTL 模块。
+
+**表 4. 数据链路选型**
+
+| 优先级 | 链路 | 引脚 | 说明 |
+|---|---|---|---|
+| 主力 | USART1（板载 USB 转串口） | PA9 / PA10 | 连接 Type-C 即用；921600 下 92 KB/s |
+| 备选 | USB CDC | PA11 / PA12 | 500–900 KB/s，需自行实现 USB device 固件 |
+| 🚫 禁用 | USART2 | PA2 / PA3 | PA2 为底板 PWM 输出，PA3 为模拟输入，硬冲突 |
+
+两条可用链路在操作系统层都表现为 COM 口，由同一个 `SerialDevice` 实现覆盖，
+协议层不受链路差异影响（[ADR-011](docs/06-decisions.md)）。
+
+> 板载 USB 转串口的芯片型号与最高波特率尚未核实，标记为 `【待核实】`。
+
+### 7.2 模拟输入只有一路
+
+底板只有一路模拟输入（BNC → TL072 → **PA3 / ADC_IN3**），而 I2C 解码需要
+SCL 与 SDA 两路同时刻采样。可选方案见 [ADR-010](docs/06-decisions.md)：
+
+1. **改板增加第二路前端** —— 完整的双通道模拟示波器，需改板与打样（P4）。
+2. **单路 ADC + 一路数字** —— P0–P3 采用此方案：一路经 ADC 观察模拟质量，
+   另一路经 LM393 → PA6 输入捕获解码协议。
+3. **纯数字双通路** —— 增加一颗比较器，两路均走定时器捕获，放弃模拟视图。
+
+### 7.3 耦合与量程为机械开关
+
+SW2（AC/DC 耦合）与 SW3（X1/X50 衰减）为手拨开关，AI 与固件均无法程控。
+自动量程需要改板（改用继电器或模拟开关，如 CD4053）。
+
+触发电平不受此限制：它由固件按采样值与 `trigger_level_lsb` 比较得出，可程控。
+
+数字通路所用 LM393 的阈值由电阻分压固定（`Uth = 2.214 V` / `Utl = 2.172 V`，
+见 [docs/02-hardware.md](docs/02-hardware.md) §5），不受 `SET_TRIGGER.level_lsb`
+影响；该参数只作用于模拟通路的触发搜索。
+
+---
+
+## 8 许可与致谢
+
+本项目的硬件设计基于以下上游开源工程，参考固件来自以下上游仓库。许可条款如下。
 
 | 上游 | 内容 | 许可 |
 |---|---|---|
-| [立创开源《简易数字示波器设计（入门版）》](https://oshwhub.com/course-examples/yi-qi-yi-biao-jian-yi-shu-zi-shi-bo-qi-she-ji-cha-jian-ban) | 硬件设计（原理图/PCB） | **GPL-3.0** |
+| [立创开源《简易数字示波器设计（入门版）》](https://oshwhub.com/course-examples/yi-qi-yi-biao-jian-yi-shu-zi-shi-bo-qi-she-ji-cha-jian-ban) | 硬件设计（原理图 / PCB） | **GPL-3.0** |
 | [chen11232/GD32E230-Oscilloscope](https://gitee.com/chen11232/GD32E230-Oscilloscope) | 参考固件源码 | **MulanPSL-2.0** |
 
-- 硬件派生作品**必须**同样以 GPL-3.0 开源。
-- 参考代码派生的固件部分遵从 MulanPSL-2.0。
-- 上游页面明文**禁止商业性使用**。
-- 本项目仓库整体以 **GPL-3.0** 发布以保证合规（见 [`LICENSE`](LICENSE) 与 [`NOTICE.md`](NOTICE.md)）。
+- 硬件部分为上游设计的修改版本，按 GPL-3.0 发布。
+- 参考固件派生的部分遵从 MulanPSL-2.0。
+- 上游页面明文禁止商业性使用。
+- 本仓库整体以 GPL-3.0 发布，见 [`LICENSE`](LICENSE) 与 [`NOTICE.md`](NOTICE.md)。
 
 致谢：立创开源硬件平台、立创EDA-莫工、EDA课程案例团队、chenlong。

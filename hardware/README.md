@@ -65,7 +65,7 @@
 
 | 器件 | 编号 | 数量 |
 |---|---|---|
-| STM32F103C8T6 核心板（地阔星） | C22396880 | 1 |
+| STM32F103C8T6 最小系统板（板载 USB 转串口） | 以实物为准 | 1 |
 | TL072IP | C110329 | 1 |
 | LM393P | C725322 | 1 |
 | XD7660 | C521200 | 1 |
@@ -108,15 +108,15 @@
 3. **探头电容**：4.7 kΩ 上拉下，探头电容必须 ≤15 pF，
    否则你自己的探头会把被测信号的上升沿拉过 I2C 的 300 ns 规格 ——
    **测出来的"信号完整性问题"是测量系统自造的**
-4. **禁止双路供电倒灌**：有社区帖指出地阔星核心板 Type-C 为直供
-   （VBUS 直连 5V，无二极管）。若底板经排针 5V 供电的同时又插核心板 Type-C，
-   存在倒灌风险 `【待测】`
+4. **禁止双路供电倒灌**：底板自带 Type-C（仅供电），核心板自带 Type-C
+   （供电 + 串口）。两者同时接入即为双路供电，是否有倒灌风险取决于当前
+   核心板的电源拓扑 `【待测】` —— 换板前那条社区帖的结论针对上一块板，不适用
 
 ---
 
 ## 4. 实板必测清单
 
-见 [`docs/02-hardware.md`](../docs/02-hardware.md) §9 —— **七项，拿到板子第一件事**。
+见 [`docs/02-hardware.md`](../docs/02-hardware.md) §9 —— **十二项，拿到板子第一件事**。
 
 测完请更新那份文档并去掉对应的 `【待测】` 标记。
 
@@ -129,8 +129,7 @@
 | 上游硬件工程 | <https://oshwhub.com/course-examples/yi-qi-yi-biao-jian-yi-shu-zi-shi-bo-qi-she-ji-cha-jian-ban> |
 | 上游开发 wiki（16 节教程） | <https://wiki.lceda.cn/zh-hans/course-projects/microcontroller/32-simple-oscilloscope/introduce.html> |
 | 上游参考代码 | <https://gitee.com/chen11232/GD32E230-Oscilloscope> |
-| 核心板官方文档 | <https://wiki.lckfb.com/zh-hans/dkx-stm32f103c8t6/> |
-| 核心板商城页 | <https://item.szlcsc.com/24005615.html> |
+| 上一块核心板资料（留档） | <https://wiki.lckfb.com/zh-hans/dkx-stm32f103c8t6/> |
 
 ### B 站视频教程（上游，16 集）
 

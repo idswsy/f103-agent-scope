@@ -323,7 +323,10 @@ Type-C 口，板载 USB 转串口）**，经用户 2026-10-04 确认并提供板
 **代价**：
 
 - P1 期手上多一个未核实的部件（板载串口桥的型号与最高波特率 `【待核实】`）
-- 旧文档里「没有板载串口桥」的措辞需要一并订正 —— 已改 `02-hardware.md` §4、`07-dev-env.md`
+- 旧文档里「没有板载串口桥」的措辞需要一并订正。已订正：`02-hardware.md`
+  §1–§4 / §9 / §10、`04-performance.md` §4、`07-dev-env.md` §4–§5、
+  `firmware/README.md`「数据链路选型」、`hardware/README.md`、`README.md`、
+  `host/crates/transport-serial/src/lib.rs` 模块注释
 
 **何时重新考虑**：若板载串口桥实测不稳，切 USB CDC（协议不变，只是要写 USB device 固件）。
 
