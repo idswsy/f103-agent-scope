@@ -12,10 +12,10 @@
 > | `App/hal.h` | ✅ App 层看到的硬件接口（纯函数指针，无寄存器） |
 > | `App/trigger.c` | ✅ 触发搜索（施密特迟滞状态机，**状态跨块保留**） |
 > | `App/acq.c` | ✅ 采集状态机（ARM → 搜触发 → 收尾 → DONE） |
+| `App/proto_task.c` | ✅ 命令分发（收字节 → 解析 → 执行 → 应答），17 条命令 |
 > | `App/measure.c` | ⏳ 待实现 |
 > | `App/i2c_decode.c` | ⏳ 待实现（数字通路，且本板只有一路比较器，见 ADR-010） |
-> | `App/proto_task.c` | ⏳ 待实现（`proto/protocol.c` 已提供解析器与编码器，这里主要是分发） |
-> | `App/ui.c` | ⏳ 待实现 |
+> > | `App/ui.c` | ⏳ 待实现 |
 > | `Hardware/*` | ❌ 需要板子 |
 >
 > 这一半能先做出来，靠的正是下面那条纪律 —— **`App/` 不碰 HAL，

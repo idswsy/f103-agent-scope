@@ -27,12 +27,16 @@ CFLAGS="-std=c11 -Wall -Wextra -Werror -O2 -g"
 # 这条不是风格问题：include 路径里没有 HAL，App/ 就算想 include 也找不到。
 INC="-I App -I ../proto"
 
+# `proto/protocol.c` 是与主机端共用的编解码（两端跑同一份黄金向量）——
+# 设备侧也要编它。这样「主机解出来的」与「设备发出去的」从构造上就是一套。
+PROTO_SRC="../proto/protocol.c"
+
 command -v "$CC" >/dev/null 2>&1 || { echo "找不到 C 编译器: $CC" >&2; exit 1; }
 
 mkdir -p "$BUILD"
 
 # App 层里被测试覆盖到的源文件。
-APP_SRC="App/trigger.c App/acq.c"
+APP_SRC="App/trigger.c App/acq.c App/proto_task.c"
 
 VERBOSE=0
 [ "${1:-}" = "-v" ] && VERBOSE=1
@@ -44,9 +48,8 @@ fail=0
 for src in tests/test_*.c; do
     name="$(basename "$src" .c)"
     echo "── $name"
-    if ! run "$CC" $CFLAGS $INC -o "$BUILD/$name" "$src" $APP_SRC; then
-        printf "  \033[31m编译失败\033[0m —— App/ 是不是 include 了 HAL？
-"
+    if ! run "$CC" $CFLAGS $INC -o "$BUILD/$name" "$src" $APP_SRC $PROTO_SRC; then
+        printf "  \033[31m编译失败\033[0m —— App/ 是不是 include 了 HAL？\n"
         fail=$((fail + 1))
         continue
     fi
