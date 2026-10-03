@@ -113,11 +113,17 @@ jobs:
         with:
           workspaces: host
 
-      # eframe 官方给出的 Linux 依赖，加上串口要的 libudev
+      # eframe 官方给出的 Linux 依赖，加上串口要的 libudev。
+      #
+      # `gcc` 是给 **ring** 装的：AI 分析面板引入的 ureq 走 rustls，
+      # 而 rustls 在 Linux 上默认用 ring 做密码学后端 —— ring 里有一段 C 和
+      # 汇编，`cc` crate 需要一个真正的 C 编译器才编得过。
+      # 运行器上通常自带 gcc，但**不假设**它一定在（本文件里
+      # firmware-layering 那个 job 就是这么做的，理由相同）。
       - name: 安装图形系统依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev pkg-config \
+          sudo apt-get install -y libudev-dev pkg-config gcc \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libssl-dev
 

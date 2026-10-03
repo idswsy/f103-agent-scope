@@ -9,6 +9,7 @@
 //! | 解码结果 | 本线程，脏标记缓存 | 4096 点解码很快，但没必要每帧重算 |
 //! | 「期望值」与「回显值」 | **分开存** | 采样率会被量化，界面必须能画出「请求 vs 实际」的差异 |
 
+use crate::ai::AiState;
 use crate::font::FontOutcome;
 use crate::msg::{Request, TransportKind, Update};
 use crate::panels;
@@ -96,6 +97,13 @@ pub struct App {
     pub(crate) show_help: bool,
     /// `--demo` 的状态机：0=未开始 1=已发连接 2=已发采集。
     demo_stage: u8,
+
+    // ── AI 分析 ──
+    /// AI 面板的全部状态（配置、在途请求、结果）。
+    ///
+    /// 单独成组是有意的：这块**不碰设备**，和 `worker` 那条链路没有任何交集
+    /// 除了「读当前采集」。共用一个 `AiState` 字段比往 `App` 上再摊十几个字段好读。
+    pub(crate) ai: AiState,
 }
 
 impl App {
@@ -109,6 +117,10 @@ impl App {
         let worker = Worker::spawn(ctx.clone());
         // 首启预选模拟器 + I2C 场景 —— 零硬件的人双击就能看到东西
         worker.send(Request::ListPorts);
+
+        // AI 状态与它的配置来源说明。**只调一次 `load`** ——
+        // 它内部会建 `AiWorker`、读一次配置文件，调两次就等于建了两个 worker。
+        let (ai, ai_note) = AiState::load(ctx.clone());
 
         let mut app = App {
             worker,
@@ -148,6 +160,8 @@ impl App {
             faults: scope_sim::FaultInjection::default(),
             show_help: false,
             demo_stage: if demo { 0 } else { 3 },
+
+            ai,
         };
 
         // 字体去向写进日志 —— 加载成功也留一条，方便排查「为什么中文是方框」
@@ -155,6 +169,20 @@ impl App {
             FontOutcome::Loaded { path } => app.note(format!("界面字体：{path}")),
             FontOutcome::NotFound { .. } => app.note("⚠ 未找到中文字体，中文会显示为方框"),
         }
+
+        // AI 配置的来源说明记入日志。
+        //
+        // **不放在面板上常驻显示**：它描述的是「文件在哪、读到没有」这类部署细节，
+        // 属于日志内容；放在操作界面上既挤占空间，又每次重绘都在重复同一句话。
+        // 密钥的存储方式与安全边界另见帮助页「注意事项」。
+        if let Some(note) = ai_note {
+            app.note(format!("AI 配置：{note}"));
+        }
+
+        // `--demo` 下把 AI 面板一并展开：这个开关的用途之一就是核对布局，
+        // 而收起状态的面板截不到任何东西（见 main.rs 里 `--demo` 那段注释）。
+        app.ai.panel_open = demo;
+
         app
     }
 
@@ -170,6 +198,70 @@ impl App {
     /// 是否有长操作在进行。
     pub(crate) fn is_busy(&self) -> bool {
         self.busy.is_some()
+    }
+
+    /// 链路的一句话描述（给证据包和界面用）。
+    ///
+    /// **模拟器要写出场景名**：用户在界面上换了场景之后，证据包里
+    /// 如果只写「模拟器」，模型就没法把结论和具体波形对上。
+    pub(crate) fn link_description(&self) -> String {
+        if self.simulated {
+            format!("sim({})", self.scenario.name())
+        } else if self.port.trim().is_empty() {
+            format!("serial @ {}", self.baud)
+        } else {
+            format!("{} @ {}", self.port, self.baud)
+        }
+    }
+
+    /// 面板顶部那行锚点，例如 `#3 · 4096 点 @ 857142 Hz · sim(i2c_100k) · 触发点 9`。
+    ///
+    /// **必须常显。** 没有它，用户会把模拟器上的结论当成自己板子的结论 ——
+    /// 这是三个独立设计里都被列为最严重的那条风险。
+    pub(crate) fn capture_anchor(&self) -> String {
+        let Some(cap) = &self.capture else {
+            return "（没有采集）".to_string();
+        };
+        let n = cap.channels.first().map(|c| c.len()).unwrap_or(0);
+        let trig = match cap.trigger_index {
+            Some(i) => format!(" · 触发点 {i}"),
+            None => " · 无触发".to_string(),
+        };
+        format!(
+            "#{} · {} 点 @ {} Hz · {}{}{}",
+            cap.id,
+            n,
+            cap.rate_hz,
+            self.link_description(),
+            trig,
+            if cap.overrun { " · ⚠溢出" } else { "" },
+        )
+    }
+
+    /// 把当前采集打包成证据包。**纯组装，不做任何计算** ——
+    /// 所有数字都是 core 已经算好的。
+    ///
+    /// 返回 `None` 表示还没有采集可分析。
+    pub(crate) fn build_evidence(&self) -> Option<String> {
+        let cap = self.capture.as_ref()?;
+        let scale = scope_core::ChannelScale::default();
+        let link = self.link_description();
+        let question = self.ai.question.trim();
+
+        Some(scope_core::build_evidence(&scope_core::EvidenceInput {
+            capture: cap,
+            scale: &scale,
+            link: &link,
+            simulated: self.simulated,
+            config: self.config.as_ref(),
+            decode: self.decode.as_ref(),
+            decode_cfg: Some(&self.decode_cfg),
+            question: if question.is_empty() {
+                None
+            } else {
+                Some(question)
+            },
+        }))
     }
 
     /// 处理一条 worker 回执。
@@ -324,6 +416,13 @@ impl eframe::App for App {
             self.apply(u);
         }
 
+        // AI 回执走**另一条通道**（另一条线程），同样先收集再应用。
+        let mut ai_pending = Vec::new();
+        self.ai.worker.drain(|u| ai_pending.push(u));
+        for u in ai_pending {
+            self.ai.apply(u);
+        }
+
         if self.worker.is_dead() {
             // worker 悄悄死了的话，UI 会永远转圈 —— 这是最坏的用户体验
             self.busy = None;
@@ -403,6 +502,24 @@ impl eframe::App for App {
                         .id_salt("detail_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| panels::detail_panel(self, ui));
+                });
+        }
+
+        // AI 面板：右侧独立一栏。
+        //
+        // 为什么不塞进底部的 `detail`：那里已经有测量 + 色标 + 质量 + 交易表，
+        // 再挤进去只会让两边都难读。右侧栏还有个好处 —— 分析结论可以和波形
+        // **并排**看，不用来回滚。
+        if self.ai.panel_open {
+            egui::Panel::right("ai")
+                .resizable(true)
+                .default_size(380.0)
+                .size_range(300.0..=640.0)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("ai_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| panels::ai_panel(self, ui));
                 });
         }
 

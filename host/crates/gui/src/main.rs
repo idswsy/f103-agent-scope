@@ -33,7 +33,9 @@
 
 use scope_sim::Scenario;
 
+mod ai;
 mod app;
+mod config;
 mod font;
 mod msg;
 mod panels;

@@ -17,6 +17,22 @@ scope-sim              = { workspace = true }
 scope-transport-serial = { workspace = true }
 scope-device           = { workspace = true }
 
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
 eframe    = { workspace = true }
 egui      = { workspace = true }
 egui_plot = { workspace = true }
+
+# AI 分析面板的 HTTP 客户端。
+#
+# **故意不放进 `[workspace.dependencies]`**：ureq 3.x 的 MSRV 是 1.85，而其余
+# crate 都声明 `rust-version = "1.75"`。只加在本 crate 里，那条 1.75 的承诺对
+# **不含 GUI 的构建路径**依然成立 —— 本 crate 因为 eframe 早就是 1.95 了。
+#
+# 选 ureq 而不是 reqwest 的理由是硬性的：`docs/01-architecture.md:22-24`
+# 写明全栈同步阻塞、不许引 async runtime。ureq 是阻塞式 API，正好。
+#
+# TLS 走 rustls + ring（已用 `cargo tree` 确认，**不是** aws-lc-rs ——
+# 后者要 CMake/NASM，Windows + MinGW 下编不过）。
+ureq = { version = "3.4.2", default-features = false, features = ["rustls", "gzip"] }
