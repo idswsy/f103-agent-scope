@@ -166,6 +166,33 @@ jobs:
           sudo apt-get update && sudo apt-get install -y gcc
           ./firmware/run_tests.sh
 
+      # ⚠ 这个坑是**静默**的，必须由 CI 兜住。
+      #
+      # 在 Windows 上提交脚本时，git 默认不跟踪可执行位（core.fileMode=false），
+      # 文件会以 100644 入库。本地跑 `./xxx.sh` 照样能跑（Windows 不看那个位），
+      # **只有在 Linux runner 上才炸**：`Permission denied`。
+      #
+      # 回归：`firmware/run_tests.sh` 就是这么进来的 —— CI 从加入它的那次合并
+      # 起连红三轮（240006d / 37c44a8 / b39b8c0），而本地完全复现不出来。
+      - name: 检查 CI 调用的脚本有可执行位
+        run: |
+          # 查的是 **git 索引里的模式**，不是文件系统上的 `-x`。
+          # 两头都重要：Windows 的 Git Bash 会把所有文件都报成可执行，
+          # 用 `[ -x ]` 在本地既能通过、又说明不了 runner 上会怎样。
+          # 索引里的 100755 / 100644 在两端是同一个值 —— 所以这条
+          # **本地就能验**，包括故意改回 100644 看它会不会红。
+          missing=0
+          for s in $(grep -oP '^\s*\./\K\S+\.sh' .github/workflows/ci.yml | sort -u); do
+            mode=$(git ls-files -s -- "$s" | awk '{print $1}')
+            if [ "$mode" != "100755" ]; then
+              echo "::error file=$s::CI 用 ./ 调用 $s，但它在 git 里是 ${mode:-（未跟踪）}，不是 100755"
+              echo "  在 Linux runner 上会 Permission denied。修：git update-index --chmod=+x $s"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "✓ CI 调用的脚本都有可执行位"
+
       - name: 检查关键文档存在
         run: |
           for f in docs/03-protocol.md docs/04-performance.md proto/tests/vectors.json; do
