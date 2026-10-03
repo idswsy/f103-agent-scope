@@ -881,6 +881,24 @@ mod tests {
         }
     }
 
+    /// 系统提示词有多大 —— 它是**每一轮**都要背的固定开销。
+    ///
+    /// 刻度尺测试：成本讨论里要引用这个数。
+    #[test]
+    fn the_system_prompt_stays_small() {
+        let n = SYSTEM_PROMPT.chars().count();
+        let cjk = SYSTEM_PROMPT
+            .chars()
+            .filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c))
+            .count();
+        println!("SYSTEM_PROMPT: {n} 字符（中文 {cjk} 字）");
+
+        assert!(
+            n < 1200,
+            "系统提示词 {n} 字符 —— 它每轮都要发一次，别让它膨胀"
+        );
+    }
+
     /// 输出必须收敛到「状态 / 问题 / 建议」三节 —— 用户要的是诊断，不是报告。
     #[test]
     fn system_prompt_asks_for_diagnosis_and_actions() {
@@ -1065,6 +1083,166 @@ mod tests {
     /// ```text
     /// ./host/run.sh test -p scope-gui -- --ignored live_endpoint
     /// ```
+    /// **量一次真实证据包的尺寸 —— 纯本地，不花钱、不联网。**
+    ///
+    /// 它复现 `live_single_shot_end_to_end` 里那次采集的全部输入，
+    /// 只是不把请求发出去。用来核对服务端报的 `input_tokens` 是否可信：
+    ///
+    /// ```text
+    /// ./host/run.sh test -p scope-gui -- --ignored measure_real_payload --nocapture
+    /// ```
+    #[test]
+    #[ignore = "要跑一次真实采集（本地），手动跑"]
+    fn measure_real_payload() {
+        use scope_core::{AcquireParams, ChannelScale, CommandBus, EvidenceInput};
+
+        let mut bus = CommandBus::new(scope_device::Transport::sim(scope_sim::Scenario::I2c100k));
+        bus.connect().expect("连模拟器失败");
+        let cap = scope_core::acquire(
+            &mut bus,
+            &AcquireParams {
+                samples: 4096,
+                rate_hz: scope_core::f103::MAX_SAMPLE_RATE_HZ,
+                trigger_level_lsb: 2048,
+                timeout: Duration::from_millis(2000),
+            },
+        )
+        .expect("采集失败");
+
+        let scale = ChannelScale::default();
+        let decode_cfg = scope_core::I2cDecodeConfig::default();
+        let decode = scope_core::decode_capture(&cap, &decode_cfg).ok();
+        let frames = decode.as_ref().map(|d| d.transactions.len()).unwrap_or(0);
+
+        let evidence = scope_core::build_evidence(&EvidenceInput {
+            capture: &cap,
+            scale: &scale,
+            link: "sim(i2c_100k)",
+            simulated: true,
+            config: bus.config.as_ref(),
+            decode: decode.as_ref(),
+            decode_cfg: Some(&decode_cfg),
+            question: Some("这条总线上的通信是否正常？有没有值得注意的地方？"),
+        });
+
+        let cfg = AiConfig {
+            api_key: "sk-placeholder".into(),
+            ..AiConfig::default()
+        };
+        let body = build_body(&cfg, &evidence).unwrap();
+
+        let ev = evidence.chars().count();
+        let sp = SYSTEM_PROMPT.chars().count();
+        println!("\n真实证据包   : {ev} 字符（{frames} 帧）");
+        println!("系统提示词   : {sp} 字符");
+        println!("请求体总长   : {} 字符", body.chars().count());
+        println!("两者合计     : {} 字符", ev + sp);
+        println!(
+            "\n（服务端上次报的输入是 239 token —— 拿这个字符数去对，\n \
+             若明显对不上，说明那个字段不能直接当成本依据）"
+        );
+    }
+
+    /// **真跑一次成功的单发分析 —— 端到端，用真 key，花真钱。**
+    ///
+    /// 手动执行（`--nocapture` 才能看到基线）：
+    ///
+    /// ```text
+    /// ./host/run.sh test -p scope-gui -- --ignored live_single_shot --nocapture
+    /// ```
+    ///
+    /// # 为什么必须有这一条
+    ///
+    /// 在此之前，**整条链只验过失败路径**（假 key → 401）。而「闭环 / 工具循环」
+    /// 这类扩展要搭在这条主干上 —— 主干从没成功过就往上盖，出问题时
+    /// 分不清是新增部分的 bug 还是主干本来就有的。
+    ///
+    /// 它也顺带把几件从未一起验过的事串起来：真采集 → 真证据包 → 真 HTTP →
+    /// 真解析 → 真用量。跑出来的数字就是后续的**基线**。
+    #[test]
+    #[ignore = "要外网 + 真 key + 花钱；手动跑"]
+    fn live_single_shot_end_to_end() {
+        use scope_core::{AcquireParams, ChannelScale, CommandBus, EvidenceInput};
+
+        // ── 1) 读用户机器上的真实配置 ──
+        let path = crate::config::default_config_path();
+        let (cfg, note) = crate::config::load(path.as_deref());
+        if let Some(n) = &note {
+            println!("配置来源：{n}");
+        }
+        assert!(
+            cfg.has_key(),
+            "配置里没有 key —— 先在 GUI 面板的「设置」里填好并保存"
+        );
+        println!("端点 {}  模型 {}", cfg.base_url, cfg.model);
+
+        // ── 2) 真采一窗（模拟器，i2c_100k）──
+        let mut bus = CommandBus::new(scope_device::Transport::sim(scope_sim::Scenario::I2c100k));
+        let info = bus.connect().expect("连模拟器失败");
+        println!(
+            "设备 {} 通道，采样率上限 {} Hz",
+            info.ch_count, info.rate_max_hz
+        );
+
+        let cap = scope_core::acquire(
+            &mut bus,
+            &AcquireParams {
+                samples: 4096,
+                rate_hz: scope_core::f103::MAX_SAMPLE_RATE_HZ,
+                trigger_level_lsb: 2048,
+                timeout: Duration::from_millis(2000),
+            },
+        )
+        .expect("采集失败");
+        println!(
+            "采集 #{} {} 点 @ {} Hz",
+            cap.id,
+            cap.channels[0].len(),
+            cap.rate_hz
+        );
+
+        // ── 3) 证据包（走真实路径：core 的 measure + decode）──
+        let scale = ChannelScale::default();
+        let decode_cfg = scope_core::I2cDecodeConfig::default();
+        let decode = scope_core::decode_capture(&cap, &decode_cfg).ok();
+        let evidence = scope_core::build_evidence(&EvidenceInput {
+            capture: &cap,
+            scale: &scale,
+            link: "sim(i2c_100k)",
+            simulated: true,
+            config: bus.config.as_ref(),
+            decode: decode.as_ref(),
+            decode_cfg: Some(&decode_cfg),
+            question: Some("这条总线上的通信是否正常？有没有值得注意的地方？"),
+        });
+        println!(
+            "\n── 证据包 {} 字符（约 {} token）──\n{evidence}\n",
+            evidence.chars().count(),
+            evidence.chars().count() / 3
+        );
+
+        // ── 4) 真发一次 ──
+        let cancel = AtomicBool::new(false);
+        let answer = ask(&cfg, &evidence, &cancel).expect("真实调用应当成功 —— 失败看上面的错误");
+
+        // ── 5) 打印基线 ──
+        println!("══ 基线 ══");
+        println!("模型      : {}", answer.model);
+        println!("用时      : {:.2} s", answer.elapsed.as_secs_f32());
+        println!("输入 token: {}", answer.input_tokens);
+        println!("输出 token: {}", answer.output_tokens);
+        println!("回复字数  : {}", answer.text.chars().count());
+        println!("\n── 回复全文 ──\n{}\n", answer.text);
+
+        // 断的是「真的拿到了东西」，不是措辞
+        assert!(!answer.text.trim().is_empty(), "回复是空的");
+        assert!(answer.input_tokens > 0, "服务端没报输入用量");
+        assert!(answer.output_tokens > 0, "服务端没报输出用量");
+
+        // 提示词要求「不复述界面上已有的数值」，模型应当给的是诊断而非抄数
+        println!("（人工核对：上面这段有没有在复述峰峰值/频率/占空比？）");
+    }
+
     #[test]
     #[ignore = "需要外网；手动跑：./host/run.sh test -p scope-gui -- --ignored live_endpoint"]
     fn live_endpoint_round_trip_maps_the_auth_error() {

@@ -33,7 +33,7 @@ use std::fmt::Write as _;
 
 use crate::capture::{Capture, ChannelScale};
 use crate::command::DeviceConfig;
-use crate::i2c_decode::{I2cDecode, I2cDecodeConfig};
+use crate::i2c_decode::{I2cDecode, I2cDecodeConfig, Transaction};
 use crate::measure::measure;
 
 /// 波形包络的**目标**桶数。
@@ -324,26 +324,20 @@ fn decode_section(s: &mut String, input: &EvidenceInput<'_>) {
     if d.transactions.is_empty() {
         let _ = writeln!(s, "（一帧都没解出来）");
     } else {
-        let _ = writeln!(s, "帧表:");
+        let _ = writeln!(
+            s,
+            "帧表（每个地址 / 数据字节后的 +A = 从机应答，+N = 从机未应答）:"
+        );
         for (i, t) in d.transactions.iter().take(MAX_FRAMES).enumerate() {
-            let bytes: Vec<String> = t.bytes.iter().map(|b| format!("{b:02X}")).collect();
+            let payload = frame_payload(t);
             let _ = writeln!(
                 s,
-                "  #{:<3} t={:>9.3} ms  {}{}{}{}",
+                "  #{:<3} t={:>9.3} ms  {}{}  {}",
                 i + 1,
                 t.start_time_us as f64 / 1000.0,
                 if t.repeated { "Sr " } else { "" },
-                t.address_str(),
-                if bytes.is_empty() {
-                    String::new()
-                } else {
-                    format!("  数据: {}", bytes.join(" "))
-                },
-                if t.complete {
-                    ""
-                } else {
-                    "  ⚠被窗口截断"
-                },
+                payload,
+                if t.complete { "" } else { "⚠被窗口截断" },
             );
         }
         let extra = d.transactions.len().saturating_sub(MAX_FRAMES);
@@ -405,6 +399,53 @@ fn footer_section(s: &mut String, input: &EvidenceInput<'_>) {
             let _ = writeln!(s, "== 用户的问题 ==");
             let _ = writeln!(s, "{q}");
         }
+    }
+}
+
+/// 把一帧渲染成「地址 / 数据字节 + 应答位」的紧凑串。
+///
+/// # 为什么应答位必须出现
+///
+/// **对 I2C 诊断来说，从机有没有应答是最要紧的一位。**
+/// 本项目 P3 的验收场景就是「告诉我为什么 NACK」—— 帧表里没有这一位，
+/// 证据包就根本答不了那个问题。
+///
+/// 回归：这张表曾经只印地址和字节值，把 `acked` 整个丢了，
+/// 而 `to_text()`（GUI 导出用的那份）是一直带着它的 —— 两份描述又漂了。
+/// **是一次真跑的模型回复指出来的**：它说「帧表未列出 ACK/NAK 位，
+/// 从机是否应答无法从证据确认」。这种「缺失」只有拿真实数据跑才看得见。
+///
+/// 格式取 `+A` / `+N`：一行一帧，且 19 帧的常见情形下只多几十个字符。
+fn frame_payload(t: &Transaction) -> String {
+    use crate::i2c_decode::EventKind;
+    let mut s = String::new();
+    for ev in &t.events {
+        match &ev.kind {
+            EventKind::Address(a) => {
+                let _ = write!(
+                    s,
+                    "0x{:02X}({}){}  ",
+                    a.value,
+                    if a.read { "R" } else { "W" },
+                    ack_mark(a.acked)
+                );
+            }
+            EventKind::Data { value, acked } => {
+                let _ = write!(s, "{value:02X}{}  ", ack_mark(*acked));
+            }
+            // START / STOP / 截断标记在帧级别已经表达过了，不重复
+            _ => {}
+        }
+    }
+    s.trim_end().to_string()
+}
+
+/// 应答位的紧凑标记。
+fn ack_mark(acked: bool) -> &'static str {
+    if acked {
+        "+A"
+    } else {
+        "+N"
     }
 }
 
@@ -524,6 +565,60 @@ mod tests {
         cap
     }
 
+    /// 造一份**地址被应答、但随后的数据字节被 NACK** 的采集。
+    ///
+    /// ACK 与 NACK 的区别只在第 9 个时钟的 SDA 电平：从机拉低 = 应答，
+    /// 放手（保持高）= 未应答。所以这里地址位之后送 `bit!(false)`、
+    /// 数据位之后送 `bit!(true)`。
+    fn nacked_i2c_capture() -> Capture {
+        let rate = 800_000u32;
+        let mut scl: Vec<u16> = Vec::new();
+        let mut sda: Vec<u16> = Vec::new();
+
+        macro_rules! hold {
+            ($sv:expr, $dv:expr, $n:expr) => {
+                for _ in 0..$n {
+                    scl.push($sv);
+                    sda.push($dv);
+                }
+            };
+        }
+        macro_rules! bit {
+            ($sv:expr) => {{
+                let d = if $sv { HIGH } else { LOW };
+                for _ in 0..4 {
+                    scl.push(LOW);
+                    sda.push(d);
+                }
+                for _ in 0..4 {
+                    scl.push(HIGH);
+                    sda.push(d);
+                }
+            }};
+        }
+        macro_rules! byte_with_ack {
+            ($b:expr, $acked:expr) => {{
+                for i in (0..8).rev() {
+                    bit!(($b >> i) & 1 == 1);
+                }
+                bit!(!$acked); // 应答 = SDA 拉低；未应答 = 放手保持高
+            }};
+        }
+
+        hold!(HIGH, HIGH, 4);
+        hold!(HIGH, LOW, 4); // START
+        hold!(LOW, LOW, 4);
+        byte_with_ack!(0x88u8, true); // 地址：被应答
+        byte_with_ack!(0x00u8, false); // 数据：被 NACK
+        hold!(LOW, LOW, 4);
+        hold!(HIGH, LOW, 4);
+        hold!(HIGH, HIGH, 4); // STOP
+
+        let mut cap = Capture::new(9, rate, 2, scl.len() as u32);
+        cap.channels = vec![scl, sda];
+        cap
+    }
+
     /// 造一份直流采集 —— 没有边沿，所以频率/占空比/上升时间都测不出。
     fn flat_capture() -> Capture {
         let mut cap = Capture::new(2, 800_000, 2, 512);
@@ -620,6 +715,105 @@ mod tests {
             !text.contains("不要把「帧数」当成「完整事务笔数」"),
             "全收尾的数据不该出现截断说明（否则是天天响的假警报）\n{text}"
         );
+    }
+
+    // ── 应答位：I2C 诊断里最要紧的一位 ───────────────────────────────
+
+    /// **帧表必须带从机应答位。**
+    ///
+    /// 回归：这张表曾经只印地址与字节值，把 `acked` 整个丢了。后果不是
+    /// 「少了个字段」，而是**证据包根本答不了本项目 P3 的验收问题
+    /// 「告诉我为什么 NACK」** —— 模型只能回一句「从机是否应答无法从证据确认」。
+    ///
+    /// 发现方式值得记：它不是被测试抓到的，是**一次真跑的模型回复**指出来的。
+    /// 「信息缺失」这类问题，代码读一百遍也看不出来 —— 因为缺的东西不在那里。
+    /// ⚠ **必须断言在数据行上，不能断言整段文本。**
+    ///
+    /// 第一版这两条测试是这么写的：`assert!(text.contains("+A"))`。
+    /// 看起来没问题 —— 但帧表上面那行**图例**里就写着「+A = 从机应答」，
+    /// 于是把 `ack_mark()` 改成恒返回空串，断言照样通过。
+    /// **测试证明不了它要证明的事**，是变异测试把它抓出来的。
+    ///
+    /// 所以这里直接对 [`frame_payload`] 断言 —— 那个函数里没有图例，
+    /// 只有真正的数据。
+    fn payload_of(cap: &Capture) -> Vec<String> {
+        let d = decode_capture(cap, &I2cDecodeConfig::default()).unwrap();
+        d.transactions.iter().map(frame_payload).collect()
+    }
+
+    #[test]
+    fn frame_table_carries_the_acknowledge_bit() {
+        let cap = i2c_capture(true);
+        let payloads = payload_of(&cap);
+        assert!(!payloads.is_empty(), "测试数据没解出帧");
+
+        // 数据行里必须真的出现应答标记
+        assert!(
+            payloads.iter().any(|p| p.contains("+A")),
+            "数据行里没有应答位 —— 模型无法判断从机是否应答：{payloads:?}"
+        );
+        // **每一个**地址 / 数据字节后面都要有，不能只标一个。
+        //
+        // （这里第一版写错过：拿「以 0x 开头的 token 数」去比「带标记的 token 数」，
+        //   而一帧里地址和数据字节各一个 —— 2 ≠ 1 就被判红了。
+        //   要断言的是「所有 token 都带标记」，不是两个计数相等。）
+        let tokens: Vec<&str> = payloads.iter().flat_map(|p| p.split_whitespace()).collect();
+        assert!(!tokens.is_empty(), "数据行是空的：{payloads:?}");
+        for t in &tokens {
+            assert!(
+                t.ends_with("+A") || t.ends_with("+N"),
+                "「{t}」没有带应答位 —— 有字节被漏掉了：{payloads:?}"
+            );
+        }
+    }
+
+    /// NACK 必须能被看出来，且**不能和 ACK 混淆**。
+    ///
+    /// 用带 NACK 的数据（地址被应答、随后的写被拒）验一遍：
+    /// 同一个帧里应当同时出现 `+A` 与 `+N`。
+    #[test]
+    fn a_nack_is_visible_and_distinguishable() {
+        let cap = nacked_i2c_capture();
+        let d = decode_capture(&cap, &I2cDecodeConfig::default()).unwrap();
+
+        // 前提：这份数据里确实有 NACK，否则测试是假通过的
+        assert!(
+            d.transactions.iter().any(|t| t.has_nack()),
+            "测试数据里没有 NACK —— 这条测试失去意义"
+        );
+
+        let joined = d
+            .transactions
+            .iter()
+            .map(frame_payload)
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        assert!(joined.contains("+N"), "NACK 没有体现出来：{joined}");
+        assert!(joined.contains("+A"), "ACK 也应当照样标出来：{joined}");
+        // 地址那一笔是 ACK、数据那一笔是 NACK —— 两者必须能分辨。
+        //
+        // 注意地址是 `0x44`：测试数据里送的是 `0x88`，那是**带读写位的地址字节**，
+        // 解码器剥掉最低位之后得到 7 位地址 0x44。第一版这里写成 0x88，判红了 ——
+        // 又是**期望写错**而不是代码错。
+        assert!(joined.contains("0x44(W)+A"), "地址应当标为被应答：{joined}");
+        assert!(joined.contains("00+N"), "数据字节应当标为未应答：{joined}");
+    }
+
+    /// 图例本身也要在（数据对但没人看得懂记号，等于没给）。
+    #[test]
+    fn the_frame_table_explains_its_ack_notation() {
+        let cap = i2c_capture(true);
+        let scale = ChannelScale::default();
+        let d = decode_capture(&cap, &I2cDecodeConfig::default()).unwrap();
+        let cfg = I2cDecodeConfig::default();
+        let mut i = input(&cap, &scale);
+        i.decode = Some(&d);
+        i.decode_cfg = Some(&cfg);
+        let text = build_evidence(&i);
+
+        assert!(text.contains("从机应答"), "缺图例：{text}");
+        assert!(text.contains("从机未应答"), "缺图例：{text}");
     }
 
     // ── 坑 2 的回归：通道是用户选的就要说 ────────────────────────────
@@ -743,6 +937,42 @@ mod tests {
             MAX_CHARS - 1,
             "没超限就不该动它"
         );
+    }
+
+    /// **一份 4096 点的真实采集，证据包有多大。**
+    ///
+    /// 这条是有用的刻度尺：成本讨论里反复要引用这个数，
+    /// 而拍脑袋估的和实际量的差得很远（我估过 2000+ 字符，实测见下）。
+    #[test]
+    fn a_4096_point_capture_measures_its_own_size() {
+        let mut cap = Capture::new(1, 857_142, 2, 4096);
+        // 造一条像 I2C 的方波，好让解码与包络都不是空的
+        cap.channels = vec![
+            (0..4096)
+                .map(|i| if (i / 16) % 2 == 0 { 4095 } else { 0 })
+                .collect(),
+            (0..4096)
+                .map(|i| if (i / 64) % 2 == 0 { 4095 } else { 0 })
+                .collect(),
+        ];
+        let scale = ChannelScale::default();
+        let d = decode_capture(&cap, &I2cDecodeConfig::default()).ok();
+        let cfg = I2cDecodeConfig::default();
+        let mut i = input(&cap, &scale);
+        i.decode = d.as_ref();
+        i.decode_cfg = Some(&cfg);
+        let text = build_evidence(&i);
+
+        let chars = text.chars().count();
+        println!("4096 点双通道证据包：{chars} 字符，约 {} token", chars / 3);
+
+        // 上界：一份正常采集不该逼近 MAX_CHARS，否则截断会天天发生
+        assert!(
+            chars < MAX_CHARS / 2,
+            "4096 点的证据包 {chars} 字符，已经逼近 {MAX_CHARS} 上限"
+        );
+        // 下界：太小说明有段落整段没写出来
+        assert!(chars > 500, "证据包只有 {chars} 字符 —— 像是漏了段");
     }
 
     /// 真实采集渲染出来必须远低于上限 —— 否则「省略号」会天天出现。
