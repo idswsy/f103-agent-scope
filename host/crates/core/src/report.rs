@@ -142,9 +142,12 @@ fn config_section(s: &mut String, config: Option<&DeviceConfig>) {
         channel_label(c.trigger_source as usize),
         c.trigger_level_lsb,
     );
+    // 协议里的字段名叫 `ch0_*`（GET_CONFIG 只带 0 号通道的配置），
+    // 但**显示名必须跟界面走** —— 界面把索引 0 叫 CH1。
     let _ = writeln!(
         s,
-        "CH0: 使能={} 耦合={}",
+        "{}: 使能={} 耦合={}",
+        channel_label(0),
         if c.ch0_enable != 0 { "是" } else { "否" },
         if c.ch0_coupling != 0 { "AC" } else { "DC" },
     );
@@ -661,13 +664,37 @@ mod tests {
 
         assert!(text.contains("CH1"), "两通道采集应出现 CH1：{text}");
         assert!(text.contains("CH2"), "两通道采集应出现 CH2：{text}");
-        for bad in ["ch0", "ch1", "ch2"] {
+        for bad in ["ch0", "ch1", "ch2", "CH0"] {
             assert!(
                 !text.contains(bad),
                 "证据包里出现了界面不存在的写法 `{bad}` —— \
                  界面用的是 CH1/CH2（1 起），必须一致\n{text}"
             );
         }
+    }
+
+    /// 设备配置段的通道名走 `channel_label`，不是协议字段名。
+    ///
+    /// 回归：这里曾直接写死 `"CH0: 使能=…"` —— 协议字段确实叫 `ch0_enable`，
+    /// 但**界面把索引 0 叫 CH1**，于是又一次「分析里出现界面不存在的通道」。
+    #[test]
+    fn the_config_section_uses_the_display_name_not_the_protocol_field_name() {
+        let cap = flat_capture();
+        let scale = ChannelScale::default();
+        let cfg = DeviceConfig {
+            rate_hz: 857_142,
+            ch0_enable: 1,
+            ..DeviceConfig::default()
+        };
+        let mut i = input(&cap, &scale);
+        i.config = Some(&cfg);
+        let text = build_evidence(&i);
+
+        assert!(
+            text.contains("CH1: 使能=是"),
+            "配置段应使用界面的 CH1 名称：{text}"
+        );
+        assert!(!text.contains("CH0"), "不得出现 CH0：{text}");
     }
 
     /// **短采集不得退化成「每个样点一桶」。**
