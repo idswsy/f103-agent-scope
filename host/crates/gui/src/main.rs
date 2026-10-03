@@ -127,7 +127,7 @@ fn drive_cli(task: &str, port: Option<String>, scenario: Option<Scenario>) -> ef
         println!("配置：{n}");
     }
     if !cfg.has_key() {
-        return fail("配置里没有 API 密钥 —— 先在 GUI 面板的「设置」里填好并保存");
+        return fail("未配置 API 密钥 —— 先在 GUI 面板的「设置」中填写并保存");
     }
 
     let exe = match drive::find_scope_mcp() {

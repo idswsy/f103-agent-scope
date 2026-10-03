@@ -1067,7 +1067,7 @@ pub fn ai_panel(app: &mut App, ui: &mut egui::Ui) {
         let can_drive = app.can_start_drive() && app.ai.cfg.has_key();
         let drive_btn = ui.add_enabled(can_drive, egui::Button::new("交给 AI 采集"));
         let drive_btn = if !app.connected {
-            drive_btn.on_disabled_hover_text("尚未连接设备。交接的前提是先连上一台。")
+            drive_btn.on_disabled_hover_text("尚未连接设备。连接后方可交接。")
         } else if !app.ai.cfg.has_key() {
             drive_btn.on_disabled_hover_text("未配置 API 密钥。请在「设置」中填写。")
         } else if driving {
@@ -1119,7 +1119,7 @@ pub fn ai_panel(app: &mut App, ui: &mut egui::Ui) {
             egui::Color32::from_rgb(230, 160, 30),
             "⚠ 设备已交给 AI —— 左侧所有设备控件已停用",
         );
-        ui.small("串口同一时刻只能有一个主人，这是交接的必然，不是界面故障。");
+        ui.small("串口同一时刻只能由一个进程持有。设备控件停用属交接的必然。");
 
         // ⚠ 只在 `Running` 阶段给终止。
         //
@@ -1129,7 +1129,7 @@ pub fn ai_panel(app: &mut App, ui: &mut egui::Ui) {
         let can_stop = app.drive.phase == crate::drive::DrivePhase::Running;
         if ui
             .add_enabled(can_stop, egui::Button::new("终止"))
-            .on_disabled_hover_text("正在让出设备，请稍候 —— 会话尚未开始")
+            .on_disabled_hover_text("正在让出设备，会话尚未开始")
             .clicked()
         {
             app.stop_drive();
@@ -1282,10 +1282,17 @@ fn drive_section(app: &mut App, ui: &mut egui::Ui) {
     if let Some(text) = app.drive.final_text.clone() {
         ui.add_space(4.0);
         ui.label("结论");
+        // ⚠ 高度**随内容**，不写死。
+        //
+        // 写死 `desired_rows(10)` 时，一条一行的结论也占十行 ——
+        // 而它下面的「恢复交接前的设置」是「AI 改错了怎么改回去」的唯一入口，
+        // 被挤到滚动线以下就**不滚动看不到**，等于没有。
+        // （这个是盯着截图才发现的：读代码时那个按钮明明在那儿。）
+        let rows = text.lines().count().clamp(3, 16);
         ui.add(
             egui::TextEdit::multiline(&mut text.as_str())
                 .desired_width(f32::INFINITY)
-                .desired_rows(10)
+                .desired_rows(rows)
                 .font(egui::TextStyle::Monospace),
         );
     }
@@ -1294,13 +1301,13 @@ fn drive_section(app: &mut App, ui: &mut egui::Ui) {
     if app.drive.phase == DrivePhase::Idle && app.drive.handoff.is_some() {
         ui.add_space(4.0);
         if ui
-            .button("恢复我交出去之前的设置")
-            .on_hover_text("把「期望配置」填回交接时的值；点左侧「应用到设备」生效")
+            .button(crate::drive::RESTORE_LABEL)
+            .on_hover_text("将「期望配置」填回交接时的值，由「应用到设备」下发")
             .clicked()
         {
             app.restore_handoff_config();
         }
-        ui.small("AI 改过的设置保留着。左侧「配置」面板显示的是设备回显值。");
+        ui.small("AI 的改动保留在设备上。左侧「配置」面板为设备回显值。");
     }
 
     ui.separator();

@@ -80,7 +80,7 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 pub fn find_scope_mcp() -> Result<PathBuf, AiError> {
     let me = std::env::current_exe().map_err(|e| {
         AiError::new(
-            format!("取不到自身可执行文件的位置（{e}）"),
+            format!("无法获取自身可执行文件的位置（{e}）"),
             "这是程序缺陷，请提交 issue",
         )
     })?;
@@ -123,7 +123,7 @@ pub fn find_scope_mcp() -> Result<PathBuf, AiError> {
                 .join(" 或 ")
         ),
         "与本程序放在同一目录即可（通常是 host/target/debug/）—— \
-         用 ./host/run.sh run -p scope-gui 启动会自动放好",
+         由 ./host/run.sh run -p scope-gui 启动时自动就位",
     ))
 }
 
@@ -160,7 +160,7 @@ pub fn check_id(resp: &Value, want: u64) -> Result<bool, AiError> {
             } else {
                 Err(AiError::new(
                     format!("响应 id 对不上：等 {want}，收到 {v}"),
-                    "子进程与客户端不同步了 —— 终止本次会话重来",
+                    "子进程与客户端已不同步 —— 终止本次会话后重新发起",
                 ))
             }
         }
@@ -229,7 +229,7 @@ impl McpProcess {
     pub fn spawn(exe: &PathBuf) -> Result<McpProcess, AiError> {
         let fail = |e: std::io::Error| {
             AiError::new(
-                format!("起不了 scope-mcp（{e}）"),
+                format!("无法启动 scope-mcp（{e}）"),
                 "确认它与本程序在同一目录、且有执行权限",
             )
         };
@@ -338,7 +338,7 @@ impl McpProcess {
                 Err(RecvTimeoutError::Timeout) => {
                     return Err(AiError::new(
                         format!("等 {method} 的响应超时（{} 秒）", RPC_TIMEOUT.as_secs()),
-                        "子进程卡住了 —— 终止本次会话重来",
+                        "子进程无响应 —— 终止本次会话后重新发起",
                     ));
                 }
                 Err(RecvTimeoutError::Disconnected) => {
@@ -565,7 +565,7 @@ pub enum DriveEvent {
         text: String,
         /// 实际跑了几轮。
         turns: usize,
-        /// 是不是撞了轮数上限被迫停的。
+        /// 是否因达到轮数上限而停止。
         hit_limit: bool,
     },
     /// 出错结束。
@@ -997,7 +997,7 @@ impl DrivePhase {
 /// 1. **provenance** —— AI 期间 GUI 处于断开状态，[`crate::app::App::link_description`]
 ///    会输出「serial @ 921600」、`simulated` 会变成 false。**模拟器会被说成串口。**
 ///    有这个快照，锚点行与证据包才说得出真话。
-/// 2. **「恢复我交出去之前的设置」** —— 用户点一下就按它重配。
+/// 2. **「恢复交接前的设置」** —— 用户点一下就按它重配。
 #[derive(Debug, Clone)]
 pub struct Handoff {
     /// 链路的一句话描述（给人看，也进证据包）。
@@ -1078,6 +1078,20 @@ pub enum TrajectoryItem {
     },
 }
 
+/// 「把 AI 改过的设置改回去」那个按钮的文案。
+///
+/// # 为什么单独成常量
+///
+/// 它有**四处引用**：按钮本身、设备收回时的那行日志、以及 [`Handoff`] 与
+/// [`DriveState::begin`] 的文档。而它们此前**各不相同** ——
+/// 「恢复我原来的设置」「恢复我交出去之前的设置」两种写法并存，
+/// 按钮后来改了名，日志里还指着旧名字，**用户照着提示去找会找不到**。
+///
+/// 这正是本项目最熟的那类病：同一件事有多个名字，而且没有任何东西守着它们一致。
+/// 程序里能共用的部分抽成常量；文档注释里仍写全名（那里引用不了常量值），
+/// 但它只有一处，改的时候不会漏。
+pub const RESTORE_LABEL: &str = "恢复交接前的设置";
+
 /// 轨迹最多留多少条。
 ///
 /// 24 轮 × 每条几项，不设上限能涨到几百条 —— 那是给人扫一眼用的，
@@ -1134,7 +1148,7 @@ impl DriveState {
     /// ⚠ **丢掉旧句柄之前要先终止它** —— 调用方负责（见 `App::start_drive`）。
     /// 这里只负责把自己这一摊清干净。
     ///
-    /// **不动 `handoff`** —— 那是「恢复我原来的设置」的依据，
+    /// **不动 `handoff`** —— 那是「恢复交接前的设置」的依据，
     /// 要活到设备收回来之后。
     pub fn begin(&mut self) {
         self.trajectory.clear();

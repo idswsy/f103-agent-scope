@@ -242,7 +242,7 @@ impl App {
         // 停掉 --demo 自动机 —— 否则它会在 AI 跑的时候插一脚
         self.demo_stage = 3;
 
-        self.note("把设备交给 AI：GUI 先断开，把串口让出去");
+        self.note("设备交接：GUI 断开，释放串口");
         self.worker.send(Request::Disconnect);
     }
 
@@ -256,7 +256,10 @@ impl App {
             // 重新连上 → 回到 Idle
             DrivePhase::Reconnecting if self.connected => {
                 self.drive.phase = DrivePhase::Idle;
-                self.note("设备已收回 —— AI 改过的设置保留着，可用「恢复我原来的设置」改回去");
+                self.note(format!(
+                    "设备已收回。AI 的改动保留在设备上，可用「{}」改回",
+                    drive::RESTORE_LABEL
+                ));
             }
             _ => {}
         }
@@ -329,7 +332,7 @@ impl App {
             } => {
                 self.drive.final_text = Some(text);
                 self.drive.push(TrajectoryItem::Phase(if hit_limit {
-                    format!("撞了轮数上限被停（{turns} 轮）")
+                    format!("已达轮数上限而停止（{turns} 轮）")
                 } else {
                     format!("跑完（{turns} 轮）")
                 }));
@@ -355,7 +358,7 @@ impl App {
             return;
         };
         self.drive.phase = DrivePhase::Reconnecting;
-        self.note("AI 结束，正在把设备收回来");
+        self.note("会话结束，正在收回设备");
         self.worker.send(Request::Connect {
             transport: h.transport,
             port: h.port,
@@ -375,7 +378,7 @@ impl App {
         // 作废这一代 —— 旧线程还会吐几条事件出来，不能混进下一次会话
         self.drive.next_generation();
         h.terminate();
-        self.note("AI 会话已终止（子进程已结束）。设备上保留着它最后的配置。");
+        self.note("会话已终止（子进程已结束）。设备上保留其最后的配置。");
         self.return_device();
     }
 
@@ -385,7 +388,7 @@ impl App {
             return;
         };
         let Some(c) = h.config.as_ref() else {
-            self.note("交出去时没读到设备配置，无法恢复");
+            self.note("交接时未读到设备配置，无法恢复");
             return;
         };
         // 把「期望值」同步成快照 —— 用户点一次「应用到设备」即可
@@ -394,7 +397,7 @@ impl App {
         self.want_trigger_mode = c.trigger_mode;
         self.want_trigger_edge = c.trigger_edge;
         self.want_trigger_level = c.trigger_level_lsb;
-        self.note("已把「期望配置」填回交出去之前的值 —— 点「应用到设备」生效");
+        self.note("「期望配置」已填回交接时的值，由「应用到设备」下发");
     }
 
     /// 记一行日志。
