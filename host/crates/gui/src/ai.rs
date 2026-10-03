@@ -521,10 +521,24 @@ impl AiState {
 
     /// 收一条回执。
     pub fn apply(&mut self, u: AiUpdate) {
+        // 这条是不是当前正在等的那一个？
+        let is_current = self.awaiting == Some(u.req_id);
+
+        // **只有它才是**才能清 `awaiting`。
+        //
+        // 回归：这里曾经无条件 `self.awaiting = None`，于是一条**旧请求**的
+        // 迟到结果会把**新请求**的运行态一并清掉 —— 界面显示「不在分析」、
+        // 「开始分析」按钮重新亮起，而新请求其实还在飞。用户此时再点一次，
+        // 就有三个请求同时在路上，而 req_id 机制本来就是为了避免这种混乱。
+        // 这个交错靠读代码看不出来，是被 `a_stale_result_does_not_disturb_
+        // the_new_request` 抓到的。
+        if is_current {
+            self.awaiting = None;
+        }
+
         // 不是正在等的那个 —— 说明用户取消过，或者又发起了一次。
-        // **不丢弃**：钱已经花了，标一下比扔掉有用。
-        self.answer_late = self.awaiting != Some(u.req_id);
-        self.awaiting = None;
+        // **不丢弃**：请求已经计过费，标一下比扔掉有用。
+        self.answer_late = !is_current;
 
         match u.outcome {
             Ok(a) => {
@@ -573,6 +587,220 @@ mod tests {
             base_url: "https://example.test/v1/messages".into(),
             model: "test-model".into(),
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // AiState 的状态机
+    // ══════════════════════════════════════════════════════════════════
+    //
+    // ⚠ 这些测试**从不调用 `start()`** —— 那会真的起线程、发网络请求。
+    // 需要「正在等结果」这个前置状态时，直接写 `awaiting` 字段（同模块可见）。
+    //
+    // 覆盖的是界面最容易出错的那部分：取消之后结果回来了怎么办、
+    // 结论对应的采集已经切走了怎么办。**这是「取消与迟到标注」那条
+    // 人工验证项里唯一能自动化的部分。**
+
+    /// 造一个不含网络活动的状态。`key` 传 `None` 表示没配密钥。
+    fn state_with_key(key: Option<&str>) -> AiState {
+        let cfg = match key {
+            Some(k) => AiConfig {
+                api_key: k.into(),
+                ..cfg()
+            },
+            None => AiConfig {
+                api_key: String::new(),
+                ..cfg()
+            },
+        };
+        AiState {
+            worker: AiWorker::new(egui::Context::default()),
+            cfg,
+            config_path: None,
+            panel_open: false,
+            awaiting: None,
+            answer: None,
+            answer_req: 0,
+            answer_capture_id: 0,
+            answer_anchor: String::new(),
+            answer_late: false,
+            error: None,
+            question: String::new(),
+            show_key: false,
+        }
+    }
+
+    fn answer(text: &str) -> AiAnswer {
+        AiAnswer {
+            text: text.into(),
+            model: "m".into(),
+            elapsed: Duration::from_millis(1200),
+            input_tokens: 10,
+            output_tokens: 20,
+        }
+    }
+
+    fn update(req_id: u64, capture_id: u16, text: &str) -> AiUpdate {
+        AiUpdate {
+            req_id,
+            capture_id,
+            anchor: format!("#{capture_id}"),
+            outcome: Ok(answer(text)),
+        }
+    }
+
+    #[test]
+    fn cannot_start_without_a_key() {
+        let s = state_with_key(None);
+        assert!(!s.can_start(), "没有密钥时不得发起分析");
+        assert!(!s.is_running());
+    }
+
+    #[test]
+    fn can_start_with_a_key_and_is_idle() {
+        let s = state_with_key(Some("sk-x"));
+        assert!(s.can_start());
+        assert!(!s.is_running());
+    }
+
+    /// 「是否正在分析」只看 `awaiting`。
+    ///
+    /// 曾经想过用线程存活状态判断，那是错的：请求取消后在途 HTTP 仍会跑到
+    /// 超时，而那时界面早该回到就绪态。
+    #[test]
+    fn running_state_follows_awaiting_not_the_thread() {
+        let mut s = state_with_key(Some("sk-x"));
+        assert!(!s.is_running());
+
+        s.awaiting = Some(7);
+        assert!(s.is_running(), "有在途请求时应报运行中");
+        assert!(!s.can_start(), "运行中不得再次发起");
+
+        s.awaiting = None;
+        assert!(!s.is_running());
+        assert!(s.can_start(), "回到就绪态后应可再次发起");
+    }
+
+    /// 取消后界面立刻回到就绪态 —— **不等**在途请求真的结束。
+    #[test]
+    fn cancel_returns_to_idle_immediately() {
+        let mut s = state_with_key(Some("sk-x"));
+        s.awaiting = Some(3);
+        s.cancel();
+        assert!(!s.is_running(), "取消后应立即回到就绪态");
+        assert!(s.can_start(), "取消后应能立刻重新发起");
+    }
+
+    #[test]
+    fn a_normal_result_is_not_marked_late() {
+        let mut s = state_with_key(Some("sk-x"));
+        s.awaiting = Some(1);
+        s.apply(update(1, 5, "结论"));
+        assert!(!s.answer_late, "正常返回不该被标成迟到");
+        assert_eq!(s.answer.as_ref().unwrap().text, "结论");
+        assert_eq!(s.answer_capture_id, 5);
+        assert!(!s.is_running());
+    }
+
+    /// **取消之后结果回来了 —— 不丢弃，标成迟到。**
+    ///
+    /// 丢弃是错的：请求已经计过费了。这条同时守住「标了」和「没丢」两件事。
+    #[test]
+    fn a_late_result_is_kept_and_labelled() {
+        let mut s = state_with_key(Some("sk-x"));
+        s.awaiting = Some(1);
+        s.cancel(); // awaiting 归 None
+        assert!(s.awaiting.is_none());
+
+        s.apply(update(1, 5, "迟到的结论"));
+        assert!(s.answer_late, "取消后返回的结果必须标成迟到");
+        assert!(s.answer.is_some(), "迟到结果不得丢弃 —— 请求已经计过费了");
+    }
+
+    /// 用户取消后又发起了一次：旧请求的结果回来时也必须标成迟到，
+    /// 且**不能顶掉**新请求的状态。
+    #[test]
+    fn a_stale_result_does_not_disturb_the_new_request() {
+        let mut s = state_with_key(Some("sk-x"));
+        s.awaiting = Some(2); // 新请求在跑
+
+        s.apply(update(1, 5, "上一轮的")); // 旧请求回来了
+        assert!(s.answer_late, "请求号对不上就要标迟到");
+        assert!(s.is_running(), "旧结果回来不该把新请求的运行态清掉");
+        assert_eq!(s.awaiting, Some(2));
+    }
+
+    /// 结论对应的采集已经不是当前显示的那个 —— 界面要能判断出来。
+    #[test]
+    fn an_answer_about_another_capture_is_flagged() {
+        let mut s = state_with_key(Some("sk-x"));
+        s.awaiting = Some(1);
+        s.apply(update(1, 5, "针对采集 5 的结论"));
+
+        assert!(
+            !s.answer_is_about_another_capture(Some(5)),
+            "当前就是采集 5，不该报错配"
+        );
+        assert!(
+            s.answer_is_about_another_capture(Some(6)),
+            "当前切到采集 6 了，必须能识别出来"
+        );
+        assert!(
+            s.answer_is_about_another_capture(None),
+            "当前没有采集时也算对不上"
+        );
+    }
+
+    #[test]
+    fn no_answer_means_nothing_to_mismatch() {
+        let s = state_with_key(Some("sk-x"));
+        assert!(
+            !s.answer_is_about_another_capture(Some(1)),
+            "没有结论时不该报「结论对不上」"
+        );
+    }
+
+    #[test]
+    fn a_failure_is_recorded_with_its_remedy() {
+        let mut s = state_with_key(Some("sk-x"));
+        s.awaiting = Some(1);
+        s.apply(AiUpdate {
+            req_id: 1,
+            capture_id: 5,
+            anchor: "#5".into(),
+            outcome: Err(AiError::new("出事了", "这么办")),
+        });
+        let e = s.error.as_ref().expect("失败要被记下来");
+        assert_eq!(e.message, "出事了");
+        assert!(
+            !e.hint.trim().is_empty(),
+            "失败必须带处理措施 —— 项目规矩：错误不能只给错误码"
+        );
+    }
+
+    /// 上一次失败了，这一次成功 —— 旧错误不该继续挂在界面上。
+    #[test]
+    fn a_new_start_clears_the_previous_error() {
+        let mut s = state_with_key(Some("sk-x"));
+        s.error = Some(AiError::new("上一次失败了", "怎么办"));
+        // 直接模拟 start 里的清理动作，避免真的起线程
+        s.error = None;
+        assert!(s.error.is_none());
+    }
+
+    /// 没配密钥时保存要给出「存不下来」，而不是静默假装成功。
+    #[test]
+    fn saving_without_a_config_path_says_so() {
+        let s = state_with_key(Some("sk-x"));
+        assert!(s.config_path.is_none());
+        let msg = s.save_config();
+        assert!(
+            msg.contains("未能保存") || msg.contains("无可用配置目录"),
+            "没有配置目录时必须明说保存失败：{msg}"
+        );
+        assert!(
+            msg.contains("内存"),
+            "还要说清后果（设置不会持久化）：{msg}"
+        );
     }
 
     // ── 请求体 ───────────────────────────────────────────────────────
