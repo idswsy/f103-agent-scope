@@ -74,7 +74,11 @@ pub struct AiError {
 }
 
 impl AiError {
-    fn new(message: impl Into<String>, hint: impl Into<String>) -> Self {
+    /// 构造一条「说明 + 怎么办」。
+    ///
+    /// `pub(crate)`：`drive.rs` 也要造同类错误 —— 两个入口（单发分析、
+    /// AI 驱动的会话）对用户而言是一件事，错误形状必须一样。
+    pub(crate) fn new(message: impl Into<String>, hint: impl Into<String>) -> Self {
         AiError {
             message: message.into(),
             hint: hint.into(),
@@ -250,6 +254,20 @@ pub fn parse_response(
             .to_string(),
         elapsed,
     })
+}
+
+/// 给 `drive.rs` 用的薄包装：那边手上是响应体的**字符串**。
+///
+/// 故意不另写一份错误映射 —— 单发分析与工具循环走的是同一个端点，
+/// 同一个 401 在两个地方给出不同的措辞，就是又一处「同一次故障两种描述」。
+pub(crate) fn http_error_for_drive(status: u16, body: &str) -> AiError {
+    let v = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    http_error(status, &v)
+}
+
+/// 同上，传输层。
+pub(crate) fn transport_error_for_drive(e: &ureq::Error) -> AiError {
+    transport_error(e)
 }
 
 /// 把 HTTP 错误码翻译成「说明 + 怎么办」。

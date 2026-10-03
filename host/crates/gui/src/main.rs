@@ -36,6 +36,7 @@ use scope_sim::Scenario;
 mod ai;
 mod app;
 mod config;
+mod drive;
 mod font;
 mod msg;
 mod panels;
@@ -63,6 +64,26 @@ fn main() -> eframe::Result<()> {
         .find(|w| w[0] == "--scenario")
         .and_then(|w| Scenario::parse(&w[1]));
 
+    // ── --drive <需求>：**不起窗口**，直接在命令行跑一次「AI 自己配置并采集」 ──
+    //
+    // 存在的理由是**把会话本身与界面接线分开验**：出问题时能分清
+    // 是这条路没打通，还是只是界面没接上。
+    //
+    //     ./host/run.sh run -p scope-gui -- --drive "看看这条总线上在发生什么"
+    //     ./host/run.sh run -p scope-gui -- --drive "…" --port COM7
+    if let Some(pos) = args.iter().position(|a| a == "--drive") {
+        let task = args
+            .get(pos + 1)
+            .filter(|s| !s.starts_with("--"))
+            .cloned()
+            .unwrap_or_else(|| "看看这条总线上在发生什么，有没有值得注意的地方".to_string());
+        let port = args
+            .windows(2)
+            .find(|w| w[0] == "--port")
+            .map(|w| w[1].clone());
+        return drive_cli(&task, port, scenario);
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 760.0])
@@ -85,4 +106,96 @@ fn main() -> eframe::Result<()> {
             )))
         }),
     )
+}
+
+/// `--drive` 的实现：命令行跑一次完整会话，事件打到 stdout。
+///
+/// 它是**会话这一侧的验收台** —— 界面还没接上时用它验；
+/// 界面接上之后它仍然有用（出问题时能分清是会话的毛病还是界面的）。
+fn drive_cli(task: &str, port: Option<String>, scenario: Option<Scenario>) -> eframe::Result<()> {
+    use drive::{DriveEvent, DriveJob, McpProcess};
+    use std::io::Write as _;
+
+    let fail = |msg: &str| -> eframe::Result<()> {
+        eprintln!("\n✗ {msg}");
+        std::process::exit(1);
+    };
+
+    // 配置与单发分析共用一份（同一个 key / 端点 / 模型）
+    let (cfg, note) = config::load(config::default_config_path().as_deref());
+    if let Some(n) = note {
+        println!("配置：{n}");
+    }
+    if !cfg.has_key() {
+        return fail("配置里没有 API 密钥 —— 先在 GUI 面板的「设置」里填好并保存");
+    }
+
+    let exe = match drive::find_scope_mcp() {
+        Ok(p) => p,
+        Err(e) => return fail(&format!("{}｜{}", e.message, e.hint)),
+    };
+    println!("scope-mcp: {}", exe.display());
+
+    // **连接参数由这里钉死**，不让 AI 自己挑目标
+    let connect_args = match &port {
+        Some(p) => serde_json::json!({ "transport": "serial", "port": p, "baud": 921_600 }),
+        None => {
+            let s = scenario.unwrap_or(Scenario::I2c100k);
+            serde_json::json!({ "transport": "sim", "sim_scenario": s.name() })
+        }
+    };
+
+    let job = DriveJob {
+        task: task.to_string(),
+        cfg,
+        connect_args,
+    };
+
+    println!("\n需求：{task}");
+    println!("目标：{}\n", job.connect_args);
+
+    let mut mcp = match McpProcess::spawn(&exe) {
+        Ok(m) => m,
+        Err(e) => return fail(&format!("{}｜{}", e.message, e.hint)),
+    };
+
+    let outcome = drive::run_session(&job, &mut mcp, &mut |ev| match ev {
+        DriveEvent::Phase(p) => println!("… {p}"),
+        DriveEvent::ToolCall { name, args } => println!("→ {name} {args}"),
+        DriveEvent::ToolResult { name, ok, summary } => {
+            println!("  {} {name}：{summary}", if ok { "✓" } else { "✗" });
+        }
+        DriveEvent::Warnings(ws) => {
+            for w in ws {
+                println!("  ⚠ {w}");
+            }
+        }
+        DriveEvent::Capture(c) => println!(
+            "  ▤ 采集 #{}  {} 点 × {} 通道 @ {} Hz",
+            c.id,
+            c.channels.first().map(|v| v.len()).unwrap_or(0),
+            c.channels.len(),
+            c.rate_hz
+        ),
+        DriveEvent::Finished {
+            text,
+            turns,
+            hit_limit,
+        } => {
+            println!(
+                "\n── 结论（{turns} 轮{}）──\n{text}",
+                if hit_limit { "，撞上限被停" } else { "" }
+            );
+        }
+    });
+
+    mcp.shutdown(); // 优雅收场：让它自己断开，再等退出
+
+    match outcome {
+        Ok(()) => {
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
+        }
+        Err(e) => fail(&format!("{}｜{}", e.message, e.hint)),
+    }
 }
