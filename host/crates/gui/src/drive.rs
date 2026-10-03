@@ -1329,6 +1329,136 @@ mod tests {
         assert_eq!(summarize_args(&json!({"a":1})), r#"{"a":1}"#);
     }
 
+    // ── 与真子进程对接的两条，默认不跑 ───────────────────────────────
+
+    /// **交接的往返：设备让出去，再完好地收回来。**
+    ///
+    /// 这条验的是路线 B 的**核心机制** ——
+    ///
+    /// ```text
+    /// ① GUI 侧本来能采
+    /// ② 让出去（断开）
+    /// ③ 子进程接同一目标、采一窗
+    /// ④ 子进程收场
+    /// ⑤ GUI 侧重新连上、还能采
+    /// ```
+    ///
+    /// ⑤ 是重点：**交接失败最坏的形态不是报错，而是「设备回不来了」**。
+    ///
+    /// ⚠ 在**模拟器**上验，说明力有限：模拟器没有「端口独占」这回事，
+    /// 两个进程各建一台本来就互不干扰。所以这条能证明的是
+    /// 「子进程起得来、收得干净、收完之后 GUI 侧的连接与采集照常」；
+    /// **真正的串口独占要靠真机验**（见 HANDOFF 的未验证项）。
+    ///
+    /// ```text
+    /// ./host/run.sh test -p scope-gui -- --ignored handoff_round_trip --nocapture
+    /// ```
+    #[test]
+    #[ignore = "要起 scope-mcp 子进程；手动跑"]
+    fn handoff_round_trip_gives_the_device_back() {
+        use scope_core::{AcquireParams, CommandBus};
+        use scope_device::Transport;
+
+        let connect = || {
+            let mut bus = CommandBus::new(Transport::sim(scope_sim::Scenario::I2c100k));
+            bus.connect().expect("连模拟器失败");
+            bus
+        };
+        let capture = |bus: &mut CommandBus<Transport>| {
+            scope_core::acquire(
+                bus,
+                &AcquireParams {
+                    samples: 4096,
+                    rate_hz: scope_core::f103::MAX_SAMPLE_RATE_HZ,
+                    trigger_level_lsb: 2048,
+                    timeout: Duration::from_millis(2000),
+                },
+            )
+            .expect("采集失败")
+        };
+
+        // ── ① GUI 侧本来是好的 ──
+        let mut bus = connect();
+        let before = capture(&mut bus);
+        println!(
+            "交出去之前：采集 #{} · {} 点",
+            before.id,
+            before.channels[0].len()
+        );
+        assert_eq!(before.channels[0].len(), 4096);
+
+        // ── ② 让出去 ──
+        drop(bus);
+
+        // ── ③ 子进程接管同一目标 ──
+        let exe = find_scope_mcp().expect("找不到 scope-mcp —— 先 ./host/run.sh build");
+        let mut mcp = McpProcess::spawn(&exe).expect("起不了子进程");
+        mcp.call(
+            "initialize",
+            json!({"protocolVersion": "2024-11-05", "capabilities": {},
+                   "clientInfo": {"name": "test", "version": "0"}}),
+        )
+        .expect("握手失败");
+
+        let tool = |mcp: &mut McpProcess, name: &str, args: Value| {
+            let r = mcp
+                .call("tools/call", json!({"name": name, "arguments": args}))
+                .unwrap_or_else(|e| panic!("{name} 传输失败：{}｜{}", e.message, e.hint));
+            assert!(
+                !r.get("isError").and_then(|v| v.as_bool()).unwrap_or(false),
+                "{name} 被拒：{}",
+                tool_text(&r)
+            );
+            r
+        };
+
+        tool(
+            &mut mcp,
+            "scope_connect",
+            json!({"transport": "sim", "sim_scenario": "i2c_100k"}),
+        );
+        tool(&mut mcp, "scope_capture", json!({}));
+        let mut mirrored = Mirrored::default();
+        let got = mirrored.poll(&mut mcp).expect("镜像失败");
+        assert_eq!(got.len(), 1, "子进程那一侧应当采到一窗");
+        println!(
+            "AI 接管期间：采集 #{} · {} 点",
+            got[0].id,
+            got[0].channels[0].len()
+        );
+
+        // ── ④ 收场，并确认子进程**真的被回收了** ──
+        let killer = mcp.child_handle();
+        mcp.shutdown();
+        let reaped = killer.lock().unwrap().try_wait().expect("try_wait 出错");
+        assert!(
+            reaped.is_some(),
+            "子进程没有被回收 —— 这就是「关窗留下孤儿占着 COM7」那个形态"
+        );
+        println!(
+            "子进程已回收（退出码 {}）",
+            reaped.unwrap().code().unwrap_or(-1)
+        );
+
+        // ── ⑤ 设备收回来，照常能采 ──
+        let mut bus = connect();
+        let after = capture(&mut bus);
+        println!(
+            "收回来之后：采集 #{} · {} 点",
+            after.id,
+            after.channels[0].len()
+        );
+        assert_eq!(
+            after.channels[0].len(),
+            4096,
+            "交接之后设备必须还能正常采集"
+        );
+        assert!(
+            after.channels[0].iter().any(|&v| v > 2048),
+            "收回来之后采到的波形不该是空的"
+        );
+    }
+
     // ── 与真子进程对接的那一条，默认不跑 ─────────────────────────────
 
     /// **镜像这条路通不通 —— 对着真的 `scope-mcp` 子进程验，但不碰 LLM。**
