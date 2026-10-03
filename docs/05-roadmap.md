@@ -1,4 +1,4 @@
-# 05 · 路线图与分工
+# 05 · 路线图
 
 **原则：先让「无硬件也能开发」跑起来，再让硬件闭环，最后才做 AI。**
 
@@ -190,50 +190,6 @@ Agent 拿到的是它没要求的配置下的数据。
 
 **不变量**：协议层与上位机**一行都不用改** —— `DevicePort` / `GetCapabilities` / 分片策略都与链路和器件无关。
 **数字通路保留**：1 MHz I2C 下它仍是最可靠的解码路径（见 [ADR-005](06-decisions.md)）。
-
----
-
-## 团队分工（3 人）
-
-### 🧑💻 A — 固件
-
-| 负责 | 文件 |
-|---|---|
-| 时钟树 / ADC / DMA / 触发 | `firmware/Hardware/adc_dma.c`、`App/trigger.c` |
-| 协议解析与命令分发 | `firmware/App/proto_task.c`、`proto/protocol.c` |
-| 数字通路 I2C 解码 | `firmware/Hardware/tim_capture.c`、`App/i2c_decode.c` |
-| 屏幕 / 编码器 / 按键 | `firmware/Hardware/tft_st7735.c`、`App/ui.c` |
-
-**入口文档**：`04-performance.md` §1（采样率）、`03-protocol.md` §6（缓冲组织）
-
----
-
-### 🧑💻 B — 上位机
-
-| 负责 | 文件 |
-|---|---|
-| 协议编解码（Rust 侧） | `host/crates/proto/` |
-| 命令层 / CommandBus / 状态缓存 | `host/crates/core/` |
-| 传输层 | `host/crates/transport-serial/` |
-| 模拟器 | `host/crates/sim/` |
-| CLI / 测量算法 / 标定 | `host/crates/cli/` |
-| I2C 解码器（Rust 侧） | `host/crates/core/src/i2c_decode.rs` |
-
-**入口文档**：`03-protocol.md` 全文（这是契约）、`01-architecture.md` §解耦点
-
----
-
-### 🧑💻 C — Agent + 硬件
-
-| 负责 | 文件 |
-|---|---|
-| MCP Server + 工具设计 | `host/crates/mcp/` |
-| Agent 工作流与提示词 | `docs/` |
-| 改板设计（双通道前端） | `hardware/mods/` |
-| BOM / 采购 / 焊接 / 实测 | `hardware/` |
-| 性能实测与文档校正 | 回写 `04-performance.md` |
-
-**入口文档**：`04-performance.md` 全文、`02-hardware.md` 全文
 
 ---
 

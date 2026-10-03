@@ -378,9 +378,9 @@ pub fn faults(app: &mut App, ui: &mut egui::Ui) {
         });
 
     ui.checkbox(&mut f.no_trigger, "永不触发")
-        .on_hover_text("验证「等触发超时」这条路不会卡死界面");
+        .on_hover_text("验证「等待触发超时」时界面不会阻塞");
     ui.checkbox(&mut f.force_overrun, "强制溢出")
-        .on_hover_text("验证界面会如实标记数据不完整，而不是假装正常");
+        .on_hover_text("验证界面会如实标记数据不完整");
 
     ui.horizontal(|ui| {
         let can_inject = !app.device_is_elsewhere();
@@ -1119,7 +1119,6 @@ pub fn ai_panel(app: &mut App, ui: &mut egui::Ui) {
             egui::Color32::from_rgb(230, 160, 30),
             "⚠ 设备已交给 AI —— 左侧所有设备控件已停用",
         );
-        ui.small("串口同一时刻只能由一个进程持有。设备控件停用属交接的必然。");
 
         // ⚠ 只在 `Running` 阶段给终止。
         //
