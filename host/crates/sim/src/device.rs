@@ -16,7 +16,7 @@
 //!   并被 README 与 docs/01 各抄了一遍。）
 //! - **故障注入**：丢帧 / CRC 错 / 延迟尖峰
 
-use crate::waveform::{Scenario, WaveformGen};
+use crate::waveform::{Scenario, WaveformGen, FULL_SCALE_LSB};
 use scope_core::device::DevicePort;
 use scope_core::error::LinkError;
 use scope_proto::*;
@@ -53,6 +53,19 @@ impl Default for FaultInjection {
 }
 
 impl FaultInjection {
+    /// 第 `n` 个发出帧该不该被丢掉。
+    ///
+    /// 抽成方法是为了让「什么算丢帧」只有一处定义 —— 计数与丢弃动作
+    /// 必须用同一个判据，否则统计出来的数和实际丢的对不上。
+    pub fn drops_frame(&self, n: u32) -> bool {
+        self.drop_every_n_frames > 0 && n % self.drop_every_n_frames == 0
+    }
+
+    /// 第 `n` 个发出帧的 CRC 该不该被破坏。
+    pub fn breaks_crc(&self, n: u32) -> bool {
+        self.crc_err_every_n_frames > 0 && n % self.crc_err_every_n_frames == 0
+    }
+
     /// 是否完全干净（无注入）。
     pub fn is_clean(&self) -> bool {
         self.drop_every_n_frames == 0
@@ -79,6 +92,24 @@ struct Config {
     holdoff_us: u32,
     ch0_enable: u8,
     ch0_coupling: u8,
+    /// 通道 0 的量程档位索引。**本板是手拨开关，只记录不生效**（见 docs/02 §5）。
+    ch0_range_idx: u8,
+    /// 通道 0 的垂直偏移（ADC LSB，i16）。
+    ///
+    /// `GET_CONFIG` 不回报这两个字段（协议里 payload 是定长 17 字节），
+    /// 所以只能靠 `SET_CHANNEL` 记下来。它们由 `SET_CHANNEL` 的**回显**带给主机。
+    ch0_offset_lsb: i16,
+    /// 通道 1 的使能。
+    ///
+    /// 分开存是有原因的：从前 `cmd_set_channel` 无论 `ch` 是几都往 `ch0_*`
+    /// 里写 —— 配 CH2 会**改掉 CH1 的配置**。
+    ch1_enable: u8,
+    /// 通道 1 的耦合。
+    ch1_coupling: u8,
+    /// 通道 1 的量程档位索引（同 ch0，只记录）。
+    ch1_range_idx: u8,
+    /// 通道 1 的垂直偏移。
+    ch1_offset_lsb: i16,
 }
 
 impl Default for Config {
@@ -97,6 +128,12 @@ impl Default for Config {
             holdoff_us: 1000,
             ch0_enable: 1,
             ch0_coupling: 0,
+            ch0_range_idx: 0,
+            ch0_offset_lsb: 0,
+            ch1_enable: 1,
+            ch1_coupling: 0,
+            ch1_range_idx: 0,
+            ch1_offset_lsb: 0,
         }
     }
 }
@@ -127,6 +164,19 @@ pub struct SimDevice {
     /// `dev.faults.drop_every_n_frames = 50;`
     pub faults: FaultInjection,
     frames_sent: u32,
+
+    // ── 链路健康计数（GET_STATUS 上报）──────────────────────────
+    //
+    // 从前 `cmd_get_status` 把 `overrun_samples` / `rx_crc_err` /
+    // `rx_dropped` / `tx_dropped` 全部**写死为 0**，于是主机侧读到
+    // 「零溢出、零 CRC 错」时，那根本不是统计出来的，而是没人统计。
+    // 一个 Agent 会把它当成「链路很干净」的证据。
+    /// 累计被丢弃的样点数（采集溢出）。
+    overrun_samples: u32,
+    /// 累计被故障注入丢掉的发送帧数。
+    tx_dropped: u32,
+    /// 最近一次错误码（`queue_error` 回的那个）。
+    last_error_code: u16,
 
     /// 上一次触发的时间（用于 auto 模式超时与 holdoff）。
     armed_at: Option<std::time::Instant>,
@@ -167,6 +217,9 @@ impl SimDevice {
             dedup: None,
             faults: FaultInjection::default(),
             frames_sent: 0,
+            overrun_samples: 0,
+            tx_dropped: 0,
+            last_error_code: 0,
             armed_at: None,
             triggered: false,
         }
@@ -209,9 +262,8 @@ impl SimDevice {
         self.frames_sent = self.frames_sent.wrapping_add(1);
 
         // 故障注入：丢帧
-        if self.faults.drop_every_n_frames > 0
-            && self.frames_sent % self.faults.drop_every_n_frames == 0
-        {
+        if self.faults.drops_frame(self.frames_sent) {
+            self.tx_dropped = self.tx_dropped.wrapping_add(1);
             return;
         }
 
@@ -228,9 +280,7 @@ impl SimDevice {
         let mut bytes = f.encode();
 
         // 故障注入：破坏 CRC（改最后一个字节）
-        if self.faults.crc_err_every_n_frames > 0
-            && self.frames_sent % self.faults.crc_err_every_n_frames == 0
-        {
+        if self.faults.breaks_crc(self.frames_sent) {
             if let Some(last) = bytes.last_mut() {
                 *last ^= 0xFF;
             }
@@ -244,6 +294,8 @@ impl SimDevice {
     /// 错误响应统一用 `CMD_ERROR` 作为帧命令码，原始命令码由主机从
     /// 自己发出的请求里对应 —— 这样错误帧的解析路径只有一条。
     fn queue_error(&mut self, seq: u16, _hash_cmd: u16, code: u16, msg: &str) {
+        // 让 GET_STATUS 能回答「上一次出错是什么」——从前这个字段写死 0
+        self.last_error_code = code;
         let msg_bytes = msg.as_bytes();
         let n = msg_bytes.len().min(32);
         let mut p = Vec::with_capacity(4 + n);
@@ -410,8 +462,17 @@ impl SimDevice {
     fn cmd_get_status(&mut self, seq: u16) {
         let mut p = Vec::with_capacity(33);
         p.push(self.state as u8);
-        p.extend_from_slice(&0u16.to_le_bytes()); // err_flags
-        p.extend_from_slice(&0u16.to_le_bytes()); // ring_fill
+        // bit0 = 发生过溢出。位含义见 docs/03-protocol.md
+        let err_flags: u16 = u16::from(self.overrun_samples > 0);
+        p.extend_from_slice(&err_flags.to_le_bytes());
+        // 环里已填充的样点数：DONE 报本次采集的长度，其余状态报 0
+        let ring_fill = self
+            .captured
+            .as_ref()
+            .filter(|_| self.state == State::Done)
+            .map(|c| c.channels.first().map(|v| v.len()).unwrap_or(0) as u16)
+            .unwrap_or(0);
+        p.extend_from_slice(&ring_fill.to_le_bytes());
         p.extend_from_slice(
             &self
                 .captured
@@ -420,14 +481,25 @@ impl SimDevice {
                 .unwrap_or(0)
                 .to_le_bytes(),
         );
-        p.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // last_trigger_index = 无
-        p.extend_from_slice(&0u32.to_le_bytes()); // overrun_samples
-        p.extend_from_slice(&0u16.to_le_bytes()); // rx_crc_err
-        p.extend_from_slice(&0u16.to_le_bytes()); // rx_dropped
-        p.extend_from_slice(&0u32.to_le_bytes()); // tx_dropped
+        let ti = self
+            .captured
+            .as_ref()
+            .and_then(|c| c.trigger_index)
+            .unwrap_or(0xFFFF_FFFF);
+        p.extend_from_slice(&ti.to_le_bytes());
+        // ── 下面四个是「这份数据可不可信」的判据。**必须是真统计出来的值。**
+        //
+        // 回归：这四行从前全是写死的 `0`。主机侧读到「零溢出、零 CRC 错」时，
+        // 那根本不是采集下来的证据，而是**没人统计过** —— 而 Agent 会把它
+        // 当成「链路很干净」的依据。（`Parser` 其实一直在统计
+        // `crc_err_count` / `dropped_count`，只是没人往上报。）
+        p.extend_from_slice(&self.overrun_samples.to_le_bytes());
+        p.extend_from_slice(&(self.parser.crc_err_count.min(u16::MAX as u32) as u16).to_le_bytes());
+        p.extend_from_slice(&(self.parser.dropped_count.min(u16::MAX as u32) as u16).to_le_bytes());
+        p.extend_from_slice(&self.tx_dropped.to_le_bytes());
         p.extend_from_slice(&self.uptime_ms().to_le_bytes());
         p.extend_from_slice(&self.tick_us().to_le_bytes());
-        p.extend_from_slice(&0u16.to_le_bytes()); // last_error_code
+        p.extend_from_slice(&self.last_error_code.to_le_bytes());
         debug_assert_eq!(p.len(), 33);
         self.queue(flags::RESP, seq, Cmd::GetStatus, p);
     }
@@ -479,8 +551,27 @@ impl SimDevice {
             );
             return;
         }
-        self.cfg.ch0_enable = payload[1];
-        self.cfg.ch0_coupling = payload[3];
+        // payload: {ch:u8, enable:u8, range_idx:u8, coupling:u8, offset_lsb:i16}
+        let enable = payload[1];
+        let range_idx = payload[2];
+        let coupling = payload[3];
+        let offset_lsb = i16::from_le_bytes([payload[4], payload[5]]);
+        match payload[0] {
+            0 => {
+                self.cfg.ch0_enable = enable;
+                self.cfg.ch0_range_idx = range_idx;
+                self.cfg.ch0_coupling = coupling;
+                self.cfg.ch0_offset_lsb = offset_lsb;
+            }
+            1 => {
+                self.cfg.ch1_enable = enable;
+                self.cfg.ch1_range_idx = range_idx;
+                self.cfg.ch1_coupling = coupling;
+                self.cfg.ch1_offset_lsb = offset_lsb;
+            }
+            _ => {}
+        }
+        // 回显生效值（协议规定），主机据此知道当前通道配置
         self.queue(flags::RESP, seq, Cmd::SetChannel, payload.to_vec());
     }
 
@@ -710,7 +801,26 @@ impl SimDevice {
 
         // 必须用 generate_multi：逐通道调 generate 会让第二路整体偏移 n 个样点，
         // 两路时间轴对不上 —— 对 I2C（SCL/SDA 必须同时刻）是致命的。
-        let channels = self.wave.generate_multi(ch_count, n, self.cfg.rate_hz);
+        let mut channels = self.wave.generate_multi(ch_count, n, self.cfg.rate_hz);
+
+        // **按通道配置改变输出** —— 从前 `ch0_enable` / `offset_lsb` 只是被存下来
+        // 并在 `GET_CONFIG` 里回显，**没有任何代码用它**：禁用一个通道，
+        // 采集数据一字不变。那等于设备在撒谎。
+        for (ch, samples) in channels.iter_mut().enumerate() {
+            let (enable, offset) = match ch {
+                0 => (self.cfg.ch0_enable != 0, i32::from(self.cfg.ch0_offset_lsb)),
+                _ => (self.cfg.ch1_enable != 0, i32::from(self.cfg.ch1_offset_lsb)),
+            };
+            if !enable {
+                // 通道关掉 → 平坦的 0。**不要**在这里保持原样：那会让
+                // 「关了这个通道」与「这个通道是平的」看起来一模一样。
+                samples.iter_mut().for_each(|v| *v = 0);
+            } else if offset != 0 {
+                samples.iter_mut().for_each(|v| {
+                    *v = (i32::from(*v) + offset).clamp(0, FULL_SCALE_LSB as i32) as u16;
+                });
+            }
+        }
 
         // 触发点：在中间找一个上穿电平的位置（模拟真实触发搜索）
         let trigger_index = if self.faults.no_trigger {
@@ -726,11 +836,17 @@ impl SimDevice {
         let id = self.next_capture_id;
         self.next_capture_id = self.next_capture_id.wrapping_add(1).max(1);
 
+        let overrun = self.faults.force_overrun;
+        if overrun {
+            // 溢出的语义是「这些样点没被存下来」——按采集长度计入累计值
+            let n = self.cfg.capture_samples as u32;
+            self.overrun_samples = self.overrun_samples.saturating_add(n);
+        }
         self.captured = Some(Captured {
             id,
             channels,
             trigger_index,
-            overrun: self.faults.force_overrun,
+            overrun,
         });
         self.state = State::Done;
 

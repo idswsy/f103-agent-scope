@@ -157,10 +157,14 @@ F103 的**硬件 CRC 单元只支持固定 CRC-32 多项式**，做不了 CCITT 
 
 `GET_STATUS` 是 Agent 问「现在什么情况」的首选命令，**任何状态可调**。
 
-> ⚠ **模拟器把几个计数器写死为 0**：`err_flags` / `overrun_samples` / `rx_crc_err`。
-> 也就是说，在 `sim` 上读到「溢出 0 次、CRC 错 0 次」**不构成「总线很干净」的证据** ——
-> 它们根本没被统计。真机会填这些字段（固件属 P1）。
-> MCP 层目前也还没把它们透出给 Agent。
+> **这几个计数器现在是真统计的**：模拟器按实际发生的溢出/丢帧/解析错误累加，
+> `scope_core::DeviceStatus` 解析全部 33 字节，MCP 的 `scope_status` 通过
+> `link_health` 透出（含一句 `clean` 判据）。
+>
+> 回归：这三段曾经**全是假的** —— 模拟器把 `overrun_samples` / `rx_crc_err` /
+> `rx_dropped` 写死为 `0`，而 core 的 `get_status` 只读第一个字节（`state`）
+> 就把剩下 32 字节丢了。在 `sim` 上读到「零溢出、零 CRC 错」时，那根本不是
+> 证据，而是**没人统计过** —— 一个 Agent 会把它当成「链路很干净」的依据。
 
 `RESET` 用 `magic` 防误触发。主机需重新 `GET_INFO` 并重置 seq。
 
@@ -177,6 +181,18 @@ F103 的**硬件 CRC 单元只支持固定 CRC-32 多项式**，做不了 CCITT 
 **`SET_SAMPLE_RATE` 必须回显**：F103 只有 72 MHz / 定时器整数分频的量化档位，主机时间轴一律用 `actual_hz`。
 
 **`SET_CHANNEL` 的电平/偏移一律用 ADC LSB 整数**。伏特换算、量程衰减、AC/DC 校正**全部留在上位机**（按 `uid` 存标定表），MCU 不碰浮点、不知道「伏特」是什么。
+
+> ⚠ **这块板上 `SET_CHANNEL` 的五个字段并不是都做得到**（见 [`02-hardware.md`](02-hardware.md) §5）：
+>
+> | 字段 | 本板能不能真的生效 |
+> |---|---|
+> | `enable` | ✅ 软件控制 |
+> | `offset_lsb` | ✅ 软件控制（垂直偏移是数字的） |
+> | `coupling` | ❌ **手拨开关 SW2** —— 下发值只被记录并回显，实际以开关位置为准 |
+> | `range_idx` | ❌ **手拨开关 SW3** —— 同上 |
+> | `ch` | ✅（决定上面几个作用在哪个通道） |
+>
+> MCP 层在收到被程控不了的字段时会**明确警告**，而不是让 Agent 以为耦合真的切了。
 
 `SET_TRIGGER.mode`：`0=auto` / `1=normal` / `2=single`。
 触发比较带 **±16 LSB 迟滞**防抖动重触发。

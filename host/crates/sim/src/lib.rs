@@ -112,7 +112,7 @@ mod tests {
         bus.set_trigger(1, 0, 0, 2048, 2048, 1000).unwrap();
         bus.set_acq(0, 1024, 0, 1).unwrap();
 
-        assert_eq!(bus.get_status().unwrap(), State::Idle);
+        assert_eq!(bus.get_status().unwrap().state, State::Idle);
         bus.arm().unwrap();
 
         // 等触发事件

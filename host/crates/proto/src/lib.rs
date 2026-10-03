@@ -289,6 +289,17 @@ pub enum State {
     Fault = 4,
 }
 
+impl Default for State {
+    /// 默认为 [`State::Idle`] —— 设备上电后的状态。
+    ///
+    /// 有默认值是为了让 [`DeviceStatus`](scope_core) 之类「先 Default 再填」的
+    /// 结构能用 `#[derive(Default)]`；**不要**拿它当「读不到就当作空闲」的
+    /// 兜底 —— 那会把「设备回了个我们不认识的状态」伪装成「设备空闲」。
+    fn default() -> State {
+        State::Idle
+    }
+}
+
 impl State {
     /// 从线上字节解析。
     pub fn from_u8(v: u8) -> Option<State> {
