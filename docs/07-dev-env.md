@@ -143,14 +143,17 @@ gcc -std=c11 -Iproto -Iproto/build -o /tmp/tv \
 
 ### ⚠️ 数据链路的引脚选择
 
-**地阔星核心板没有板载串口桥**，Type-C 直连 PA11/PA12。
-详见 [`02-hardware.md`](02-hardware.md) §4。
+**核心板板载 USB 转串口**（STM32F103C8T6 最小系统板），插上 Type-C 即出 COM 口。
+详见 [`02-hardware.md`](02-hardware.md) §4 与 [ADR-011](06-decisions.md)。
 
 ```
-P1 期：外接 USB-TTL → PA9(TX) / PA10(RX)   ← 最快打通
-P2 起：USB CDC    → PA11 / PA12            ← 板载 Type-C，带宽高
-🚫 禁止：USART2    → PA2 / PA3             ← 硬冲突（PWM 输出 + 模拟输入）
+主力：USART1 + 板载 USB 转串口 → PA9(TX) / PA10(RX)   ← 插上即用
+备选：USB CDC              → PA11 / PA12          ← 带宽高，但自写 USB device 固件
+🚫 禁止：USART2             → PA2 / PA3            ← 硬冲突（PWM 输出 + 模拟输入）
 ```
+
+> 2026-10-04 换板前，核心板没有串口桥，当时的方案是「外接 USB-TTL」。
+> 见 [ADR-009](06-decisions.md) 与取代它的 [ADR-011](06-decisions.md)。
 
 ---
 
@@ -242,7 +245,7 @@ CI（Ubuntu）上 `make` 是可用的，两条路都支持。
 **症状**：刚 `open` 就收到一堆乱码，或者 GET_INFO 无响应。
 
 **原因**：USB CDC 首次打开时 DTR 拉低可能触发板子复位。
-地阔星的 PA12 疑似 1.5 kΩ 硬上拉（`【待测】`），概率不低。
+PA12 疑似 1.5 kΩ 硬上拉（`【待测】` —— **这是上一块板的结论，换板后待重测**），概率不低。
 
 **解决**：连接后等 200 ms 再发第一条命令；
 或在固件里加 DTR 忽略逻辑。
