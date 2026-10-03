@@ -5,7 +5,34 @@
 
 ---
 
+## 已实现的工具
+
+### `agent_demo/` —— 用 LLM 的原生工具调用驱动这台示波器
+
+**为什么它在这里**：项目的 P3 验收标准是「Agent 一句话完成一次真实的总线调试」，
+而证明这句话需要一个**可复现**的东西 —— 一段聊天记录证明不了任何事。
+
+它做的事：起一个 `scope-mcp` 子进程，走 `tools/list` 拿到工具 schema，原样转成
+LLM 的工具表，然后跑 `tool_use` ↔ `tool_result` 循环，直到模型给出结论。
+
+```bash
+./host/run.sh build -p scope-mcp
+export DEEPSEEK_API_KEY=...        # 或 ANTHROPIC_API_KEY
+python tools/agent_demo/agent.py
+```
+
+**零依赖** —— 只用 Python 标准库。它同时是一份**说明**：一个 MCP 客户端要多少代码，
+答案是一百多行。
+
+产物是 [`docs/08-agent-walkthrough.md`](../docs/08-agent-walkthrough.md) ——
+一份真实跑出来的实录（不是整理的）。详见该目录的 README。
+
+---
+
 ## 规划中的工具
+
+> ⚠️ **下面两个只有设计，没有代码**（目录里只有 `.gitkeep`）。
+> 保留在这里是为了说明「打算往哪放」，别当成已有实现。
 
 ### `i2c_decode/` —— 独立 I2C 解码器
 

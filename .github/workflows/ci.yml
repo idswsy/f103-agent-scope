@@ -194,3 +194,19 @@ jobs:
 
       - name: MCP 自检
         run: cargo run -q -p scope-mcp -- --selftest
+
+      # docs/05-roadmap.md 的「MCP 工具清单」是 TOOLS 常量的**人读镜像**，
+      # 文档自己写着「改一处必须改两处」—— 但在此之前没有任何东西守着它。
+      # 这跟协议那四处用的是同一种纪律：镜像会腐烂，所以让 CI 盯着。
+      - name: 检查 MCP 工具名清单与实现一致
+        working-directory: .
+        run: |
+          cargo run -q --manifest-path host/Cargo.toml -p scope-mcp -- --list-tools \
+            | grep -oP '^── \Kscope_[a-z_]+' | sort -u > /tmp/impl_tools.txt
+          grep -oP '^\| `\Kscope_[a-z_]+' docs/05-roadmap.md | sort -u > /tmp/doc_tools.txt
+          echo "实现 $(wc -l < /tmp/impl_tools.txt) 个 / 文档 $(wc -l < /tmp/doc_tools.txt) 个"
+          if ! diff -u /tmp/doc_tools.txt /tmp/impl_tools.txt; then
+            echo "::error::docs/05-roadmap.md 的工具清单与 scope-mcp 的 TOOLS 常量不一致"
+            exit 1
+          fi
+          echo "✓ 工具名清单一致（说明文字仍需人工同步）"

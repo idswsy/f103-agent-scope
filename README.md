@@ -52,7 +52,7 @@
 
 | 指标 | F103 版本能做的 | 明确做不到的 |
 |---|---|---|
-| 采样率 | 双通道同步 **857 kSPS/通道**；单通道交织 1.71 MSPS（仅显示） | 1 MSPS 与 USB 并存；三 ADC 交织 7.2 MSPS（主板升级后，见路线图 P5） |
+| 采样率 | 单通道 **857 kSPS**；单通道交织 1.71 MSPS（仅显示）<br>⚠ 双通道同步 857 kSPS/路 **要等 P4 改板** —— 底板只有一路模拟输入（[ADR-010](docs/06-decisions.md)） | 1 MSPS 与 USB 并存；三 ADC 交织 7.2 MSPS（主板升级后，见路线图 P5） |
 | I2C 解码 | **100k / 400k / 1MHz 全部可靠**（走数字通路） | 不测 I2C 时序合规性（tSU;DAT / tr 的 ns 级验证） |
 | 模拟带宽 | ≤ 100 kHz 保证 | > 0.5 MHz |
 | 存储深度 | 单次 **4096 点**（8 KB 环） | 深存储、外扩 SRAM（C8 无 FSMC） |
@@ -68,14 +68,20 @@
 
 ```
 F103/
-├─ docs/          设计文档（架构、协议、硬件、性能边界、路线图、决策记录）
+├─ docs/          设计文档 00~08（起源 / 架构 / 硬件 / 协议 / 性能边界 /
+│                 路线图 / 决策记录 / 开发环境 / Agent 工作流实录）
 ├─ proto/         协议唯一真相源：C 头文件 + 纯 C 编解码 + 双端共用的黄金测试向量
-├─ firmware/      STM32F103 固件（C，分层 App/Hardware）
-├─ host/          Rust workspace：core / transport / sim / cli / mcp
-├─ hardware/      立创底板资料、BOM、改板设计
-├─ tools/         独立工具（I2C 解码器、CSV 导出、波形查看）
-└─ .github/       CI：C 向量测试 + cargo test
+├─ firmware/      STM32F103 固件（C，分层 App/Hardware）—— ⚠ 尚未实现，见该目录 README
+├─ host/          Rust workspace，8 个 crate：
+│                   proto · core · transport-serial · sim · device · cli · gui · mcp
+├─ hardware/      立创底板资料与改板设计 —— ⚠ 尚未整理，见该目录 README
+├─ tools/         独立工具：agent_demo（已实现）；i2c_decode / csv_export（仅规划）
+└─ .github/       CI：5 个 job（C 向量 / Rust / GUI / 固件分层检查 / 端到端冒烟）
 ```
+
+> **三个目录是空的**：`firmware/`（0 行代码）、`hardware/`（只有说明）、
+> `tools/i2c_decode` 与 `tools/csv_export`（只有规划）。它们保留在树里是为了
+> 说明**打算往哪放**，各自的 README 写了完整设计 —— 别把规划当成已有实现。
 
 **协议真相源策略**：固件用 C、上位机用 Rust，跨语言无法靠编译器保证一致。
 所以把 [`proto/tests/vectors.json`](proto/tests/vectors.json) 当作唯一契约 —— 同一份黄金向量由 Rust `#[test]` 和「不依赖 HAL 的纯 C 测试」两端同时执行，漂移在测试期暴露。
@@ -85,14 +91,21 @@ F103/
 ## 快速开始
 
 > 全部命令都在**仓库根目录**（`F103/`）执行。
-> 用 `./host/run.sh` 而不是裸 `cargo` —— 它会自动绕开中文路径导致的链接失败（见 [`docs/07-dev-env.md`](docs/07-dev-env.md) 坑 #1）。
+> ⚠ **`-o` 的相对路径是相对 `host/` 的**，不是相对你敲命令的地方 ——
+> `run.sh` 会先 `cd` 到 `host/` 再调 cargo。想让它落在仓库根目录就写
+> `-o ../wave.csv` 或给绝对路径。
+>
+> 用 `./host/run.sh` 而不是裸 `cargo`。它做两件事：把 `CARGO_TARGET_DIR` 指到
+> 一个纯 ASCII 路径（历史包袱 —— 项目路径曾经含中文，MinGW 的 `ld.exe` 会链接失败；
+> 现在 checkout 到中文目录仍然会踩，所以保留），以及统一构建参数。
+> 详见 [`docs/07-dev-env.md`](docs/07-dev-env.md) 坑 #1。
 
 ### 路线 A：没有硬件也能开发（推荐先走这条）
 
 ```bash
 # 1. 协议测试：C 与 Rust 两端跑同一份黄金向量
 ./proto/run_tests.sh            # C 端，50 项
-./host/run.sh test              # Rust 端，61 项
+./host/run.sh test              # Rust 端，**全部 ok 即通过**（不写死条数 —— 会腐烂）
 
 # 2. 对着模拟器抓一次波形
 ./host/run.sh run -p scope-cli -- sim capture --scenario sine_1k_3v3 -n 1024 -o wave.csv
@@ -100,11 +113,24 @@ F103/
 # 3. 看一眼 I2C 双通道是什么样
 ./host/run.sh run -p scope-cli -- sim capture --scenario i2c_100k -n 2048 -o i2c.csv
 
-# 4. MCP 工具链自检
+# 4. 打开桌面 GUI（自动连模拟器并采集一帧）
+./host/run.sh run -p scope-gui -- --demo --scenario i2c_100k
+
+# 5. MCP 工具链自检
 ./host/run.sh run -p scope-mcp -- --selftest
 ```
 
-模拟器实现同一套 `DevicePort`，内含 F103 真实档位表、ARM/触发语义、按波特率模拟的分片节奏、以及丢帧/CRC 错/延迟尖峰注入。MCP / CLI 切到 `sim` 后 Agent 逻辑零改动。
+> GUI 是一个 **egui 桌面应用**（`host/crates/gui`）：设备 / 配置 / 波形
+> （泳道显示、缩放平移、触发点、判决带）/ I2C 解码面板（双泳道 + 色标 +
+> 交易表 + 信号质量）/ 历史采集 / 测量 / 导出 / 模拟器故障注入 / 帮助页。
+> `--demo` 免点击直接出图；去掉它就是正常的连接流程。
+> `--scenario <名字>` 指定初始场景，`--font <路径>` 换中文字体。
+
+模拟器实现同一套 `DevicePort`，内含 F103 真实档位表、ARM/触发语义、状态机约束、
+seq 去重缓存，以及六种故障注入（丢帧 / CRC 错 / 延迟尖峰 / 永不触发 / 强制溢出）。
+MCP / CLI / GUI 切到 `sim` 后 **Agent 逻辑零改动**。
+
+> 它**不按波特率节流** —— 那样只会让测试变慢。链路的快慢只影响命令层估算超时。
 
 ### 路线 B：有硬件
 
@@ -118,6 +144,28 @@ F103/
 
 固件工程**尚未创建**（P1 任务）—— `firmware/README.md` 写了完整的分层结构与采样架构，
 拿到板子后照着建。烧录用 DAP-Link，接线见那份文档。
+
+### 路线 C：把它接到你自己的 Agent 上
+
+`scope-mcp` 是标准 MCP server，跑在 stdio 上。任何 MCP 客户端都能接：
+
+```bash
+# Claude Code
+claude mcp add scope -- <仓库绝对路径>/host/target/debug/scope-mcp.exe
+
+# 或者直接跟任意客户端/脚本用 JSON-RPC 对话（一行一条消息）
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ./host/target/debug/scope-mcp.exe
+```
+
+`tools/agent_demo/` 里有一个**零依赖的最小客户端**（一百多行 Python），
+做的是同样的事：`tools/list` 拿 schema → 转成 LLM 的工具表 → 跑 tool-use 循环。
+它同时是 [`docs/08-agent-walkthrough.md`](docs/08-agent-walkthrough.md)
+那份实录的生成程序 —— 想改造自己的用法，从它改起最快。
+
+> ⚠ **`capture_id` 是进程内的。** 一次管道输入就是一个会话，进程退出后
+> `capture_id` 作废，下次从 1 重新开始。所以「抓完再读」必须把
+> `scope_capture` 与后续的 `scope_read_waveform` / `scope_measure` /
+> `scope_i2c_decode` **一次喂进同一个进程**。
 
 ---
 
@@ -135,14 +183,18 @@ F103/
 
 ## 路线图
 
-| 阶段 | 目标 | 验收标准 |
-|---|---|---|
-| **P0** | 协议闭环（无硬件） | 黄金向量在 C 与 Rust 两端全绿；`sim` 能跑通 capture |
-| **P1** | 最简硬件闭环 | F103 采 2048 点 → 串口 → CLI 落 CSV → 能画图 |
-| **P2** | 数字通路 I2C 解码 | 100k/400k/1MHz 真实总线解码结果与逻辑分析仪一致 |
-| **P3** | MCP + Agent | Agent 一句话完成"抓一次 I2C 写时序并告诉我为什么 NACK" |
-| **P4** | 增强 | 双通道改板、自动量程、GUI、等效时间采样 |
-| **P5** | 主板升级 STM32F407 | 以太网 / FSMC / 三 ADC 三重解锁：7.2 MSPS、深存储、直接传原始波形 |
+| 阶段 | 目标 | 状态 | 验收标准 |
+|---|---|---|---|
+| **P0** | 协议闭环（无硬件） | ✅ 完成 | 黄金向量在 C 与 Rust 两端全绿；`sim` 能跑通 capture |
+| **P1** | 最简硬件闭环 | ❌ **未开始**（固件 0 行） | F103 采 2048 点 → 串口 → CLI 落 CSV → 能画图 |
+| **P2** | 数字通路 I2C 解码 | ⚠️ 主机侧完成，硬件侧 0 | 100k/400k/1MHz 真实总线解码结果与逻辑分析仪一致 |
+| **P3** | MCP + Agent | ✅ 完成，见 [`docs/08`](docs/08-agent-walkthrough.md) | Agent 一句话完成"抓一次 I2C 写时序并告诉我为什么 NACK" |
+| **P4** | 增强 | ⚠️ GUI / 历史 / 导出已做；改板与自动量程未做 | 双通道改板、自动量程、等效时间采样 |
+| **P5** | 主板升级 STM32F407 | ❌ 未开始（后期计划） | 以太网 / FSMC / 三 ADC 三重解锁：7.2 MSPS、深存储、直接传原始波形 |
+
+> **一句话现状**：软件栈（协议 / 上位机 / 模拟器 / GUI / MCP / Agent）已完整可跑，
+> 但没有硬件 —— `firmware/` 一行都没有，串口路径**从未与真机对过话**。
+> 所有演示都跑在内置模拟器上。
 
 详见 [`docs/05-roadmap.md`](docs/05-roadmap.md)。
 

@@ -2,11 +2,15 @@
 //!
 //! 把示波器能力以 **14 个粗粒度工具**暴露给 AI Agent。
 //!
-//! ## 当前状态：骨架已就位，工具实现待 P3
+//! ## 状态
 //!
-//! 这个二进制现在做两件有用的事：
-//! 1. `--list-tools` 打印工具清单与 JSON Schema（人工核对用）
-//! 2. `--selftest` 走一遍模拟器，确认命令层可用
+//! 14 个工具**全部实现**（见 `session.rs`）。三种用法：
+//! 1. 默认：跑 stdio 上的 MCP server（换行分隔的 JSON-RPC 2.0）
+//! 2. `--list-tools`：打印工具清单与**由参数类型生成的** JSON Schema
+//! 3. `--selftest`：走一遍模拟器，确认命令层可用
+//!
+//! `docs/08-agent-walkthrough.md` 是一份真实的 Agent 使用实录，
+//! 生成程序在 `tools/agent_demo/`。
 //!
 //! ## 设计约束（为什么是"粗粒度"）
 //!
@@ -238,7 +242,11 @@ fn type_label(schema: &Value, root: &Value) -> String {
     }
 }
 
-/// 工具清单 —— 与 `docs/03-protocol.md` §MCP 保持一致。
+/// 工具清单。
+///
+/// 工具名与说明的**人读镜像**在 `docs/05-roadmap.md` 的「MCP 工具清单」一节
+/// （`docs/03-protocol.md` 里没有 §MCP 这一节 —— 这里曾经指向它）。
+/// 那边是手抄的，CI 有一条检查卡住工具名不许分家。
 ///
 /// 每个条目的最后一个参数是参数类型：schema 由它生成，`arguments` 也解成它。
 /// **不要在这里手写 schema 字符串** —— 见 [`tool!`] 的说明。
@@ -285,7 +293,7 @@ const TOOLS: &[ToolSpec] = &[
     ),
     tool!(
         "scope_capture",
-        "采集一次并等待触发完成。默认只返回统计量与 ≤256 点 minmax 预览，不含全量波形",
+        "采集一次并等待触发完成。默认只返回统计量与 ≤256 点 minmax 预览，不含全量波形。⚠ 返回的 capture_id 只在**当前连接的本次会话**里有效 —— 之后引用它的调用必须接着发，不能另起一个进程",
         "ARM + EVENT_TRIGGER + READ_BUFFER",
         "总是",
         CaptureArgs,
@@ -293,7 +301,7 @@ const TOOLS: &[ToolSpec] = &[
     ),
     tool!(
         "scope_read_waveform",
-        "按需分页拉取波形样点。硬顶 4096 点；要全量请用 scope_save_capture",
+        "按需分页拉取波形样点。硬顶 4096 点；要全量请用 scope_save_capture。capture_id 来自本次会话里的 scope_capture",
         "READ_BUFFER",
         "总是",
         ReadWaveformArgs,

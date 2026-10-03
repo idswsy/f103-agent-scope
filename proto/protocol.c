@@ -341,7 +341,16 @@ bool proto_cmd_allowed(scope_state_t state, uint16_t cmd)
     switch (state) {
     case STATE_IDLE:
     case STATE_DONE:
-        /* IDLE / DONE 下除 ARM 会丢数据外全部允许 */
+        /* IDLE / DONE 下**全部**允许 —— 包括 ARM。
+         *
+         * 注意：在 DONE 下再次 ARM 会丢弃当前采集的数据。这里选择放行而不是
+         * 拒绝，是因为「采完想立刻再采一次」是最常见的用法，为它加一道状态
+         * 检查会让主机的采集循环多一次 GET_STATUS 往返。数据被丢弃这件事
+         * 由 READ_BUFFER 的 capture_id 校验兜住（对不上的 id 回 NO_DATA）。
+         *
+         * 回归：这句注释从前写的是「除 ARM 会丢数据外全部允许」——
+         * 与它下面那行 `return true` 直接矛盾，而 docs/03 的状态机表照抄了
+         * 注释的说法，于是契约页与实现讲了两件不同的事。 */
         return true;
 
     case STATE_ARMED:

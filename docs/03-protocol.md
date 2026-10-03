@@ -4,7 +4,7 @@
 > `docs/03-protocol.md` + `proto/protocol.h` + `host/crates/proto/src/lib.rs` + `proto/tests/vectors.json`。
 > CI 会跑两端黄金向量，不同步就红。
 
-版本：`0x10`（主 1 / 次 0） · 状态：草案 · 最后更新：2026-10-01
+版本：`0x10`（主 1 / 次 0） · 状态：草案 · 最后更新：2026-10-03
 
 ---
 
@@ -115,13 +115,27 @@ F103 的**硬件 CRC 单元只支持固定 CRC-32 多项式**，做不了 CCITT 
 
 | 状态 | 值 | 允许的命令 |
 |---|---|---|
-| `IDLE` | 0 | 除 `STOP` 外全部 |
-| `ARMED` | 1 | `STOP` / `GET_STATUS` / `PING` / `FORCE_TRIGGER` |
-| `STREAMING` | 2 | 同上 |
-| `DONE` | 3 | 除 `ARM`（会丢弃当前数据）外全部 |
-| `FAULT` | 4 | `RESET` / `GET_STATUS` / `PING` / `GET_LAST_ERROR` |
+| `IDLE` | 0 | **全部** |
+| `ARMED` | 1 | 通用命令 + `FORCE_TRIGGER` |
+| `STREAMING` | 2 | 同 `ARMED` |
+| `DONE` | 3 | **全部**（再次 `ARM` 会丢弃当前采集的数据） |
+| `FAULT` | 4 | 通用命令 + `RESET` |
 
-`ARMED` / `STREAMING` 下发配置类命令 → 回 `BUSY`（提示先 `STOP`）。
+**通用命令**（任何状态都允许）：`GET_INFO` / `PING` / `GET_STATUS` / `STOP` /
+`GET_LAST_ERROR`，以及三个设备→主机的事件帧
+（`EVENT_TRIGGER` / `EVENT_OVERRUN` / `EVENT_LOG`）。
+
+`ARMED` / `STREAMING` 下 `RESET` / `GET_CONFIG` / `SET_*` / `ARM` / `READ_BUFFER` /
+`MEASURE` **全部回 `BUSY`**（提示先 `STOP`）。
+
+> ⚠ 这张表的真相源是 `proto/tests/vectors.json` 里的 `state_matrix` ——
+> C 与 Rust 两侧都按它断言，两边实测一致。
+>
+> **曾经的错误**：这张表写过「`IDLE` 除 `STOP` 外全部」「`DONE` 除 `ARM` 外全部」，
+> 而实现（以及 `protocol.c` 里紧挨着 `return true` 的那句注释）说的是另一回事 ——
+> 实际两者都是**全允许**。按错误的表去推断，会以为「`DONE` 下 `ARM` 会被拒绝、
+> 从而保护住当前采集」，实际上它会被接受并**丢弃**那份数据。
+> 契约页的错比别处的错更贵：它会被人当成行为去依赖。
 
 **重试安全**：设备缓存**最近一次的 `(seq, CMD, 完整响应)`**，同一 seq 在 1 s 内重发**直接回放**，保证 `ARM` 等非幂等命令的重试安全。
 缓存仅 1 槽 → **主机不得并发流水多个非幂等请求**。
@@ -142,6 +156,11 @@ F103 的**硬件 CRC 单元只支持固定 CRC-32 多项式**，做不了 CCITT 
 **`GET_INFO` 是连接后的第一条命令**（主版本不匹配时也必须应答）。`caps` 位掩码声明通道数、触发模式集、AC 耦合支持、支持的波形格式（PACK12 / MINMAX / DELTA）、设备侧测量项。
 
 `GET_STATUS` 是 Agent 问「现在什么情况」的首选命令，**任何状态可调**。
+
+> ⚠ **模拟器把几个计数器写死为 0**：`err_flags` / `overrun_samples` / `rx_crc_err`。
+> 也就是说，在 `sim` 上读到「溢出 0 次、CRC 错 0 次」**不构成「总线很干净」的证据** ——
+> 它们根本没被统计。真机会填这些字段（固件属 P1）。
+> MCP 层目前也还没把它们透出给 Agent。
 
 `RESET` 用 `magic` 防误触发。主机需重新 `GET_INFO` 并重置 seq。
 

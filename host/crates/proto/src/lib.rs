@@ -319,7 +319,9 @@ pub fn cmd_allowed(state: State, cmd: Cmd) -> bool {
     }
 
     match state {
-        // IDLE / DONE 下除 ARM 会丢数据外全部允许
+        // IDLE / DONE 下**全部**允许 —— 包括 ARM。
+        // 在 DONE 下再次 ARM 会丢弃当前采集的数据，放行的理由见
+        // `proto/protocol.c` 里同一处的说明（与 C 侧逐字对应）。
         Idle | Done => true,
         // 采集进行中只允许强制触发，其余配置命令要回 BUSY
         Armed | Streaming => matches!(cmd, ForceTrigger),
