@@ -1111,7 +1111,18 @@ pub fn ai_panel(app: &mut App, ui: &mut egui::Ui) {
             "⚠ 设备已交给 AI —— 左侧所有设备控件已停用",
         );
         ui.small("串口同一时刻只能有一个主人，这是交接的必然，不是界面故障。");
-        if ui.button("终止").clicked() {
+
+        // ⚠ 只在 `Running` 阶段给终止。
+        //
+        // `Disconnecting` 时会话还没起、句柄还是空的，点了什么也终止不了 ——
+        // 摆一个按下去没反应的按钮比不给更糟。而那个窗口只有约一秒
+        // （断开本身很快），之后就能终止了。
+        let can_stop = app.drive.phase == crate::drive::DrivePhase::Running;
+        if ui
+            .add_enabled(can_stop, egui::Button::new("终止"))
+            .on_disabled_hover_text("正在让出设备，请稍候 —— 会话尚未开始")
+            .clicked()
+        {
             app.stop_drive();
         }
     }
