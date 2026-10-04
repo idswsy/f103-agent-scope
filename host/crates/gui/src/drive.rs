@@ -768,6 +768,12 @@ pub fn run_session(
 ///
 /// **只改字段名** `inputSchema` → `input_schema`，其余原样 ——
 /// 与 `agent.py` 的做法一致，那条路已经验证可用。
+///
+/// ⚠ **`annotations` 刻意不转发。** 这个函数的输出**直接进 Anthropic Messages
+/// 请求体**，而那边对工具对象的键是白名单的 —— 多一个它不认识的键，**整个请求
+/// 会被拒**（`Extra inputs are not permitted`）。注解是给 **MCP 宿主**看的提示
+/// （据此决定要不要免确认），不是给模型看的，模型不需要它。
+/// `tools_list_is_renamed_not_reshaped` 里钉了这条。
 pub fn to_llm_tools(resp: &Value) -> Value {
     let tools: Vec<Value> = resp
         .get("tools")
@@ -1349,6 +1355,8 @@ mod tests {
                 "name": "scope_capture",
                 "description": "采集一次",
                 "inputSchema": { "type": "object", "properties": { "count": { "type": "integer" } } },
+                // 真实响应里现在带这个字段 —— 放进输入，才能验它不被转发
+                "annotations": { "readOnlyHint": false, "destructiveHint": false },
             }]
         });
         let out = to_llm_tools(&resp);
@@ -1362,6 +1370,12 @@ mod tests {
             "只改字段名，schema 内容必须原样"
         );
         assert!(t.get("inputSchema").is_none(), "旧名字不该留");
+        // 这条是**防回归**，不是防手滑：annotations 一旦漏进请求体，
+        // Anthropic API 会用「不认识的键」把整个请求打回，而不是忽略它。
+        assert!(
+            t.get("annotations").is_none(),
+            "annotations 是给 MCP 宿主看的，不能进 LLM 请求体"
+        );
     }
 
     #[test]

@@ -205,6 +205,12 @@ def to_llm_tools(mcp_tools: list[dict]) -> list[dict]:
     **唯一的改动是字段名**：`inputSchema` → `input_schema`。
     schema 本体一个字节不动 —— 这正是我们要证明的事：
     `params.rs` 里那个 Rust 类型生成的 schema，可以被原样交给模型用。
+
+    ⚠ **不要转发 `annotations`。** 本函数的输出直接进 Anthropic Messages
+    请求体，那边对工具对象的键是白名单的 —— 多一个不认识的键，**整个请求
+    会被拒**（`Extra inputs are not permitted`）。工具注解是给 MCP 宿主看的
+    （据此决定要不要免确认），模型不需要它。
+    （`gui/src/drive.rs` 里的同名函数同理，那边有测试钉着。）
     """
     return [
         {"name": t["name"], "description": t["description"], "input_schema": t["inputSchema"]}

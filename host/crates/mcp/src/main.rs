@@ -38,6 +38,68 @@ use scope_core::{CaptureStore, CommandBus};
 use scope_sim::{Scenario, SimDevice};
 use serde_json::{json, Value};
 
+/// MCP 工具注解（`tools/list` 里的 `annotations` 对象）。
+///
+/// 规范里这四个字段**都是提示，不强制**，且**缺省值是刻意悲观的**：
+/// 不写就等于 `readOnlyHint=false` + `destructiveHint=true`。也就是说
+/// 客户端会把「你没声明」理解成「这个工具可能有害」，连 `scope_status`
+/// 这种纯读的也要走确认。所以每个工具都必须显式声明。
+///
+/// 字段名按规范用驼峰（`readOnlyHint` 等），由 `rename_all` 统一转换。
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolAnnotations {
+    /// 不给客户端任何「可免确认」的余地，除非真的只读。
+    read_only_hint: bool,
+    /// 可能毁掉设备或主机上的数据。只有逃生门为真。
+    destructive_hint: bool,
+    /// 同样的参数再调一次，不会产生额外后果。
+    idempotent_hint: bool,
+    /// 会与设备之外的系统交互（扫串口、写任意路径）。
+    open_world_hint: bool,
+}
+
+/// 注解的几种典型组合。**在工具的声明处引用它们**，而不是各写各的 ——
+/// 一处改动就能让同类工具一起变，也便于审查「哪些工具是只读的」。
+#[allow(dead_code)] // 常量按语义成组给出，未必每一个都被用到
+impl ToolAnnotations {
+    /// 纯读：不改设备状态，不碰主机文件。
+    const READ_ONLY: Self = Self {
+        read_only_hint: true,
+        destructive_hint: false,
+        idempotent_hint: true,
+        open_world_hint: false,
+    };
+    /// 只读，但要扫系统（枚举串口）。
+    const READ_ONLY_OPEN: Self = Self {
+        read_only_hint: true,
+        destructive_hint: false,
+        idempotent_hint: true,
+        open_world_hint: true,
+    };
+    /// 改设备状态：连接、配置、采集、流。可重复调用，但每次都有新后果。
+    const CHANGES_DEVICE: Self = Self {
+        read_only_hint: false,
+        destructive_hint: false,
+        idempotent_hint: false,
+        open_world_hint: false,
+    };
+    /// 写主机文件，路径由调用方给定。
+    const WRITES_HOST: Self = Self {
+        read_only_hint: false,
+        destructive_hint: false,
+        idempotent_hint: true,
+        open_world_hint: true,
+    };
+    /// 逃生门：能发任意命令码，含 `MEM_WRITE`。
+    const ESCAPE_HATCH: Self = Self {
+        read_only_hint: false,
+        destructive_hint: true,
+        idempotent_hint: false,
+        open_world_hint: false,
+    };
+}
+
 /// 一个 MCP 工具的声明。
 struct ToolSpec {
     name: &'static str,
@@ -49,6 +111,8 @@ struct ToolSpec {
     protocol_cmds: &'static str,
     /// 是否只在某些条件下注册。
     condition: &'static str,
+    /// 给 MCP 客户端的注解（只读 / 破坏性等）。见 [`ToolAnnotations`]。
+    annotations: ToolAnnotations,
     /// 实现。内部会把 `arguments` 解成**生成 `schema` 的那个类型**。
     handler: fn(&mut session::Session, &Value) -> R,
 }
@@ -70,6 +134,7 @@ type R = std::result::Result<Value, session::ToolError>;
 macro_rules! tool {
     (
         $name:literal, $desc:literal, $cmds:literal, $cond:literal,
+        $ann:expr,
         $args:ty, |$s:ident, $p:ident| $body:expr
     ) => {
         ToolSpec {
@@ -77,6 +142,7 @@ macro_rules! tool {
             description: $desc,
             protocol_cmds: $cmds,
             condition: $cond,
+            annotations: $ann,
             schema: schema_of::<$args>,
             handler: |$s: &mut session::Session, __args: &Value| {
                 parse_then::<$args, _>(__args, |$p| $body)
@@ -256,6 +322,7 @@ const TOOLS: &[ToolSpec] = &[
         "列出系统中可用的串口。不指定 port 连接时用内置模拟器，无需硬件",
         "GET_INFO",
         "总是",
+        ToolAnnotations::READ_ONLY_OPEN,
         NoArgs,
         |s, _p| s.list_devices()
     ),
@@ -264,6 +331,7 @@ const TOOLS: &[ToolSpec] = &[
         "连接设备。不指定 port 时使用模拟器",
         "GET_INFO + GET_CONFIG",
         "总是",
+        ToolAnnotations::CHANGES_DEVICE,
         ConnectArgs,
         |s, p| s.connect(&p)
     ),
@@ -272,6 +340,7 @@ const TOOLS: &[ToolSpec] = &[
         "断开连接并停止流",
         "STOP",
         "总是",
+        ToolAnnotations::CHANGES_DEVICE,
         NoArgs,
         |s, _p| s.disconnect()
     ),
@@ -280,6 +349,7 @@ const TOOLS: &[ToolSpec] = &[
         "设备当前状态与生效配置（含链路描述）。任何状态可调",
         "GET_STATUS",
         "总是",
+        ToolAnnotations::READ_ONLY,
         NoArgs,
         |s, _p| s.status()
     ),
@@ -288,6 +358,7 @@ const TOOLS: &[ToolSpec] = &[
         "一次性配置采样率/采集/触发/通道。返回实际生效值与警告",
         "SET_SAMPLE_RATE / SET_TRIGGER / SET_ACQ / SET_CHANNEL",
         "总是",
+        ToolAnnotations::CHANGES_DEVICE,
         ConfigureArgs,
         |s, p| s.configure(&p)
     ),
@@ -296,6 +367,7 @@ const TOOLS: &[ToolSpec] = &[
         "采集一次并等待触发完成。默认只返回统计量与 ≤256 点 minmax 预览，不含全量波形。⚠ 返回的 capture_id 只在**当前连接的本次会话**里有效 —— 之后引用它的调用必须接着发，不能另起一个进程",
         "ARM + EVENT_TRIGGER + READ_BUFFER",
         "总是",
+        ToolAnnotations::CHANGES_DEVICE,
         CaptureArgs,
         |s, p| s.capture(&p)
     ),
@@ -304,6 +376,7 @@ const TOOLS: &[ToolSpec] = &[
         "按需分页拉取波形样点。硬顶 4096 点；要全量请用 scope_save_capture。capture_id 来自本次会话里的 scope_capture",
         "READ_BUFFER",
         "总是",
+        ToolAnnotations::READ_ONLY,
         ReadWaveformArgs,
         |s, p| s.read_waveform(&p)
     ),
@@ -312,6 +385,7 @@ const TOOLS: &[ToolSpec] = &[
         "对指定采集做测量：频率/峰峰值/均值/RMS/占空比/上升时间。返回纯数字+单位",
         "主机侧计算（精度最高）；流模式可走 MEASURE",
         "总是",
+        ToolAnnotations::READ_ONLY,
         MeasureArgs,
         |s, p| s.measure(&p)
     ),
@@ -320,6 +394,7 @@ const TOOLS: &[ToolSpec] = &[
         "把采集解码为 I2C 帧序列（START/地址/ACK/数据/STOP），返回帧列表与信号质量评估",
         "主机侧解码（基于 READ_BUFFER 数据）",
         "总是",
+        ToolAnnotations::READ_ONLY,
         I2cDecodeArgs,
         |s, p| s.i2c_decode(&p)
     ),
@@ -328,6 +403,7 @@ const TOOLS: &[ToolSpec] = &[
         "列出主机侧保存的最近采集，供引用而不必重抓",
         "无（本地 capture store）",
         "总是",
+        ToolAnnotations::READ_ONLY,
         NoArgs,
         |s, _p| s.list_captures()
     ),
@@ -336,6 +412,7 @@ const TOOLS: &[ToolSpec] = &[
         "把全量波形落盘为 CSV。全量数据不进 LLM 上下文",
         "无（本地写文件）",
         "总是",
+        ToolAnnotations::WRITES_HOST,
         SaveCaptureArgs,
         |s, p| s.save_capture(&p)
     ),
@@ -344,6 +421,7 @@ const TOOLS: &[ToolSpec] = &[
         "在一段时间里连续采集，返回采集次数与缺口统计，外加第一次采集（供后续测量/解码）。设备侧流模式尚未实现",
         "ARM(stream) + 分片推送 + STOP",
         "总是",
+        ToolAnnotations::CHANGES_DEVICE,
         WatchArgs,
         |s, p| s.watch(&p)
     ),
@@ -352,6 +430,7 @@ const TOOLS: &[ToolSpec] = &[
         "切换模拟器波形场景 / 换随机种子 / 注入故障（仅模拟器模式）",
         "无（模拟器内部）",
         "仅 transport=sim",
+        ToolAnnotations::CHANGES_DEVICE,
         SimSetScenarioArgs,
         |s, p| s.sim_set_scenario(&p)
     ),
@@ -360,6 +439,7 @@ const TOOLS: &[ToolSpec] = &[
         "开发者逃生门：发任意命令码与 payload。默认不向 LLM 暴露",
         "任意（含 MEM_READ / MEM_WRITE）",
         "仅 SCOPE_MCP_DEBUG=1",
+        ToolAnnotations::ESCAPE_HATCH,
         DebugRawArgs,
         |s, p| s.debug_raw(&p)
     ),
@@ -384,8 +464,14 @@ fn main() -> Result<()> {
 // stdio 上的 MCP server
 // ══════════════════════════════════════════════════════════════
 
-/// 协议版本。客户端给别的值也照常工作，只是回我们支持的这一版。
-const PROTOCOL_VERSION: &str = "2024-11-05";
+/// 我们声明支持的最新协议版本。
+///
+/// `2025-03-26` 相对 `2024-11-05` 的关键增量是**工具注解**（`annotations`），
+/// `tools/list` 里正在用它 —— 停在旧版本号上却发新字段，是不诚实的。
+const PROTOCOL_VERSION: &str = "2025-03-26";
+
+/// 还认得、并能按其语义服务的旧版本。客户端请求其中之一时按它回。
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] = ["2025-03-26", "2024-11-05"];
 
 /// `scope_debug_raw` 的注册条件：`SCOPE_MCP_DEBUG` **精确等于 `"1"`**。
 ///
@@ -494,17 +580,26 @@ fn handle_line(
     }
 
     match req.method.as_str() {
-        "initialize" => Some(Response::ok(
-            id,
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": { "tools": {} },
-                "serverInfo": {
-                    "name": "scope-mcp",
-                    "version": scope_core::VERSION,
-                },
-            }),
-        )),
+        "initialize" => {
+            // 客户端声明它支持的版本。**认得就按它的回** —— 回一个比客户端新的版本，
+            // 会让它拿不认识的语义去解释后面的响应。不认得才回我们最新的。
+            let asked = params.get("protocolVersion").and_then(|v| v.as_str());
+            let agreed = match asked {
+                Some(v) if SUPPORTED_PROTOCOL_VERSIONS.contains(&v) => v,
+                _ => PROTOCOL_VERSION,
+            };
+            Some(Response::ok(
+                id,
+                json!({
+                    "protocolVersion": agreed,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": {
+                        "name": "scope-mcp",
+                        "version": scope_core::VERSION,
+                    },
+                }),
+            ))
+        }
 
         "ping" => Some(Response::ok(id, json!({}))),
 
@@ -585,6 +680,10 @@ fn tool_list(debug: bool) -> Vec<Value> {
                 "name": t.name,
                 "description": t.description,
                 "inputSchema": (t.schema)(),
+                // 规范的缺省值是刻意悲观的（不写 = 可能有害），所以每个工具都显式给，
+                // 让客户端能把 list_devices / status 这类纯读的放行。
+                "annotations": serde_json::to_value(t.annotations)
+                    .expect("注解只有 bool，必定可序列化"),
             })
         })
         .collect()
@@ -623,6 +722,14 @@ fn print_tools() {
         println!("   说明   : {}", t.description);
         println!("   协议   : {}", t.protocol_cmds);
         println!("   注册条件: {}", t.condition);
+        // 给人工核对用：一眼看出哪些工具是只读的（客户端会据此免确认）
+        println!(
+            "   注解   : 只读={} 破坏性={} 幂等={} 开放世界={}",
+            t.annotations.read_only_hint,
+            t.annotations.destructive_hint,
+            t.annotations.idempotent_hint,
+            t.annotations.open_world_hint
+        );
         // 美化输出：这是给人核对用的，紧凑 JSON 读起来太费劲
         println!(
             "   schema : {}",
@@ -818,12 +925,104 @@ mod tests {
         let arr = tools.as_array().unwrap();
         // 不带 SCOPE_MCP_DEBUG 时少一个 scope_debug_raw
         assert_eq!(arr.len(), TOOLS.len() - 1);
-        // 每个工具都要有 name / description / inputSchema，且 schema 是合法 JSON
+        // 每个工具都要有 name / description / inputSchema / annotations
         for t in arr {
             assert!(t["name"].is_string(), "缺 name: {t}");
             assert!(t["description"].is_string(), "缺 description: {t}");
             assert!(t["inputSchema"].is_object(), "schema 不是对象: {t}");
+            // 注解缺省值是刻意悲观的 —— 漏发一个，客户端就把那个工具当成可能有害的。
+            let a = &t["annotations"];
+            assert!(a.is_object(), "缺 annotations: {t}");
+            for k in [
+                "readOnlyHint",
+                "destructiveHint",
+                "idempotentHint",
+                "openWorldHint",
+            ] {
+                assert!(a[k].is_boolean(), "annotations 缺 {k} 或不是布尔: {t}");
+            }
         }
+    }
+
+    /// 钉住注解的**语义**，不只是「字段在」。
+    ///
+    /// 这两条是注解存在的全部理由：只读的能被客户端免确认放行，
+    /// 逃生门不能被当成普通工具。把它们写反，等于给了模型一把没上锁的枪。
+    #[test]
+    fn annotations_mark_read_only_tools_and_the_escape_hatch() {
+        let find = |name: &str| {
+            TOOLS
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("没有这个工具：{name}"))
+                .annotations
+        };
+
+        // 纯读的：只读、非破坏
+        for name in [
+            "scope_status",
+            "scope_read_waveform",
+            "scope_measure",
+            "scope_i2c_decode",
+            "scope_list_captures",
+            "scope_list_devices",
+        ] {
+            let a = find(name);
+            assert!(a.read_only_hint, "{name} 应声明为只读");
+            assert!(!a.destructive_hint, "{name} 不该声明为破坏性");
+        }
+
+        // 改设备状态的：不能声明只读（否则客户端会免确认，而它真的在动设备）
+        for name in [
+            "scope_connect",
+            "scope_disconnect",
+            "scope_configure",
+            "scope_capture",
+            "scope_watch",
+            "scope_sim_set_scenario",
+        ] {
+            assert!(
+                !find(name).read_only_hint,
+                "{name} 改了设备状态，不能声明只读"
+            );
+        }
+
+        // 逃生门：唯一一个破坏性 + 非只读的
+        let esc = find("scope_debug_raw");
+        assert!(
+            esc.destructive_hint && !esc.read_only_hint,
+            "逃生门必须声明为破坏性且非只读"
+        );
+        let destructive: Vec<&str> = TOOLS
+            .iter()
+            .filter(|t| t.annotations.destructive_hint)
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(
+            destructive,
+            vec!["scope_debug_raw"],
+            "只有逃生门该声明破坏性；多标了会让正常工具也走确认"
+        );
+    }
+
+    /// 回显客户端认识的版本，不认识才回我们最新的。
+    ///
+    /// 回一个比客户端更新的版本，它会拿不认识的语义解释后面的响应 ——
+    /// 而这次新增的 `annotations` 正是版本相关的字段。
+    #[test]
+    fn initialize_echoes_a_known_protocol_version() {
+        let ask = |v: &str| {
+            let (r, _) = call(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"{v}"}}}}"#
+            ));
+            r.unwrap().result.unwrap()["protocolVersion"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(ask("2024-11-05"), "2024-11-05", "认识的旧版本要照回");
+        assert_eq!(ask("2025-03-26"), "2025-03-26");
+        assert_eq!(ask("1999-01-01"), PROTOCOL_VERSION, "不认识的回最新");
     }
 
     #[test]
