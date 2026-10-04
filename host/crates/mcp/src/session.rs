@@ -25,8 +25,8 @@ use crate::params::{
 use scope_core::acquire::MAX_TIMEOUT_MS;
 use scope_core::i2c_decode::{decode_capture, detect_channels, I2cDecodeConfig, Levels};
 use scope_core::{
-    acquire_cancellable, state_name, AcquireParams, Capture, CaptureStore, ChannelScale, Cmd,
-    CommandBus, DeviceInfo, ScopeError,
+    acquire_cancellable, state_name, AcquireParams, CalibrationStore, Capture, CaptureStore, Cmd,
+    CommandBus, DeviceInfo, ScaleSet, ScopeError,
 };
 use scope_device::{Transport, TransportKind};
 use scope_sim::Scenario;
@@ -48,6 +48,10 @@ const ACQ_MODE_SINGLE: u8 = 0;
 pub struct Session {
     bus: Option<CommandBus<Transport>>,
     store: CaptureStore,
+    /// 标定表（按设备 uid 索引）。**只读** —— 写入只走 `scope-cli cal set`。
+    calib: CalibrationStore,
+    /// 当前连接的这一窗该用哪套换算。
+    calib_view: ScaleSet,
 }
 
 /// 工具失败：说明 + 怎么办。
@@ -186,11 +190,33 @@ fn u8_field(v: u64, field: &str) -> std::result::Result<u8, ToolError> {
 
 impl Session {
     /// 建一个空会话。
+    ///
+    /// **刻意不碰磁盘。** 每个 MCP 测试都调它 —— 在这里读 `$HOME` 会让
+    /// **每一个测试都依赖开发机的环境**（`%APPDATA%` 里有没有标定文件、
+    /// 内容是什么）。真实标定表由 `serve()` 经
+    /// [`Session::load_calibration_default`] 装进来。
     pub fn new() -> Session {
         Session {
             bus: None,
             store: CaptureStore::default(),
+            calib: CalibrationStore::empty(),
+            calib_view: ScaleSet::uncalibrated(0),
         }
+    }
+
+    /// 从默认位置装载标定表。**只在 `serve()` 里调。**
+    pub fn load_calibration_default(&mut self) {
+        self.calib = CalibrationStore::load_default();
+    }
+
+    /// 注入一份标定表，**不碰磁盘**。
+    ///
+    /// 目前只在测试里用，所以标了 `#[cfg(test)]`（否则非测试构建里是死代码，
+    /// CI 的 `-D warnings` 会红）。将来若加 `--calib <path>`，去掉这个属性即可。
+    #[cfg(test)]
+    pub fn with_calibration(mut self, calib: CalibrationStore) -> Session {
+        self.calib = calib;
+        self
     }
 
     /// 从已连接的会话里取 bus，没连就报错并给出自救提示。
@@ -289,12 +315,27 @@ impl Session {
         // 换连接即失效。
         self.store = CaptureStore::default();
 
+        // 标定按 uid 查，且**重新读一遍文件** —— 用户可能在两次会话之间
+        // 在另一个终端跑了 `cal set`。
+        self.calib.reload();
+        self.calib_view = self
+            .calib
+            .scales_for(Some(&info.uid), info.ch_count as usize);
+        let calib_json = json!({
+            "uid": scope_core::encode_uid(&info.uid),
+            // 有没有记录，与「记录里齐不齐」是两回事，都要给
+            "record_found": self.calib_view.record_found(),
+            "calibrated": self.calib_view.all_calibrated(),
+            "note": self.calib_view.summary_note(),
+        });
+
         let out = json!({
             "link": bus.describe(),
             "simulated": bus.is_simulated(),
             "state": state_name(state),
             "device": info_json(&info),
             "config": cfg.map(|c| config_json(&c)),
+            "calibration": calib_json,
         });
         self.bus = Some(bus);
         Ok(out)
@@ -337,6 +378,12 @@ impl Session {
 
     /// `scope_configure` —— 一个工具替代 N 个 `set_*`。
     pub fn configure(&mut self, p: &ConfigureArgs) -> R {
+        // ⚠ **必须在 `self.bus(...)` 之前取。** 那次调用借走整个 `*self`
+        // 且活到函数结尾（下面每一处 `bus.xxx()` 都在用它），之后再读
+        // `self.calib_view` 编译器不会放行。`ScaleSet` 是 `Clone`，克隆一份
+        // 借用即结束。
+        let calib_view = self.calib_view.clone();
+
         let bus = self.bus("配置设备")?;
         let mut applied = serde_json::Map::new();
         let mut warnings: Vec<String> = Vec::new();
@@ -480,16 +527,30 @@ impl Session {
                     "电平是 12-bit ADC 的 LSB 整数；也可以改传 level_v（伏特）",
                 )?,
                 (None, Some(v)) => {
-                    // `volts_to_lsb` 回 i32，所以负电平在这里被挡住
-                    let lsb = ChannelScale::default().volts_to_lsb(v);
+                    // `volts_to_lsb` 回 i32，所以负电平在这里被挡住。
+                    //
+                    // ⚠ 取**通道 0** 的换算：此刻 `trigger.source`（下面才解析）
+                    // 还不知道，而换算表可以逐通道不同。当前底板只有一路模拟
+                    // 输入（ADR-010），取 0 与取实际源通道等价；真出现逐通道
+                    // 差异时，这里要改成按 `source` 取。
+                    let sc = calib_view.get(0);
+                    let lsb = sc.volts_to_lsb(v);
                     if !(0..=LEVEL_MAX_LSB as i32).contains(&lsb) {
                         return Err(ToolError {
                             message: format!("trigger.level_v={v} 超出 12-bit ADC 量程"),
-                            hint: Some(
+                            hint: Some(if calib_view.any_calibrated() {
+                                format!(
+                                    "换算用的是 uid {} 的标定值（{:.9} V/LSB、零点 {:.1}）；\
+                                     也可以直接给 level_lsb",
+                                    calib_view.uid_hex().unwrap_or_else(|| "?".into()),
+                                    sc.volts_per_lsb,
+                                    sc.zero_lsb
+                                )
+                            } else {
                                 "电压换算用的是未标定的占位参数（3.3 V / 4096、零点 2048），\
                                  范围约 -1.65..=+1.65 V；也可以直接给 level_lsb"
-                                    .into(),
-                            ),
+                                    .into()
+                            }),
                         });
                     }
                     lsb as u16
@@ -634,7 +695,7 @@ impl Session {
         let max_preview = max_preview.min(PREVIEW_MAX) as usize;
 
         let cap = self.acquire_raw(timeout_ms)?;
-        let out = capture_summary_json(&cap, max_preview);
+        let out = capture_summary_json(&cap, max_preview, &self.calib_view);
         self.store.push(cap);
         Ok(out)
     }
@@ -790,13 +851,17 @@ impl Session {
             Some(w) => w.contains(&k),
         };
 
-        let scale = ChannelScale::default();
+        // 按 uid 查的逐通道换算。`cap` 借的是 `self.store`、这里借的是
+        // `self.calib_view` —— 不同字段，互不冲突；克隆一份是为了不让
+        // 「借用能不能同时成立」这种事绊住后面的改动。
+        let scales = self.calib_view.clone();
+        let calibrated = scales.all_calibrated();
         let mut out = serde_json::Map::new();
         for ch in 0..cap.channels.len() {
             if only_ch.is_some_and(|only| ch != only) {
                 continue;
             }
-            if let Some(m) = scope_core::measure(cap, ch, &scale) {
+            if let Some(m) = scope_core::measure(cap, ch, &scales.get(ch)) {
                 let mut row = serde_json::Map::new();
                 if has(MetricKind::Vpp) {
                     row.insert("vpp_v".into(), json!(m.vpp));
@@ -828,8 +893,16 @@ impl Session {
         Ok(json!({
             "capture_id": id,
             "measurements": out,
-            "note": "电压为未标定换算（占位参数）；频率与占空比已排除事务间空闲；\
-                     非周期信号（数据线）报出的是边沿速率",
+            // 结构化地告诉模型「伏特值可不可信」。写在一句中文 note 里，
+            // 模型得读懂那句话才知道要打折；一个布尔字段它不会漏掉。
+            "voltage_calibrated": calibrated,
+            "note": if calibrated {
+                "电压按设备标定换算（该 uid 的各通道都有记录）"
+            } else {
+                "电压未标定（占位参数 3.3 V / 4096、零点 2048），只看相对关系，\
+                 不要当成校准值。用 scope-cli cal set 写入标定。"
+            },
+            "note_unrelated": "频率与占空比已排除事务间空闲；非周期信号（数据线）报出的是边沿速率",
         }))
     }
 
@@ -1032,10 +1105,9 @@ impl Session {
             hint: Some("用 scope_list_captures 看现存采集".into()),
         })?;
 
-        let scales: Vec<ChannelScale> = (0..cap.channels.len())
-            .map(|_| ChannelScale::default())
-            .collect();
-        std::fs::write(path, cap.to_csv(&scales)).map_err(|e| ToolError {
+        // `cap` 借 `self.store`，这里借 `self.calib_view` —— 不同字段，可以同时成立。
+        let scales = self.calib_view.clone();
+        std::fs::write(path, cap.to_csv(scales.as_slice())).map_err(|e| ToolError {
             message: format!("写 {path} 失败：{e}"),
             hint: Some("确认目录存在、有写权限".into()),
         })?;
@@ -1044,6 +1116,8 @@ impl Session {
             "saved": path,
             "format": format.name(),
             "bytes": std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            // CSV 里的伏特列用的就是这套换算，所以要如实说
+            "voltage_calibrated": scales.all_calibrated(),
             "note": "全量样点已落盘。不要在对话里读它 —— 4096 点 ≈ 上万 token",
         }))
     }
@@ -1084,6 +1158,10 @@ impl Session {
             });
         }
 
+        // 循环外克隆一次：一次 watch 期间标定不该变，而且循环里
+        // `self.acquire_raw` 一直占着 `&mut self`。
+        let scales = self.calib_view.clone();
+
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
         let mut captured = 0u32;
         let mut failed = 0u32;
@@ -1109,7 +1187,7 @@ impl Session {
         // 只把第一次采集入库，且是**最后**才 push —— 保证它一定还在 store 里
         let sample = match first {
             Some(cap) => {
-                let s = capture_summary_json(&cap, max_preview);
+                let s = capture_summary_json(&cap, max_preview, &scales);
                 self.store.push(cap);
                 Some(s)
             }
@@ -1254,6 +1332,9 @@ impl Session {
 
 fn info_json(i: &DeviceInfo) -> Value {
     json!({
+        // 标定表的键。给出来，Agent 才能把「这台设备」和「有没有它的标定」
+        // 对上；也给 `scope-cli cal set --uid` 提供现成的值。
+        "uid": scope_core::encode_uid(&i.uid),
         "proto_ver": i.proto_ver,
         "fw_ver": format!("{}.{}.{}", (i.fw_ver >> 16) & 0xFF, (i.fw_ver >> 8) & 0xFF, i.fw_ver & 0xFF),
         "model": format!("0x{:04X}", i.model),
@@ -1288,12 +1369,11 @@ fn config_json(c: &scope_core::DeviceConfig) -> Value {
 /// 采集摘要 —— **三层 token 防护的第一层**。
 ///
 /// 只给统计量 + ≤`max_preview` 点的 minmax 预览，绝不回全量样点。
-fn capture_summary_json(cap: &Capture, max_preview: usize) -> Value {
-    let scale = ChannelScale::default();
+fn capture_summary_json(cap: &Capture, max_preview: usize, scales: &ScaleSet) -> Value {
     let mut channels = Vec::new();
     for ch in 0..cap.channels.len() {
         let Some(s) = cap.summary(ch) else { continue };
-        let m = scope_core::measure(cap, ch, &scale);
+        let m = scope_core::measure(cap, ch, &scales.get(ch));
         channels.push(json!({
             "channel": ch,
             // 叫 sample_count 而不是 samples：后者读起来像「样点数组」，
@@ -1771,6 +1851,79 @@ mod tests {
         // SCL 是 100 kHz
         let f = ch0["freq_hz"].as_f64().unwrap();
         assert!((f - 100_000.0).abs() < 500.0, "实测 {f} Hz");
+    }
+
+    /// 标定状态要**结构化**地给出来，不能只写在一句中文 note 里 ——
+    /// 模型得读懂那句话才知道要打折，而一个布尔字段它不会漏掉。
+    ///
+    /// 这条同时钉住 `Session::new()` **不碰磁盘**：测试没有注入标定，
+    /// 所以无论开发机 `%APPDATA%` 里有什么，这里都必须是 false。
+    #[test]
+    fn the_session_reports_an_uncalibrated_voltage_by_default() {
+        let mut s = connected();
+        let c = s
+            .connect(&args(
+                json!({ "transport": "sim", "sim_scenario": "i2c_100k" }),
+            ))
+            .unwrap();
+        assert!(c["device"]["uid"].is_string(), "uid 要暴露给 Agent");
+        assert_eq!(c["calibration"]["record_found"], false);
+        assert_eq!(c["calibration"]["calibrated"], false);
+
+        let _ = s.capture(&args(json!({}))).unwrap();
+        let v = s.measure(&args(json!({ "capture_id": 1 }))).unwrap();
+        assert_eq!(v["voltage_calibrated"], false);
+    }
+
+    /// 注入标定后，**数值必须真的随标定缩放**。
+    ///
+    /// 只断言布尔字段是不够的 —— 那只证明标志位传对了，不证明换算真的
+    /// 走到了标定值。所以这里拿同一场景的未标定基线，比一个**可预测的比值**。
+    #[test]
+    fn an_injected_calibration_scales_the_numbers() {
+        // 未标定基线
+        let mut base = connected();
+        let _ = base.capture(&args(json!({}))).unwrap();
+        let b = base.measure(&args(json!({ "capture_id": 1 }))).unwrap();
+        assert_eq!(b["voltage_calibrated"], false, "基线必须是未标定");
+        let base_vpp = b["measurements"]["ch0"]["vpp_v"].as_f64().unwrap();
+
+        // 模拟器自身的 uid（`sim/src/device.rs:422`），标定表按它索引
+        let uid = scope_core::decode_uid("5eed00010203040506070809").unwrap();
+        // 占位值是 3.3/4096 ≈ 0.00080566；取 0.001 让比值恰为 1.241212…
+        let per_lsb = 1.0e-3;
+        let mut store = CalibrationStore::empty();
+        for ch in 0..2 {
+            store
+                .set_channel(
+                    uid,
+                    ch,
+                    scope_core::ChannelScale {
+                        volts_per_lsb: per_lsb,
+                        zero_lsb: 2048.0,
+                    },
+                    None,
+                    0,
+                )
+                .unwrap();
+        }
+
+        let mut s = Session::new().with_calibration(store);
+        s.connect(&args(
+            json!({ "transport": "sim", "sim_scenario": "i2c_100k" }),
+        ))
+        .unwrap();
+        let _ = s.capture(&args(json!({}))).unwrap();
+        let v = s.measure(&args(json!({ "capture_id": 1 }))).unwrap();
+
+        assert_eq!(v["voltage_calibrated"], true, "注入了标定就该报 true");
+        let vpp = v["measurements"]["ch0"]["vpp_v"].as_f64().unwrap();
+        let ratio = per_lsb / (3.3 / 4096.0);
+        let want = base_vpp * ratio;
+        assert!(
+            (vpp - want).abs() < want * 0.02,
+            "Vpp 应随标定缩放：基线 {base_vpp:.4} V × {ratio:.6} = {want:.4} V，实测 {vpp:.4} V"
+        );
     }
 
     #[test]

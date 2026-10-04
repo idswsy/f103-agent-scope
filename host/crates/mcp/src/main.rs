@@ -490,6 +490,9 @@ fn serve() -> Result<()> {
     let flag = std::env::var("SCOPE_MCP_DEBUG").ok();
     let debug_tools = debug_tools_enabled(flag.as_deref());
     let mut session = session::Session::new();
+    // 只在这里读磁盘 ——  必须保持不碰文件系统，
+    // 否则每个 MCP 测试都会依赖开发机 %APPDATA% 里有什么。
+    session.load_calibration_default();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
 

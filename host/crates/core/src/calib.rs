@@ -266,7 +266,16 @@ impl CalibrationStore {
 
     /// 重新读一遍当前路径。连上设备时调用 —— 用户在两次采集之间可能
     /// 在另一个终端跑了 `cal set`。
+    ///
+    /// **没有路径时什么也不做。** `reload` 的语义是「重新读一遍我来自的那个
+    /// 文件」，**不是**「清空」—— 没有文件可读还把手上的内容丢掉，既有破坏性
+    /// 又反直觉。注入式用法（测试、将来可能的 `--calib`）会直接踩到：
+    /// `connect()` 会调它，于是刚注入的记录在连接的一瞬间被抹掉。
+    /// （这条是 MCP 侧的测试逼出来的，不是推出来的。）
     pub fn reload(&mut self) {
+        if self.path.is_none() {
+            return;
+        }
         let path = self.path.clone();
         *self = Self::load_from(path);
     }
@@ -651,6 +660,42 @@ mod tests {
             .set_channel(uid, 0, scale(1.0e-3, f64::NAN), None, 0)
             .expect_err("非法零点必须被拒");
         assert!(e.contains("zero_lsb"), "实测：{e}");
+    }
+
+    /// `reload()` 在**没有路径**时不得清空内容。
+    ///
+    /// 回归：`connect()` 每次都调 `reload()`，而它原先是无条件
+    /// `*self = load_from(path)` —— 于是注入进来的记录在连接的一瞬间被抹掉，
+    /// MCP 侧那条「注入标定后数值应缩放」的测试直接失败。
+    #[test]
+    fn reload_without_a_path_keeps_the_contents() {
+        let mut s = CalibrationStore::empty();
+        let uid = uid_of("5eed00010203040506070809");
+        s.set_channel(uid, 0, scale(1.0e-3, 2048.0), None, 0)
+            .unwrap();
+        assert!(s.get(&uid).is_some());
+
+        s.reload();
+        assert!(s.get(&uid).is_some(), "没有路径可读时不该把手上的记录丢掉");
+    }
+
+    /// 有路径时 `reload()` 必须**真的重新读盘** ——
+    /// 用户在两次采集之间跑了 `cal set`，界面得跟上。
+    #[test]
+    fn reload_with_a_path_picks_up_external_changes() {
+        let mut s = temp_store("reload");
+        let uid = uid_of("5eed00010203040506070809");
+        s.set_channel(uid, 0, scale(1.0e-3, 2048.0), None, 0)
+            .unwrap();
+        s.save().unwrap();
+        assert!(s.get(&uid).is_some());
+
+        // 模拟「另一个终端把文件改没了」
+        let p = s.path().unwrap().to_path_buf();
+        std::fs::write(&p, r#"{"version":1,"devices":{}}"#).unwrap();
+
+        s.reload();
+        assert!(s.get(&uid).is_none(), "有路径时必须重新读盘");
     }
 
     /// 占位 uid 认得出，真 uid 不误报。
