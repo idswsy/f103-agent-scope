@@ -16,9 +16,10 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use scope_core::{decode_uid, encode_uid, is_placeholder_uid, CalibrationStore};
 use scope_core::{
     AcquireParams, Capture, CaptureStore, ChannelScale, CommandBus, DevicePort, I2cDecodeConfig,
-    Levels, State,
+    Levels, ScaleSet, State,
 };
 use scope_sim::{Scenario, SimDevice};
 use scope_transport_serial::{baud, SerialDevice};
@@ -61,6 +62,55 @@ enum Target {
 
     /// 列出系统中可用的串口
     Ports,
+
+    /// 通道标定表：查看 / 写入 / 删除。**不连接设备**，直接操作主机端文件
+    Cal {
+        #[command(subcommand)]
+        action: CalAction,
+    },
+}
+
+/// `scope-cli cal` 的子命令。
+///
+/// 标定**只从这里写** —— MCP 侧是只读的。理由：标定会改变之后**所有**的
+/// 测量值，它是设备状态而不是单次操作，不该由一个看不见探头的模型来改。
+#[derive(Subcommand, Debug)]
+enum CalAction {
+    /// 列出所有标定记录
+    Show,
+
+    /// 写入一条通道标定
+    Set {
+        /// 设备 uid（十六进制）。接受大小写与 `:` `-` 空格分隔
+        #[arg(long)]
+        uid: String,
+
+        /// 通道号（0 起）
+        #[arg(long, default_value_t = 0)]
+        ch: usize,
+
+        /// 每 LSB 对应多少伏
+        #[arg(long)]
+        volts_per_lsb: f64,
+
+        /// 零电平对应的 ADC LSB
+        #[arg(long, default_value_t = 2048.0)]
+        zero_lsb: f64,
+
+        /// 备注。**同一占位 uid 下多块板靠它区分**，强烈建议写
+        #[arg(long)]
+        note: Option<String>,
+    },
+
+    /// 删除某个 uid 的记录
+    Clear {
+        /// 设备 uid（十六进制）
+        #[arg(long)]
+        uid: String,
+    },
+
+    /// 打印标定文件的位置
+    Path,
 }
 
 #[derive(Subcommand, Debug)]
@@ -248,6 +298,8 @@ fn main() -> Result<()> {
             Ok(())
         }
 
+        Target::Cal { action } => run_cal(action),
+
         Target::Sim { action } => {
             let mut dev = SimDevice::new(action.scenario_or_default().into());
             println!("# 模拟器: {}", dev.describe());
@@ -262,8 +314,140 @@ fn main() -> Result<()> {
     }
 }
 
+/// 把 uid 字符串解析成 12 字节，失败时给一条能照着改的错误。
+fn parse_uid(s: &str) -> Result<[u8; 12]> {
+    decode_uid(s).ok_or_else(|| {
+        anyhow::anyhow!(
+            "uid 解析失败：{s:?}。应为 12 字节十六进制（24 个字符，如 \
+             `5eed00010203040506070809`）；`:`、`-`、空格分隔与大小写都接受"
+        )
+    })
+}
+
+/// Unix 秒。core 不引时间库，时间戳由写方给。
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `scope-cli cal` —— 标定表的读写。**不连接设备。**
+fn run_cal(action: CalAction) -> Result<()> {
+    let mut store = CalibrationStore::load_default();
+    if let Some(note) = store.note() {
+        println!("# {note}");
+    }
+    let where_ = store
+        .path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(无路径)".into());
+
+    match action {
+        CalAction::Path => {
+            if store.path().is_none() {
+                bail!(
+                    "没有可用的配置目录（APPDATA / XDG_CONFIG_HOME / HOME 均未设置），\
+                     标定无处存放"
+                );
+            }
+            println!("{where_}");
+            Ok(())
+        }
+
+        CalAction::Show => {
+            println!("标定表  {} 条记录  {where_}", store.len());
+            if store.is_read_only() {
+                println!("⚠ 文件版本高于本程序，本次只读");
+            }
+            if store.is_empty() {
+                println!();
+                println!(
+                    "（空。写入一条：scope-cli cal set --uid <24位十六进制> --volts-per-lsb <V>）"
+                );
+                return Ok(());
+            }
+            for (uid, rec) in store.iter() {
+                println!();
+                match rec.updated_unix {
+                    Some(t) => println!("{uid}  更新于 {t}"),
+                    None => println!("{uid}"),
+                }
+                if let Some(n) = &rec.note {
+                    println!("  备注: {n}");
+                }
+                if let Ok(b) = parse_uid(uid) {
+                    if let Some(why) = is_placeholder_uid(&b) {
+                        println!("  ⚠ {why}");
+                    }
+                }
+                for (ch, c) in rec.channels.iter().enumerate() {
+                    println!(
+                        "  CH{}: {:.9} V/LSB  零点 {:.1} LSB  满量程 {:.3} V",
+                        ch + 1,
+                        c.volts_per_lsb,
+                        c.zero_lsb,
+                        c.volts_per_lsb * 4096.0
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        CalAction::Set {
+            uid,
+            ch,
+            volts_per_lsb,
+            zero_lsb,
+            note,
+        } => {
+            let uid_b = parse_uid(&uid)?;
+            // 占位 uid 不拒绝，但必须让用户知道：拿它标定等于给所有
+            // 共用这串占位值的板子一起标了。
+            if let Some(why) = is_placeholder_uid(&uid_b) {
+                println!("⚠ {why}");
+            }
+            let scale = ChannelScale {
+                volts_per_lsb,
+                zero_lsb,
+            };
+            // core 的持久化 API 返回 `Result<_, String>`（错误文本是给人看的，
+            // 本来就带「怎么办」）。`String` 不是 `std::error::Error`，
+            // 所以进 anyhow 要显式转一次。
+            store
+                .set_channel(uid_b, ch, scale, note, now_unix())
+                .map_err(anyhow::Error::msg)?;
+            store.save().map_err(anyhow::Error::msg)?;
+            println!(
+                "已写入 {}  CH{}  {:.9} V/LSB  零点 {:.1}",
+                encode_uid(&uid_b),
+                ch + 1,
+                volts_per_lsb,
+                zero_lsb
+            );
+            println!("文件: {where_}");
+            Ok(())
+        }
+
+        CalAction::Clear { uid } => {
+            let uid_b = parse_uid(&uid)?;
+            if store.remove(&uid_b) {
+                store.save().map_err(anyhow::Error::msg)?;
+                println!("已删除 {}", encode_uid(&uid_b));
+            } else {
+                println!("没有 {} 的记录，未改动", encode_uid(&uid_b));
+            }
+            Ok(())
+        }
+    }
+}
+
 fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
     let mut bus = CommandBus::new(RefPort(port));
+    // 标定表在**连接之前**读一次：一是 `bus` 之后会借走可变引用，
+    // 二是标定属于会话开始时的设备状态，中途换掉会让同一次采集里
+    // 前后两次换算用的不是同一套参数。
+    let calib = CalibrationStore::load_default();
 
     match action {
         Action::Info => {
@@ -277,6 +461,12 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
             );
             println!("型号       : 0x{:04X}", info.model);
             println!("UID        : {}", hex(&info.uid));
+            println!(
+                "标定       : {}",
+                calib
+                    .scales_for(Some(&info.uid), info.ch_count as usize)
+                    .summary_note()
+            );
             println!("ADC        : {} bit", info.adc_bits);
             println!("通道数     : {}", info.ch_count);
             println!(
@@ -384,10 +574,12 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
                 }
             }
 
+            // 换算表按设备 uid 查；没有记录就退回占位值，并如实说明。
+            let scales = calib.scales_for(bus.info.as_ref().map(|i| &i.uid), ch_count);
+            println!("  {}", scales.summary_note());
+
             if let Some(path) = out {
-                let scales: Vec<ChannelScale> =
-                    (0..ch_count).map(|_| ChannelScale::default()).collect();
-                let csv = capture.to_csv(&scales);
+                let csv = capture.to_csv(scales.as_slice());
                 let mut f =
                     std::fs::File::create(&path).with_context(|| format!("无法创建 {path}"))?;
                 f.write_all(csv.as_bytes())?;
@@ -525,10 +717,8 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
                 None => (0..ch_count).collect(),
             };
 
-            // 换算表按通道给，长度恒等于通道数 —— `to_csv` 的短表兜底路径不可达。
-            // ⚠ 这里仍是占位换算；标定管线落地后改为按设备 uid 查表。
-            let scales: Vec<ChannelScale> =
-                (0..ch_count).map(|_| ChannelScale::default()).collect();
+            // 换算表按设备 uid 查；长度恒等于通道数，`to_csv` 的短表兜底路径不可达。
+            let scales: ScaleSet = calib.scales_for(bus.info.as_ref().map(|i| &i.uid), ch_count);
 
             println!();
             println!(
@@ -540,7 +730,7 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
 
             for ch in targets {
                 // 「测不出」要写成「测不出」，不能写 0 —— 项目纪律：宁可说不知道
-                let Some(m) = scope_core::measure(&capture, ch, &scales[ch]) else {
+                let Some(m) = scope_core::measure(&capture, ch, &scales.get(ch)) else {
                     println!("  CH{}: 测不出（通道无数据）", ch + 1);
                     continue;
                 };
@@ -565,8 +755,7 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
             }
 
             println!();
-            println!("⚠ 电压用的是未标定的占位换算（3.3 V / 4096、零点 2048），不是标定值。");
-            println!("  只看相对关系；绝对值要按设备 uid 标定后才对得上。");
+            println!("{}", scales.summary_note());
 
             let _ = bus.stop();
             Ok(())
@@ -692,6 +881,59 @@ mod tests {
                 v.to_possible_value().unwrap().get_name(),
                 "枚举名与场景名对不上"
             );
+        }
+    }
+
+    /// uid 解析宽容、但错的要给出能照着改的提示。
+    ///
+    /// 宽容是有代价的：**两种拼法会静默产生两条记录**。所以写入一律走
+    /// `encode_uid` 规范化，读取才宽容 —— 这条测试钉的是「读」这一侧。
+    #[test]
+    fn uid_parsing_accepts_separators_and_explains_junk() {
+        let want = decode_uid("5eed00010203040506070809").unwrap();
+        for s in [
+            "5eed00010203040506070809",
+            "5E:ED:00:01:02:03:04:05:06:07:08:09",
+            "5e-ed-00-01-02-03-04-05-06-07-08-09",
+        ] {
+            assert_eq!(parse_uid(s).unwrap(), want, "应能解析 {s}");
+        }
+        let e = parse_uid("xyz").unwrap_err().to_string();
+        assert!(e.contains("24 个字符"), "错误要写清格式：{e}");
+    }
+
+    /// 钉住 `cal set` 的命令行表面 —— 默认值改错了是**用户可见**的。
+    #[test]
+    fn the_cal_set_command_line_parses_with_its_defaults() {
+        let cli = Cli::try_parse_from([
+            "scope-cli",
+            "cal",
+            "set",
+            "--uid",
+            "5eed00010203040506070809",
+            "--volts-per-lsb",
+            "0.001",
+        ])
+        .expect("`cal set` 应当能解析");
+
+        match cli.target {
+            Target::Cal {
+                action:
+                    CalAction::Set {
+                        uid,
+                        ch,
+                        volts_per_lsb,
+                        zero_lsb,
+                        note,
+                    },
+            } => {
+                assert_eq!(uid, "5eed00010203040506070809");
+                assert_eq!(ch, 0, "通道默认 0 起");
+                assert_eq!(zero_lsb, 2048.0, "零点默认是 12-bit 中点");
+                assert_eq!(volts_per_lsb, 0.001);
+                assert!(note.is_none(), "备注是可选的");
+            }
+            other => panic!("解析成了别的子命令：{other:?}"),
         }
     }
 }
