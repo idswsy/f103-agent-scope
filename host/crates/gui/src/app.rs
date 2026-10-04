@@ -16,7 +16,8 @@ use crate::msg::{Request, TransportKind, Update};
 use crate::panels;
 use crate::worker::Worker;
 use scope_core::{
-    Capture, CaptureStore, DeviceConfig, DeviceInfo, I2cDecode, I2cDecodeConfig, State,
+    CalibrationStore, Capture, CaptureStore, DeviceConfig, DeviceInfo, I2cDecode, I2cDecodeConfig,
+    ScaleSet, State,
 };
 use scope_sim::Scenario;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +60,19 @@ pub struct App {
     pub(crate) want_trigger_edge: u8,
     /// 触发电平（ADC LSB）。
     pub(crate) want_trigger_level: u16,
+
+    // ── 通道标定 ──
+    /// 标定表（按设备 uid 索引）。**只读** —— 写入走 `scope-cli cal set`。
+    pub(crate) calib: CalibrationStore,
+    /// 当前这一窗该用哪套换算。
+    ///
+    /// **断开连接时不清**（与 `info`/`config` 不同）—— 因为 `capture` 也不清，
+    /// 波形还在屏幕上，纵轴标签必须跟显示的数据一致。
+    ///
+    /// ⚠ 代价：历史采集里换过设备的那几条，会按**当前**设备的标定渲染。
+    /// 真正的修法是给 `Capture` 加 uid 溯源，那会牵动 core、MCP 的 JSON
+    /// 与 GUI 的镜像，成本高。本轮接受，在这里写明。
+    pub(crate) calib_view: ScaleSet,
 
     // ── 采集与解码 ──
     /// 当前显示的采集。
@@ -147,6 +161,9 @@ impl App {
             want_trigger_mode: 1, // normal
             want_trigger_edge: 0, // 上升
             want_trigger_level: 2048,
+
+            calib: CalibrationStore::load_default(),
+            calib_view: ScaleSet::uncalibrated(0),
 
             capture: None,
             store: CaptureStore::default(),
@@ -485,7 +502,6 @@ impl App {
     /// 返回 `None` 表示还没有采集可分析。
     pub(crate) fn build_evidence(&self) -> Option<String> {
         let cap = self.capture.as_ref()?;
-        let scale = scope_core::ChannelScale::default();
         let link = self.link_description();
         let question = self.ai.question.trim();
 
@@ -501,7 +517,7 @@ impl App {
 
         Some(scope_core::build_evidence(&scope_core::EvidenceInput {
             capture: cap,
-            scale: &scale,
+            scale: &self.calib_view,
             link: &link,
             simulated,
             config,
@@ -538,6 +554,15 @@ impl App {
                     "已连接 {} 通道 / 上限 {} Hz",
                     info.ch_count, info.rate_max_hz
                 ));
+                // 标定表按 uid 查。**重新读一遍文件** —— 用户可能在两次采集
+                // 之间在另一个终端跑了 `cal set`。
+                self.calib.reload();
+                self.calib_view = self
+                    .calib
+                    .scales_for(Some(&info.uid), info.ch_count as usize);
+                if !self.calib_view.all_calibrated() {
+                    self.note(self.calib_view.summary_note());
+                }
                 self.info = Some(info);
                 self.config = config;
                 self.state = Some(state);
@@ -553,6 +578,8 @@ impl App {
                 self.info = None;
                 self.config = None;
                 self.state = None;
+                // `calib_view` **故意不清**：`capture` 也不清，波形还在屏幕上，
+                // 纵轴标签必须跟显示的数据一致。见字段上的说明。
             }
 
             Update::ConfigApplied(cfg) => {

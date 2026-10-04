@@ -31,7 +31,8 @@
 
 use std::fmt::Write as _;
 
-use crate::capture::{Capture, ChannelScale};
+use crate::calib::ScaleSet;
+use crate::capture::Capture;
 use crate::command::DeviceConfig;
 use crate::i2c_decode::{I2cDecode, I2cDecodeConfig, Transaction};
 use crate::measure::measure;
@@ -64,8 +65,12 @@ pub const MAX_CHARS: usize = 8_000;
 pub struct EvidenceInput<'a> {
     /// 采集本身。
     pub capture: &'a Capture,
-    /// 电压换算（显示层唯一允许做伏特换算的地方）。
-    pub scale: &'a ChannelScale,
+    /// 逐通道电压换算，外加「标没标定」的出处。
+    ///
+    /// 从 `&ChannelScale` 换成 `&ScaleSet`：证据包里那句「是未标定还是
+    /// 已标定」必须**如实反映来源**，而不是写死一句「未标定」——
+    /// 模型据此决定敢不敢把伏特值当准数用。
+    pub scale: &'a ScaleSet,
     /// 链路描述，例如 `sim(i2c_100k)` 或 `COM7 @ 921600`。
     pub link: &'a str,
     /// 数据是不是模拟器产生的。**必须如实填** —— 它决定模型敢不敢下结论。
@@ -215,7 +220,7 @@ fn channels_section(s: &mut String, input: &EvidenceInput<'_>) {
     let mut any = false;
     for ch in 0..input.capture.channels.len() {
         let name = channel_label(ch);
-        let Some(m) = measure(input.capture, ch, input.scale) else {
+        let Some(m) = measure(input.capture, ch, &input.scale.get(ch)) else {
             let _ = writeln!(s, "{name}: 测不出（通道无数据）");
             continue;
         };
@@ -379,11 +384,28 @@ fn footer_section(s: &mut String, input: &EvidenceInput<'_>) {
         );
     }
     // 满量程 = 每 LSB 的伏特数 × 4096。别写死 3.3 —— 标定一旦变了这里就错了。
-    let full_scale = input.scale.volts_per_lsb * 4096.0;
-    let _ = writeln!(
-        s,
-        "- 电压是按 {full_scale:.2} V 满量程做的**未标定**换算，只看相对关系，不要当成校准值。"
-    );
+    // 三种状态**必须分开说**：说成「已标定」会让模型把占位值当准数，
+    // 说成「未标定」则会把标定过的数据白白降级。
+    let uid = input.scale.uid_hex().unwrap_or_else(|| "?".into());
+    if input.scale.all_calibrated() {
+        let full_scale = input.scale.get(0).volts_per_lsb * 4096.0;
+        let _ = writeln!(
+            s,
+            "- 电压按设备标定（uid {uid}）换算，满量程 {full_scale:.2} V。"
+        );
+    } else if input.scale.record_found() {
+        let full_scale = input.scale.get(0).volts_per_lsb * 4096.0;
+        let _ = writeln!(
+            s,
+            "- 电压**部分未标定**：uid {uid} 的记录里缺部分通道，缺的那些按 {full_scale:.2} V              满量程的占位值换算。标定过的通道可以当准数，其余只看相对关系。"
+        );
+    } else {
+        let full_scale = input.scale.get(0).volts_per_lsb * 4096.0;
+        let _ = writeln!(
+            s,
+            "- 电压是按 {full_scale:.2} V 满量程做的**未标定**换算，只看相对关系，不要当成校准值。"
+        );
+    }
     let _ = writeln!(
         s,
         "- 上面所有数字都来自精确计算，**不要自己估算或重新推导**；\
@@ -523,7 +545,6 @@ fn truncate_to_cap(s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::ChannelScale;
     use crate::i2c_decode::{decode_capture, I2cDecodeConfig};
 
     const HIGH: u16 = 4095;
@@ -712,7 +733,9 @@ mod tests {
         cap
     }
 
-    fn input<'a>(cap: &'a Capture, scale: &'a ChannelScale) -> EvidenceInput<'a> {
+    /// 证据包输入。换算固定为**未标定** —— 这些测试验的是证据包的结构与
+    /// 各项上限，不是换算本身；换算的测试在 `calib::tests` 里。
+    fn input<'a>(cap: &'a Capture, scale: &'a ScaleSet) -> EvidenceInput<'a> {
         EvidenceInput {
             capture: cap,
             scale,
@@ -738,7 +761,7 @@ mod tests {
     #[test]
     fn truncated_frame_survives_into_the_text() {
         let cap = i2c_capture(false); // 砍掉 STOP → 最后一帧没收尾
-        let scale = ChannelScale::default();
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
         let d = decode_capture(&cap, &I2cDecodeConfig::default()).expect("应能解码");
 
         // 前提：这份数据里确实有截断帧和对应告警，否则这条测试是假通过的
@@ -784,7 +807,7 @@ mod tests {
     #[test]
     fn complete_frames_do_not_get_a_truncation_note() {
         let cap = i2c_capture(true);
-        let scale = ChannelScale::default();
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
         let d = decode_capture(&cap, &I2cDecodeConfig::default()).expect("应能解码");
         assert!(
             d.transactions.iter().all(|t| t.complete),
@@ -890,7 +913,7 @@ mod tests {
     #[test]
     fn the_frame_table_explains_its_ack_notation() {
         let cap = i2c_capture(true);
-        let scale = ChannelScale::default();
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
         let d = decode_capture(&cap, &I2cDecodeConfig::default()).unwrap();
         let cfg = I2cDecodeConfig::default();
         let mut i = input(&cap, &scale);
@@ -953,7 +976,7 @@ mod tests {
     #[test]
     fn user_selected_channels_are_disclosed() {
         let cap = i2c_capture(true);
-        let scale = ChannelScale::default();
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
         let d = decode_capture(&cap, &I2cDecodeConfig::default()).unwrap();
         let cfg = I2cDecodeConfig::new(1, 0); // 故意反接，验证打印的是配置值
         let mut i = input(&cap, &scale);
@@ -980,7 +1003,7 @@ mod tests {
     #[test]
     fn channel_names_match_the_ui_numbering() {
         let cap = i2c_capture(true);
-        let scale = ChannelScale::default();
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
         let d = decode_capture(&cap, &I2cDecodeConfig::default()).unwrap();
         let cfg = I2cDecodeConfig::default();
         let mut i = input(&cap, &scale);
@@ -1006,7 +1029,7 @@ mod tests {
     #[test]
     fn the_config_section_uses_the_display_name_not_the_protocol_field_name() {
         let cap = flat_capture();
-        let scale = ChannelScale::default();
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
         let cfg = DeviceConfig {
             rate_hz: 857_142,
             ch0_enable: 1,
@@ -1087,7 +1110,7 @@ mod tests {
                 .map(|i| if (i / 64) % 2 == 0 { 4095 } else { 0 })
                 .collect(),
         ];
-        let scale = ChannelScale::default();
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
         let d = decode_capture(&cap, &I2cDecodeConfig::default()).ok();
         let cfg = I2cDecodeConfig::default();
         let mut i = input(&cap, &scale);
@@ -1111,7 +1134,7 @@ mod tests {
     #[test]
     fn a_real_capture_fits_comfortably() {
         let cap = i2c_capture(true);
-        let scale = ChannelScale::default();
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
         let d = decode_capture(&cap, &I2cDecodeConfig::default()).unwrap();
         let cfg = I2cDecodeConfig::default();
         let mut i = input(&cap, &scale);
@@ -1136,11 +1159,10 @@ mod tests {
     /// 写一个会被真实数据推翻的上限（我一开始就写错了）。
     #[test]
     fn preview_bucket_count_is_at_most_twice_the_target() {
-        let scale = ChannelScale::default();
-
         for len in [64usize, 127, 128, 129, 255, 256, 300, 512, 1024, 4096] {
             let mut cap = Capture::new(1, 800_000, 1, len as u32);
             cap.channels = vec![(0..len).map(|i| (i % 4096) as u16).collect()];
+            let scale = ScaleSet::uncalibrated(cap.channels.len());
             let i = input(&cap, &scale);
             let text = build_evidence(&i);
 
@@ -1172,7 +1194,7 @@ mod tests {
     #[test]
     fn simulator_data_is_declared_loudly() {
         let cap = flat_capture();
-        let scale = ChannelScale::default();
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
 
         let mut sim = input(&cap, &scale);
         sim.simulated = true;
@@ -1200,7 +1222,7 @@ mod tests {
     #[test]
     fn unmeasurable_metrics_say_so_rather_than_zero() {
         let cap = flat_capture();
-        let scale = ChannelScale::default();
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
         let text = build_evidence(&input(&cap, &scale));
 
         assert!(text.contains("测不出"), "直流信号应报「测不出」：{text}");
@@ -1215,7 +1237,7 @@ mod tests {
     #[test]
     fn overrun_is_flagged() {
         let mut cap = flat_capture();
-        let scale = ChannelScale::default();
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
         assert!(
             !build_evidence(&input(&cap, &scale)).contains("溢出"),
             "没溢出就不该提溢出"
@@ -1237,7 +1259,7 @@ mod tests {
     #[test]
     fn same_input_gives_byte_identical_output() {
         let cap = i2c_capture(true);
-        let scale = ChannelScale::default();
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
         let d = decode_capture(&cap, &I2cDecodeConfig::default()).unwrap();
         let cfg = I2cDecodeConfig::default();
 
@@ -1255,7 +1277,7 @@ mod tests {
     #[test]
     fn the_question_is_included_but_blank_is_ignored() {
         let cap = flat_capture();
-        let scale = ChannelScale::default();
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
 
         let mut with_q = input(&cap, &scale);
         with_q.question = Some("这段总线有什么问题？");
@@ -1274,7 +1296,7 @@ mod tests {
     #[test]
     fn missing_decode_explains_itself() {
         let cap = flat_capture(); // 只有 1 个真通道有数据，且没解
-        let scale = ChannelScale::default();
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
         let text = build_evidence(&input(&cap, &scale));
         assert!(
             text.contains("没有解码结果"),

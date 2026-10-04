@@ -1163,7 +1163,7 @@ mod tests {
     #[test]
     #[ignore = "要跑一次真实采集（本地），手动跑"]
     fn measure_real_payload() {
-        use scope_core::{AcquireParams, ChannelScale, CommandBus, EvidenceInput};
+        use scope_core::{AcquireParams, CommandBus, EvidenceInput};
 
         let mut bus = CommandBus::new(scope_device::Transport::sim(scope_sim::Scenario::I2c100k));
         bus.connect().expect("连模拟器失败");
@@ -1178,7 +1178,7 @@ mod tests {
         )
         .expect("采集失败");
 
-        let scale = ChannelScale::default();
+        let scale = scope_core::ScaleSet::uncalibrated(cap.channels.len());
         let decode_cfg = scope_core::I2cDecodeConfig::default();
         let decode = scope_core::decode_capture(&cap, &decode_cfg).ok();
         let frames = decode.as_ref().map(|d| d.transactions.len()).unwrap_or(0);
@@ -1231,7 +1231,7 @@ mod tests {
     #[test]
     #[ignore = "要外网 + 真 key + 花钱；手动跑"]
     fn live_single_shot_end_to_end() {
-        use scope_core::{AcquireParams, ChannelScale, CommandBus, EvidenceInput};
+        use scope_core::{AcquireParams, CommandBus, EvidenceInput};
 
         // ── 1) 读用户机器上的真实配置 ──
         let path = crate::config::default_config_path();
@@ -1271,7 +1271,7 @@ mod tests {
         );
 
         // ── 3) 证据包（走真实路径：core 的 measure + decode）──
-        let scale = ChannelScale::default();
+        let scale = scope_core::ScaleSet::uncalibrated(cap.channels.len());
         let decode_cfg = scope_core::I2cDecodeConfig::default();
         let decode = scope_core::decode_capture(&cap, &decode_cfg).ok();
         let evidence = scope_core::build_evidence(&EvidenceInput {

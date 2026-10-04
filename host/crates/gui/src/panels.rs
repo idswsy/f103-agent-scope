@@ -7,8 +7,45 @@ use crate::app::App;
 use crate::msg::{Request, TransportKind};
 use crate::vmodel::{self, SpanKind};
 use egui_plot::{HLine, Line, Plot, Polygon, Text, VLine};
-use scope_core::{state_name, ChannelScale, State};
+use scope_core::{state_name, ScaleSet, State};
 use scope_sim::Scenario;
+
+/// 状态栏的标定角标：`(是否已标定, 短文本, 悬浮说明)`。
+///
+/// 抽成**纯函数**是为了能在无头 job 里测 —— GUI 的渲染没法自动验，
+/// 但这三样东西的取值可以，而它们恰好是「用户会不会把占位值当准数」
+/// 的唯一提示。三态**必须分开**：把部分标定说成未标定，会把已经标好的
+/// 通道白白降级；说成已标定则相反，是更糟的那个方向。
+pub(crate) fn calib_badge(view: &ScaleSet) -> (bool, String, String) {
+    let uid = view.uid_hex().unwrap_or_else(|| "?".into());
+    if view.all_calibrated() {
+        let c = view.get(0);
+        (
+            true,
+            "✓ 电压已标定".into(),
+            format!(
+                "uid {uid}\nCH1：{:.9} V/LSB，零点 {:.1} LSB\n修改：scope-cli cal set",
+                c.volts_per_lsb, c.zero_lsb
+            ),
+        )
+    } else if view.record_found() {
+        (
+            false,
+            "⚠ 电压部分未标定".into(),
+            format!("{}\n修改：scope-cli cal set", view.summary_note()),
+        )
+    } else {
+        (
+            false,
+            "⚠ 电压未标定".into(),
+            format!(
+                "{}\n\n真机上要按设备 uid 存标定表才对得上。\
+                 \n模拟器的 I2C 电平是 0.15/0.85·VDD，按占位换算约 ±1.15 V。",
+                view.summary_note()
+            ),
+        )
+    }
+}
 
 /// 顶部工具条：采集 / 停止 / 复位。
 pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
@@ -448,7 +485,7 @@ pub fn help_page(app: &mut App, ui: &mut egui::Ui) {
             // ⚠ 这些字符串不要用 `\` 续行 —— 续行后源码里的缩进会原样进到
             // 字符串里，渲染出来每句中间凭空多一大段空白。
             let notes = [
-                "电压换算使用未标定的占位参数（3.3 V / 4096、零点 2048）。接入实机后需按设备 UID 标定。",
+                "电压换算按设备 UID 查标定表；没有记录时用占位参数（3.3 V / 4096、零点 2048），状态栏会标出「未标定」。写入用 scope-cli cal set。",
                 "上升时间的分辨率下限为 1 个采样周期。",
                 "频率与占空比已排除事务之间的空闲区间；非周期信号报出的是边沿速率。",
                 "协议解码走数字通路（LM393 比较器 + 定时器输入捕获），与 ADC 采样率无关；ADC 通路负责信号质量评估。",
@@ -555,15 +592,17 @@ pub fn status_bar(app: &mut App, ui: &mut egui::Ui) {
                 cap.rate_hz,
                 cap.duration_us() as f64 / 1000.0
             ));
-            // 电压是未标定的换算（ChannelScale::default 是占位值）。
-            // 这句必须放在**一定看得见**的地方 —— y 轴标签会被
+            // 标定状态必须放在**一定看得见**的地方 —— y 轴标签会被
             // show_axes([true,false]) 一起藏掉，放那儿等于没写。
             if app.show_volts {
                 ui.separator();
-                ui.colored_label(egui::Color32::from_rgb(180, 150, 90), "⚠ 电压未标定")
-                    .on_hover_text(
-                        "电压用的是 ChannelScale::default() 这个占位换算                          （3.3 V / 4096、零点 2048），不是标定值。                         模拟器的 I2C 电平是 0.15/0.85·VDD，按这个换算是 ±1.15 V；                         真机上要按设备 uid 存标定表才对得上。",
-                    );
+                let (ok, text, help) = calib_badge(&app.calib_view);
+                let color = if ok {
+                    egui::Color32::from_rgb(120, 190, 120)
+                } else {
+                    egui::Color32::from_rgb(180, 150, 90)
+                };
+                ui.colored_label(color, text).on_hover_text(help);
             }
             if cap.overrun {
                 ui.colored_label(
@@ -604,7 +643,8 @@ pub fn plot(app: &mut App, ui: &mut egui::Ui) {
     };
 
     let ch_count = cap.channels.len().max(1);
-    let scale = ChannelScale::default();
+    // 逐通道换算，按设备 uid 查。**克隆一份**：后面 `app` 还要可变借用。
+    let scales = app.calib_view.clone();
 
     // 操作提示与重置按钮。egui_plot 的缩放/平移是内置的，但**用户不知道** ——
     // 不给提示的话没人会去滚轮。另外缩进去之后没有出口，得给个按钮。
@@ -639,8 +679,10 @@ pub fn plot(app: &mut App, ui: &mut egui::Ui) {
     let decode_top = lane_bottom(ch_count - 1) - LANE_GAP;
     let decode_bottom = decode_top - DECODE_H;
 
-    let to_v = |lsb: u16| scale.lsb_to_volts(lsb);
     let show_volts = app.show_volts;
+    // 解码门限是**解码层的量**（按 LSB 定义），不是某个通道的电压。
+    // 它要在每条泳道上画成参考线，所以下面按各泳道自己的换算去画。
+    let levels = app.decode_cfg.levels;
 
     // ── 各通道折线 ──
     let palette = [
@@ -653,11 +695,12 @@ pub fn plot(app: &mut App, ui: &mut egui::Ui) {
     let mut lane_labels: Vec<(String, f64)> = Vec::new();
     for ch in 0..ch_count {
         let base = lane_bottom(ch);
+        let sc = scales.get(ch);
         // 几何一律用电压 —— 泳道里保持真实电压刻度。
         // 「显示电压」开关只换**标签单位**，不换形状：
         // 之前关掉时把 y 算成 volts/3.3*LANE_H，那既不是伏特也不是 LSB，
         // 是个没有物理意义的缩放。
-        let pts: Vec<[f64; 2]> = vmodel::waveform_points(&cap, ch, &scale)
+        let pts: Vec<[f64; 2]> = vmodel::waveform_points(&cap, ch, &sc)
             .into_iter()
             .map(|p| [p[0], base + p[1]])
             .collect();
@@ -677,8 +720,8 @@ pub fn plot(app: &mut App, ui: &mut egui::Ui) {
                 format!(
                     "CH{}  {}–{} LSB",
                     ch + 1,
-                    scale.volts_to_lsb(lo_v),
-                    scale.volts_to_lsb(hi_v)
+                    sc.volts_to_lsb(lo_v),
+                    sc.volts_to_lsb(hi_v)
                 )
             }
         } else if lo.is_finite() {
@@ -687,7 +730,7 @@ pub fn plot(app: &mut App, ui: &mut egui::Ui) {
             if show_volts {
                 format!("CH{}  {v:.2} V", ch + 1)
             } else {
-                format!("CH{}  {} LSB", ch + 1, scale.volts_to_lsb(v))
+                format!("CH{}  {} LSB", ch + 1, sc.volts_to_lsb(v))
             }
         } else {
             format!("CH{}", ch + 1)
@@ -705,15 +748,20 @@ pub fn plot(app: &mut App, ui: &mut egui::Ui) {
     }
 
     // ── 每条泳道内的 VIH / VIL 参考线 ──
-    let (vih_v, vil_v) = {
-        let l = app.decode_cfg.levels;
-        (to_v(l.vih_lsb), to_v(l.vil_lsb))
-    };
+    // 逐泳道用各自的换算：线的位置必须和那条泳道的纵轴刻度同源，
+    // 否则标定之后参考线会与波形错位。
     let mut thresholds: Vec<([f64; 2], egui::Color32)> = Vec::new();
     for ch in 0..ch_count {
         let base = lane_bottom(ch);
+        let sc = scales.get(ch);
         let c = egui::Color32::from_gray(80);
-        thresholds.push(([base + vih_v, base + vil_v], c));
+        thresholds.push((
+            [
+                base + sc.lsb_to_volts(levels.vih_lsb),
+                base + sc.lsb_to_volts(levels.vil_lsb),
+            ],
+            c,
+        ));
     }
 
     // ── 解码色块，只画在底部专用带里，不覆盖波形 ──
@@ -788,11 +836,15 @@ pub fn plot(app: &mut App, ui: &mut egui::Ui) {
         // 十字准线的 y 读数在泳道模式下不是电压（CH2 起整体下移了），
         // 留着会被当成电压读。时间信息由交易表和横轴给。
         .show_crosshair(false)
-        // 电压是**未标定**的换算：`ChannelScale::default()` 是个占位值
-        // （3.3V/4096、零点 2048），真机上要按 uid 存标定表才对得上。
-        // 不标出来的话，等于把一个猜测当成测量值展示 —— 违反项目那条
-        // 「宁可说不知道，也不给看似精确的垃圾数」。
-        .y_axis_label("泳道（电压未标定）")
+        // 电压换算的出处必须标在轴上：不标的话等于把一个猜测当成测量值
+        // 展示 —— 违反项目那条「宁可说不知道，也不给看似精确的垃圾数」。
+        // 注意 `show_axes([true, false])` 在泳道模式下会**连轴标签一起藏掉**，
+        // 所以这句话在别处（状态栏角标）也有一份 —— 那才是兜底。
+        .y_axis_label(if scales.all_calibrated() {
+            "泳道（电压已标定）"
+        } else {
+            "泳道（电压未标定）"
+        })
         .legend(egui_plot::Legend::default())
         .allow_scroll(false)
         .default_y_bounds(y_bot, y_top);
@@ -940,7 +992,8 @@ fn measure_section(app: &mut App, ui: &mut egui::Ui) {
     let Some(cap) = app.capture.clone() else {
         return;
     };
-    let scale = ChannelScale::default();
+    // 逐通道换算，按设备 uid 查。**克隆一份**：下面 `app` 还要可变借用。
+    let scales = app.calib_view.clone();
 
     ui.horizontal(|ui| {
         ui.strong("测量");
@@ -950,8 +1003,7 @@ fn measure_section(app: &mut App, ui: &mut egui::Ui) {
             .clicked()
         {
             let path = capture_path(&cap, "csv");
-            let scales: Vec<ChannelScale> = (0..cap.channels.len()).map(|_| scale).collect();
-            match std::fs::write(&path, cap.to_csv(&scales)) {
+            match std::fs::write(&path, cap.to_csv(scales.as_slice())) {
                 Ok(()) => app.note(format!("已写出 {path}")),
                 Err(e) => app.note(format!("✗ 写 CSV 失败：{e}")),
             }
@@ -967,7 +1019,7 @@ fn measure_section(app: &mut App, ui: &mut egui::Ui) {
     });
 
     for ch in 0..cap.channels.len() {
-        let Some(m) = vmodel::measure(&cap, ch, &scale) else {
+        let Some(m) = vmodel::measure(&cap, ch, &scales.get(ch)) else {
             continue;
         };
         let freq = m
@@ -1550,4 +1602,64 @@ fn decode_panel(app: &mut App, ui: &mut egui::Ui) {
                 ui.monospace(line);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scope_core::ChannelScale;
+
+    fn one_mv() -> ChannelScale {
+        ChannelScale {
+            volts_per_lsb: 1e-3,
+            zero_lsb: 2048.0,
+        }
+    }
+
+    /// 标定角标的**三态必须分开**。
+    ///
+    /// 把「部分标定」说成「未标定」会把已经标好的通道白白降级；
+    /// 反过来（未标定说成已标定）更糟 —— 那是把占位值当成准数展示。
+    /// 这条测试是这三态唯一的自动守卫：GUI 的渲染验不了，取值可以。
+    #[test]
+    fn the_calibration_badge_distinguishes_three_states() {
+        let uid = [1u8; 12];
+
+        // (1) 没有记录 —— 未标定，且不该说成「部分」
+        let none = ScaleSet::uncalibrated(2);
+        let (ok, text, help) = calib_badge(&none);
+        assert!(!ok, "没有记录不能显示成已标定");
+        assert!(text.contains("未标定"), "实测：{text}");
+        assert!(!text.contains("部分"), "没记录不是「部分」：{text}");
+        assert!(help.contains("cal set"), "悬浮说明要给出路：{help}");
+
+        // (2) 有记录但缺通道
+        let mut store = scope_core::CalibrationStore::empty();
+        store.set_channel(uid, 0, one_mv(), None, 0).unwrap();
+        let partial = store.scales_for(Some(&uid), 2);
+        let (ok, text, help) = calib_badge(&partial);
+        assert!(!ok, "缺通道不能显示成已标定");
+        assert!(text.contains("部分未标定"), "实测：{text}");
+        assert!(help.contains("CH2"), "要指出缺哪个通道：{help}");
+
+        // (3) 全部标定
+        store.set_channel(uid, 1, one_mv(), None, 0).unwrap();
+        let full = store.scales_for(Some(&uid), 2);
+        let (ok, text, help) = calib_badge(&full);
+        assert!(ok, "全标定应显示为已标定");
+        assert!(text.contains("已标定"), "实测：{text}");
+        assert!(
+            help.contains("0.001000000"),
+            "悬浮说明要给出实际换算值，否则用户没法核对：{help}"
+        );
+    }
+
+    /// 空集（还没连过设备）也要走「未标定」这一支，不能因为
+    /// `all_calibrated()` 在空集上返回 false 而漏判成别的状态。
+    #[test]
+    fn an_empty_scale_set_reads_as_uncalibrated() {
+        let (ok, text, _) = calib_badge(&ScaleSet::uncalibrated(0));
+        assert!(!ok);
+        assert!(text.contains("未标定"), "实测：{text}");
+    }
 }
