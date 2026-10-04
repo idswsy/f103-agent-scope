@@ -274,7 +274,13 @@ pub struct MinMaxPreview {
 }
 
 /// 通道标定 —— 伏特换算**只在上位机做**，MCU 只认 LSB。
-#[derive(Debug, Clone, Copy)]
+///
+/// `Serialize` / `Deserialize` 是给 [`crate::calib`] 的标定表用的。
+/// **字段名是文件格式的一部分** —— 改了就是格式变更，要配 `CALIB_VERSION` 一起动。
+///
+/// 反序列化**刻意不设 `#[serde(default)]`**：字段缺失应当让整个文件解析失败
+/// 并被记录，而不是静默退回占位值 —— 那等于悄悄用一个错的换算。
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct ChannelScale {
     /// 每 LSB 对应的伏特数。
     pub volts_per_lsb: f64,

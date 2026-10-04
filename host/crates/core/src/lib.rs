@@ -32,6 +32,7 @@
 #![warn(missing_docs)]
 
 pub mod acquire;
+pub mod calib;
 pub mod capture;
 pub mod command;
 pub mod device;
@@ -42,6 +43,10 @@ pub mod persist;
 pub mod report;
 
 pub use acquire::{acquire, acquire_cancellable, AcquireParams, TriggerEvent};
+pub use calib::{
+    decode_uid, encode_uid, is_placeholder_uid, CalibrationFile, CalibrationStore, DeviceCalib,
+    ScaleSet, CALIB_VERSION,
+};
 pub use capture::{
     Capture, CaptureStore, ChannelScale, ChannelSummary, MinMaxPreview, DEFAULT_HISTORY,
 };
