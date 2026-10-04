@@ -12,6 +12,5 @@ authors.workspace      = true
 scope-proto = { workspace = true }
 thiserror   = { workspace = true }
 serde       = { workspace = true }
-
-[dev-dependencies]
-serde_json = { workspace = true }
+# `persist` / `calib` 要读写 JSON 状态文件，所以从 dev-dependencies 提上来。
+serde_json  = { workspace = true }

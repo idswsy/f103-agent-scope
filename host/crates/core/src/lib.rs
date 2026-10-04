@@ -38,6 +38,7 @@ pub mod device;
 pub mod error;
 pub mod i2c_decode;
 pub mod measure;
+pub mod persist;
 pub mod report;
 
 pub use acquire::{acquire, acquire_cancellable, AcquireParams, TriggerEvent};

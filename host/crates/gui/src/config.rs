@@ -21,6 +21,15 @@
 //!    比文件不存在更难诊断。
 //!
 //! 路径解析写成**可注入 env 的纯函数**，所以 CI 能在无头机上把所有分支测完。
+//!
+//! # 这套机械现在在 `scope_core::persist`
+//!
+//! 上面四道防线原本实现在本文件里。标定表（`scope_core::calib`）要复用同一套，
+//! 所以**上移到 core**，本文件只留 [`AiConfig`] 与几个**同签名的薄包装** ——
+//! 闸门那类代码不该有两份：两份就会各自腐烂，而且总有一份先烂。
+//!
+//! 本文件原有的测试**一条都没改**。它们现在是双层证据：
+//! 既是 AI 配置本身的回归，也是「搬运没有改变行为」的回归。
 
 use std::path::{Path, PathBuf};
 
@@ -118,29 +127,18 @@ pub fn redact(key: &str) -> String {
 /// - 都没有 → `None`
 ///
 /// **故意不看当前目录，也不看 exe 所在目录。**
+/// **只在测试里用。** 生产路径走 [`default_config_path`]（直接调 core）。
+///
+/// 留着这个包装是因为本文件原有的四条路径解析测试都调它 ——
+/// 改测试去调 core 就把「搬运没有改变行为」那层证据弄丢了。
+#[cfg(test)]
 pub fn resolve_config_path(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    let non_empty = |k: &str| env(k).filter(|v| !v.trim().is_empty());
-
-    if let Some(appdata) = non_empty("APPDATA") {
-        return Some(Path::new(&appdata).join(DIR_NAME).join(FILE_NAME));
-    }
-    if let Some(xdg) = non_empty("XDG_CONFIG_HOME") {
-        return Some(Path::new(&xdg).join(DIR_NAME).join(FILE_NAME));
-    }
-    if let Some(home) = non_empty("HOME") {
-        return Some(
-            Path::new(&home)
-                .join(".config")
-                .join(DIR_NAME)
-                .join(FILE_NAME),
-        );
-    }
-    None
+    scope_core::persist::resolve_user_path(env, DIR_NAME, FILE_NAME)
 }
 
 /// 用真实环境变量解析路径。
 pub fn default_config_path() -> Option<PathBuf> {
-    resolve_config_path(&|k| std::env::var(k).ok())
+    scope_core::persist::default_user_path(DIR_NAME, FILE_NAME)
 }
 
 /// 读取配置。**任何失败均降级为默认值**，不返回错误。
@@ -152,121 +150,31 @@ pub fn default_config_path() -> Option<PathBuf> {
 /// 返回 `(配置, 来源说明)`。来源说明描述读取结果（文件不存在 / 解析失败 /
 /// 无可用目录），供调用方记入日志。
 pub fn load(path: Option<&Path>) -> (AiConfig, Option<String>) {
-    let Some(p) = path else {
-        return (
-            AiConfig::default(),
-            Some(
-                "未找到配置目录（APPDATA / XDG_CONFIG_HOME / HOME 均未设置）。\
-                 本次设置仅保存在内存中。"
-                    .into(),
-            ),
-        );
-    };
-    match std::fs::read_to_string(p) {
-        Ok(text) => match serde_json::from_str::<AiConfig>(&text) {
-            Ok(cfg) => (cfg, None),
-            Err(e) => (
-                AiConfig::default(),
-                Some(format!(
-                    "{} 内容无法解析（{e}）。已改用默认值；执行一次保存即可覆盖",
-                    p.display()
-                )),
-            ),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
-            AiConfig::default(),
-            Some(format!(
-                "{} 尚不存在。填写密钥并保存后将自动创建",
-                p.display()
-            )),
-        ),
-        Err(e) => (
-            AiConfig::default(),
-            Some(format!(
-                "读取 {} 失败：{e}。已改用默认值；请检查文件权限",
-                p.display()
-            )),
-        ),
-    }
+    scope_core::persist::load_json::<AiConfig>(path)
 }
+
+/// 写入失败时，用它点名「写的是什么」。
+///
+/// 提成常量而不是两处各写一个字面量：分别写的话，`save` 那处漂移了
+/// **没有任何测试会红** —— 对抗性核查实测把 `save` 的字面量改成「标定数据」，
+/// 75 条 gui 测试全过。原因见 [`check_writable`] 的说明。
+/// 值本身由 `the_refusal_message_names_what_was_being_written` 钉住。
+const WRITE_SUBJECT: &str = "API 密钥";
 
 /// 保存配置。失败时返回的是**带「怎么办」的中文说明**，不是一个裸错误码。
 pub fn save(path: &Path, cfg: &AiConfig) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{} 无上级目录，无法保存", path.display()))?;
-
-    let cwd = std::env::current_dir()
-        .map_err(|e| format!("无法获取当前工作目录（{e}）。无法确认目标位置安全性，拒绝写入"))?;
-    check_writable(parent, &cwd)?;
-
-    let body = serde_json::to_string_pretty(cfg)
-        .map_err(|e| format!("配置序列化失败：{e}。属程序缺陷，请提交 issue"))?;
-
-    // 原子写：同目录临时文件 + rename。
-    // 同目录是必须的 —— 跨文件系统的 rename 不是原子操作。
-    let tmp = parent.join(format!("{FILE_NAME}.tmp"));
-    write_private(&tmp, body.as_bytes())
-        .map_err(|e| format!("写入 {} 失败：{e}。请检查目录权限", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!(
-            "替换 {} 失败：{e}。请确认该文件未被其他程序占用",
-            path.display()
-        )
-    })?;
-    Ok(())
+    scope_core::persist::save_json_atomic(path, cfg, WRITE_SUBJECT)
 }
 
-/// 写文件，Unix 下带 `0600` 权限。
+/// 保存前的安全闸门 —— 实现在 [`scope_core::persist::check_writable`]。
 ///
-/// **Windows 下 `std` 设置不了 ACL** —— 文件会是默认权限（通常同用户可读）。
-/// 我们**不声称**它被保护了。
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(bytes)?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-    }
-}
-
-/// 保存前的安全闸门：**目标目录不许在当前工作目录（也就是仓库）里面**。
-///
-/// 两边都 canonicalize 之后再比 —— 纯字符串比较挡不住 `..`、
-/// 符号链接、以及 Windows 的短路径名。
-///
-/// `parent` 不存在时先建出来再判断（因为 canonicalize 要求路径存在）。
+/// **只在测试里用**：生产路径走 [`save`]，它直接调 core。
+/// 保留**两参数**的旧签名，为的是让本文件原有的三条闸门测试一个字都不用改 ——
+/// 它们同时是「搬运没有改变行为」的证据。
+/// 新代码请直接用 core 那个带 `what` 的版本。
+#[cfg(test)]
 pub fn check_writable(parent: &Path, forbidden_root: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(parent)
-        .map_err(|e| format!("创建目录 {} 失败：{e}。请检查权限", parent.display()))?;
-
-    let real_parent = std::fs::canonicalize(parent)
-        .map_err(|e| format!("解析路径 {} 失败：{e}", parent.display()))?;
-    // 当前目录拿不到真实路径时**不放弃检查** —— 退回按字面路径比，
-    // 宁可误报也不放过（这条闸门是防 key 进仓库的）。
-    let real_root = std::fs::canonicalize(forbidden_root).unwrap_or_else(|_| forbidden_root.into());
-
-    if real_parent.starts_with(&real_root) {
-        return Err(format!(
-            "拒绝写入：{} 位于当前工作目录（{}）之内，API 密钥不得落入项目目录。\
-             请清除 APPDATA / XDG_CONFIG_HOME / HOME 中的异常取值。",
-            real_parent.display(),
-            real_root.display()
-        ));
-    }
-    Ok(())
+    scope_core::persist::check_writable(parent, forbidden_root, WRITE_SUBJECT)
 }
 
 #[cfg(test)]
@@ -358,6 +266,28 @@ mod tests {
         assert!(err.contains("不得落入项目目录"), "错误须说明原因：{err}");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 拒写消息必须点名**写的是什么** —— 那是唯一会告诉用户「放错了什么」的地方。
+    ///
+    /// 这条**必须走生产的 [`save`]**，不能走上面那个 `check_writable`：
+    /// 那个是 `#[cfg(test)]` 包装，它自己也有一个 `what` 参数，
+    /// 所以它钉不住 `save` 实际传了什么。
+    ///
+    /// 对抗性核查实测：把 `save` 里的 `WRITE_SUBJECT` 改成 `"标定数据"`，
+    /// **75 条 gui 测试全过**，而用户看到的拒写消息已经错了。
+    /// 现在两处共用一个常量，且这条测试钉住它的值。
+    #[test]
+    fn the_refusal_message_names_what_was_being_written() {
+        let cwd = std::env::current_dir().expect("测试要能拿到当前目录");
+        let target = cwd.join("scope-gui-must-never-be-written.json");
+
+        let err = save(&target, &AiConfig::default()).expect_err("仓库目录内必须拒写");
+        assert!(
+            err.contains("API 密钥不得落入项目目录"),
+            "拒写消息必须点名写的是什么，实测：{err}"
+        );
+        assert!(!target.exists(), "闸门必须在落盘之前拦住");
     }
 
     #[test]
