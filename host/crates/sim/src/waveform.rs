@@ -797,7 +797,7 @@ mod tests {
         // 之后它当场变红，提醒的是：**断言里编码的是旧的事务形状**。
         assert!(
             starts >= 2 * stops && starts <= 2 * stops + 1,
-            "每笔事务应有 2 个起始条件（初始 + 重复起始），末尾可能多一个截断帧：             START={starts} STOP={stops}"
+            "每笔事务应有 2 个起始条件（初始 + 重复起始），末尾可能多一个截断帧： START={starts} STOP={stops}"
         );
 
         // 内容必须确定。每笔事务 5 个字节：

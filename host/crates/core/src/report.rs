@@ -397,7 +397,7 @@ fn footer_section(s: &mut String, input: &EvidenceInput<'_>) {
         let full_scale = input.scale.get(0).volts_per_lsb * 4096.0;
         let _ = writeln!(
             s,
-            "- 电压**部分未标定**：uid {uid} 的记录里缺部分通道，缺的那些按 {full_scale:.2} V              满量程的占位值换算。标定过的通道可以当准数，其余只看相对关系。"
+            "- 电压**部分未标定**：uid {uid} 的记录里缺部分通道，缺的那些按 {full_scale:.2} V 满量程的占位值换算。标定过的通道可以当准数，其余只看相对关系。"
         );
     } else {
         let full_scale = input.scale.get(0).volts_per_lsb * 4096.0;

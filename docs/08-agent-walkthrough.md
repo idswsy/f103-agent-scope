@@ -509,6 +509,17 @@
 ```
 </details>
 
+> **2026-10-04 补注**：上面这段 `note` 是**那次运行的原样记录，不改写** ——
+> 它是一份证据，不是规格。但要说清它现在是什么状态：
+>
+> 这句话已经变成**条件性**的了。设备该 `uid` 有标定记录时，`scope_measure`
+> 返回的是「电压按设备标定换算…」；并且响应里多了一个
+> `"voltage_calibrated"` 布尔字段 —— 模型据此判断伏特值可不可信，
+> **不必去读那句中文**。
+>
+> 标定表见 [`host/crates/core/src/calib.rs`](../host/crates/core/src/calib.rs)
+> 与 [`05-roadmap.md`](05-roadmap.md) 的 P1。
+
 **调用** `scope_list_captures`
 ```json
 {}

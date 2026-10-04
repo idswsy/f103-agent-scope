@@ -1200,7 +1200,7 @@ impl Session {
             "gaps": failed,
             "overruns": overruns,
             "sample": sample,
-            "note": "用重复单次采集实现（设备侧流模式尚未实现），两次采集之间必有间隙；                     gaps 是其中没等到触发的次数。只有第一次采集进了历史，\"sample\" 的                      capture_id 可直接用于 scope_measure / scope_read_waveform。",
+            "note": "用重复单次采集实现（设备侧流模式尚未实现），两次采集之间必有间隙； gaps 是其中没等到触发的次数。只有第一次采集进了历史，\"sample\" 的 capture_id 可直接用于 scope_measure / scope_read_waveform。",
         }))
     }
 

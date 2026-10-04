@@ -39,7 +39,7 @@ cd host && cargo test       # Rust 端全部测试
 | 串口链路 + 帧解析 | `firmware/App/proto_task.c` | `PING` / `ECHO` / `GET_INFO` 在真机上通过 |
 | 主机传输层 | `host/crates/transport-serial/` | 能枚举串口、连接、超时重试 |
 | CLI | `host/crates/cli/` | `scope-cli capture -o wave.csv` 能出图 |
-| 标定表 | `host/crates/core/src/calib.rs` | 用已知直流电压反推 LSB/V，写进配置文件 |
+| 标定表 | `host/crates/core/src/calib.rs` | 用已知直流电压反推 LSB/V，写进配置文件 —— **主机侧已完成**（见下表）；**真值待上板实测** |
 
 **已经先做掉的一部分**（不需要板子）：
 
@@ -49,6 +49,7 @@ cd host && cargo test       # Rust 端全部测试
 | 触发搜索 | `firmware/App/trigger.c` | ✅ 施密特迟滞状态机，**状态跨块保留**；`tests/test_trigger.c` 覆盖四个边界用例 |
 | 采集状态机 | `firmware/App/acq.c` | ✅ ARM → 搜触发（可跨块）→ 收尾 → DONE；含 auto 超时与溢出检测 |
 | 命令分发 | `firmware/App/proto_task.c` | ✅ 17 条命令；往返测试走完整的编解码（不是直接调处理函数） |
+| **标定表** | `host/crates/core/src/calib.rs` | ✅ 按设备 `uid` 索引；CLI 写入（`scope-cli cal set`），GUI / MCP 只读。**四个前端全部接上**，未标定时三端都如实标出。⚠ 真值仍需上板实测 —— 见 `docs/02-hardware.md` §9 |
 
 跑法：`./firmware/run_tests.sh` —— **不需要板子、不需要 Keil、不需要交叉编译**，
 CI 里也跑它。这正是那条分层的意义：三个人里两个人不拿板子也能改采集逻辑。

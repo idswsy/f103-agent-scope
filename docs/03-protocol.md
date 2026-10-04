@@ -182,6 +182,12 @@ F103 的**硬件 CRC 单元只支持固定 CRC-32 多项式**，做不了 CCITT 
 
 **`SET_CHANNEL` 的电平/偏移一律用 ADC LSB 整数**。伏特换算、量程衰减、AC/DC 校正**全部留在上位机**（按 `uid` 存标定表），MCU 不碰浮点、不知道「伏特」是什么。
 
+> 标定表实现在 [`host/crates/core/src/calib.rs`](../host/crates/core/src/calib.rs)：
+> 一个按 `uid` 索引的 JSON 文件（与 AI 配置同目录），CLI 写入
+> （`scope-cli cal set`），GUI 与 MCP **只读**。没有记录时用占位换算
+> （3.3 V / 4096、零点 2048），四端都会如实标出「未标定」——
+> MCP 侧是一个 `voltage_calibrated` 布尔字段，不是一个要读懂的中文句子。
+
 > ⚠ **这块板上 `SET_CHANNEL` 的五个字段并不是都做得到**（见 [`02-hardware.md`](02-hardware.md) §5）：
 >
 > | 字段 | 本板能不能真的生效 |
