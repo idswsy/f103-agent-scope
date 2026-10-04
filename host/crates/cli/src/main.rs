@@ -144,8 +144,32 @@ enum Action {
     /// 链路自检：PING 往返 + 吞吐
     Ping,
 
-    /// 测量统计（对当前采集）
-    Measure,
+    /// 测量统计：采一次，按通道给出 Vpp / 频率 / 占空比 / 上升时间
+    Measure {
+        /// 波形场景（**仅模拟器有效**；接真机时忽略）
+        #[arg(long, value_enum, default_value_t = ScenarioArg::Sine1k3v3)]
+        scenario: ScenarioArg,
+
+        /// 采样点数（F103 上限 4096）
+        #[arg(short = 'n', long, default_value_t = 1024)]
+        samples: u16,
+
+        /// 采样率（Hz）。设备会量化到最近档位并回显实际值。
+        #[arg(long, default_value_t = 857_142)]
+        rate: u32,
+
+        /// 触发电平（ADC LSB，12-bit 范围 0..4095）
+        #[arg(long, default_value_t = 2048)]
+        level: u16,
+
+        /// 超时（毫秒）
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u64,
+
+        /// 只测这一个通道（0 起）。省略则测全部通道
+        #[arg(long)]
+        channel: Option<usize>,
+    },
 }
 
 impl Action {
@@ -154,7 +178,9 @@ impl Action {
     /// 模拟器需要在跑动作之前就把设备建出来，所以得先问动作要场景。
     fn scenario_or_default(&self) -> ScenarioArg {
         match self {
-            Action::Capture { scenario, .. } | Action::I2c { scenario, .. } => *scenario,
+            Action::Capture { scenario, .. }
+            | Action::I2c { scenario, .. }
+            | Action::Measure { scenario, .. } => *scenario,
             _ => ScenarioArg::Sine1k3v3,
         }
     }
@@ -474,10 +500,75 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
             Ok(())
         }
 
-        Action::Measure => {
-            bus.connect()?;
-            println!("测量需要先有一次采集，见 `capture` 子命令。");
-            println!("（P2 会在这里接上主机侧的定点测量：freq / vpp / duty / rise_time）");
+        Action::Measure {
+            // 场景在 main() 里已经用来构造模拟器了，这里用不上
+            scenario: _,
+            samples,
+            rate,
+            level,
+            timeout_ms,
+            channel,
+        } => {
+            // 没有跨调用的采集存储（`Action::Capture` 的 store 是局部变量），
+            // 所以测量必须自己先采一次 —— 与 `i2c` 同样复用 `capture_once`。
+            let capture = capture_once(&mut bus, samples, rate, level, timeout_ms)?;
+            let ch_count = capture.channels.len();
+
+            let targets: Vec<usize> = match channel {
+                Some(c) if c >= ch_count => {
+                    anyhow::bail!(
+                        "--channel {c} 超出范围：本次采集只有 {ch_count} 个通道（0..={}）",
+                        ch_count.saturating_sub(1)
+                    )
+                }
+                Some(c) => vec![c],
+                None => (0..ch_count).collect(),
+            };
+
+            // 换算表按通道给，长度恒等于通道数 —— `to_csv` 的短表兜底路径不可达。
+            // ⚠ 这里仍是占位换算；标定管线落地后改为按设备 uid 查表。
+            let scales: Vec<ChannelScale> =
+                (0..ch_count).map(|_| ChannelScale::default()).collect();
+
+            println!();
+            println!(
+                "测量  capture_id={}  {} 点  {:.3} ms",
+                capture.id,
+                capture.len(),
+                capture.duration_us() as f64 / 1000.0
+            );
+
+            for ch in targets {
+                // 「测不出」要写成「测不出」，不能写 0 —— 项目纪律：宁可说不知道
+                let Some(m) = scope_core::measure(&capture, ch, &scales[ch]) else {
+                    println!("  CH{}: 测不出（通道无数据）", ch + 1);
+                    continue;
+                };
+                println!("  CH{}:", ch + 1);
+                println!(
+                    "    Vpp={:.4} V  min={:.4} V  max={:.4} V  mean={:.4} V  AC-RMS={:.4} V  RMS={:.4} V",
+                    m.vpp, m.min, m.max, m.mean, m.ac_rms, m.rms
+                );
+                let freq = match m.freq_hz {
+                    Some(f) => format!("{f:.1} Hz"),
+                    None => "测不出（无明显周期）".to_string(),
+                };
+                let duty = match m.duty_pct {
+                    Some(d) => format!("{d:.1} %"),
+                    None => "测不出".to_string(),
+                };
+                let rise = match m.rise_ns {
+                    Some(r) => format!("{r:.1} ns"),
+                    None => "测不出（没有干净的边沿）".to_string(),
+                };
+                println!("    频率={freq}  占空比={duty}  上升时间={rise}");
+            }
+
+            println!();
+            println!("⚠ 电压用的是未标定的占位换算（3.3 V / 4096、零点 2048），不是标定值。");
+            println!("  只看相对关系；绝对值要按设备 uid 标定后才对得上。");
+
+            let _ = bus.stop();
             Ok(())
         }
     }

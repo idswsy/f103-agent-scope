@@ -234,6 +234,17 @@ jobs:
           head -1 /tmp/i2c.csv | grep -q 'CH2V' || { echo "::error::应为双通道"; exit 1; }
           echo "✓ I2C 双通道采集成功"
 
+      - name: CLI 测量命令
+        run: |
+          out=$(cargo run -q -p scope-cli -- sim measure --scenario sine_1k_3v3 -n 4096)
+          echo "$out"
+          echo "$out" | grep -q 'Vpp=' || { echo "::error::测量未输出 Vpp"; exit 1; }
+          # 4096 点 @857 kSPS = 4.78 ms，覆盖约 4.8 个 1 kHz 周期 —— 频率必须测得出。
+          # （1024 点只有 1.19 ms，不足一个完整周期，频率会报「测不出」，那是正确行为，
+          #   所以这条特意用 4096 点，否则测不出与测量坏了分不开。）
+          echo "$out" | grep -q '频率=1000' || { echo "::error::1 kHz 正弦的频率测量不对"; exit 1; }
+          echo "✓ CLI 测量输出 Vpp 与正确的频率"
+
       - name: MCP 自检
         run: cargo run -q -p scope-mcp -- --selftest
 
