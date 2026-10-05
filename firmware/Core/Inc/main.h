@@ -59,20 +59,7 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 
 /* USER CODE BEGIN Private defines */
-struct Oscilloscope
-{
-   uint8_t showbit;         //������±�־λ
-   uint8_t keyValue;        //����ֵ
-   uint8_t ouptputbit;      //�����־λ
-   uint16_t outputFreq;     //�������Ƶ��
-   uint16_t pwmOut;         //PWM���������PWMռ�ձ�
-   uint32_t sampletime;     //��ѹ�ɼ�ʱ��
-   uint32_t timerPeriod;    //��ʱ����������
-__IO uint32_t gatherFreq;     //ʾ�����ɼ�Ƶ��
-   float vpp;               //���ֵ
-   float voltageValue[300]; //ADC�ɼ���ѹֵ
-};
-extern volatile struct Oscilloscope oscilloscope;
+/* 上游的应用逻辑已移到 Hardware/src/scope_ui.c（`#if SCOPE_LOCAL_UI`，默认关）。 */
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

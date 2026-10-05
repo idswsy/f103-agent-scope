@@ -6,11 +6,15 @@
  * License text:  http://license.coscl.org.cn/MulanPSL2
  * Provenance:    see NOTICE.md, section 2.
  *
- * Modified for this project: only this notice was added.
+ * Modified for this project: this notice, and one #include of scope_ui.h
+ * (TFT_ShowUI's prototype needs struct Oscilloscope).
  */
 
 #ifndef __TFT_H
 #define __TFT_H
+
+/* 本工程加的：`TFT_ShowUI` 的原型要用 `struct Oscilloscope`。 */
+#include "scope_ui.h"
 
 #include "main.h"
 

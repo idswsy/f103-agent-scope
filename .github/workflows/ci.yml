@@ -166,6 +166,36 @@ jobs:
           sudo apt-get update && sudo apt-get install -y gcc
           ./firmware/run_tests.sh
 
+      # 上面那条是「App/ 不许碰 HAL」的验收；这一条是它的**反面** ——
+      # Hardware/ 与 Core/ 本来就该碰 HAL，所以要带着 HAL 包含路径编一遍。
+      #
+      # 为什么必需：`Hardware/src/scope_ui.c`（上游那套本机显示+按键逻辑）
+      # 在 `SCOPE_LOCAL_UI=0` 时**整个文件被 `#if` 关掉、不参与 Keil 构建**，
+      # 所以它不会因为编译失败而被人发现 —— 会一直烂到 P4 要用的时候。
+      # 这里两种开关都编一遍，它就没有腐烂的机会。
+      #
+      # `-w` 关掉警告：宿主是 64 位而目标是 ARM，CMSIS 里
+      # `(uint32_t *)SCB->VTOR` 这类 `-Wint-to-pointer-cast` 是**必然**的，
+      # 与本工程无关。只看**退出码**，只有真错误才算失败。
+      - name: 硬件层语法检查（含默认关闭的本机 UI）
+        run: |
+          INC="-Ifirmware/Core/Inc -Ifirmware/Drivers/STM32F1xx_HAL_Driver/Inc"
+          INC="$INC -Ifirmware/Drivers/STM32F1xx_HAL_Driver/Inc/Legacy"
+          INC="$INC -Ifirmware/Drivers/CMSIS/Device/ST/STM32F1xx/Include"
+          INC="$INC -Ifirmware/Drivers/CMSIS/Include -Ifirmware/Hardware/inc"
+          DEF="-DUSE_HAL_DRIVER -DSTM32F103xB"
+          fail=0
+          for ui in 0 1; do
+            for f in firmware/Core/Src/*.c firmware/Hardware/src/*.c; do
+              if ! gcc -fsyntax-only -w -std=c11 $DEF -DSCOPE_LOCAL_UI=$ui $INC "$f"; then
+                echo "::error file=$f::语法检查失败（SCOPE_LOCAL_UI=$ui）"
+                fail=1
+              fi
+            done
+          done
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "✓ 硬件层在 SCOPE_LOCAL_UI=0 与 =1 两种开关下都编得过"
+
       # ⚠ 这个坑是**静默**的，必须由 CI 兜住。
       #
       # 在 Windows 上提交脚本时，git 默认不跟踪可执行位（core.fileMode=false），

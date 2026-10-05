@@ -21,7 +21,9 @@
 *.uvoptx.bak
 JLinkLog.txt
 JLinkSettings.ini
-MDK-ARM/*/
+# ⚠ 必须写成 `**/`：含斜杠的模式会**锚定到仓库根**，`MDK-ARM/*/` 匹配不到
+# `firmware/MDK-ARM/*/` —— 34 MB 的 Keil 构建产物会因此被提交。
+**/MDK-ARM/*/
 DebugConfig/
 RTE/
 Objects/

@@ -60,19 +60,18 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-#define ADC_VALUE_NUM 300U
+/* 上游的应用逻辑已移到 Hardware/src/scope_ui.c（`#if SCOPE_LOCAL_UI`，默认关）。 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-void Init_Oscilloscope(volatile struct Oscilloscope *value);
+/* 上游的应用逻辑已移到 Hardware/src/scope_ui.c（`#if SCOPE_LOCAL_UI`，默认关）。 */
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-volatile struct Oscilloscope oscilloscope={0};
-uint16_t adc_value[ADC_VALUE_NUM];
+/* 上游的应用逻辑已移到 Hardware/src/scope_ui.c（`#if SCOPE_LOCAL_UI`，默认关）。 */
 /* USER CODE END 0 */
 
 /**
@@ -82,11 +81,7 @@ uint16_t adc_value[ADC_VALUE_NUM];
 int main(void)
 {
   /* USER CODE BEGIN 1 */
-	uint16_t i = 0,Trigger_number = 0;
-	float tempValue = 0,max_data = 1.0f;
-	float gainFactor = 0,median = 0;
-	float voltage = 0,min = 0;
-	float calibration_vol = 0.15f;
+/* 上游的应用逻辑已移到 Hardware/src/scope_ui.c（`#if SCOPE_LOCAL_UI`，默认关）。 */
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -113,16 +108,7 @@ int main(void)
   MX_TIM2_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-	HAL_TIM_IC_Start_IT(&htim3,TIM_CHANNEL_1);
-	Init_Oscilloscope(&oscilloscope);
-	HAL_Delay(1000);
-	TFT_Init();
-	HAL_Delay(1000);	//��ʼ�����Σ�����ϵ�������⣬��������tft��λ��ͬ���������ڳ��γ�ʼ��ǰ�Ӵ���ʱ��Ч��
-	TFT_Init();
-	TFT_Fill(0,0,160,128,BLACK);
-	TFT_StaticUI();
-	
-	HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_value, ADC_VALUE_NUM);
+/* 上游的应用逻辑已移到 Hardware/src/scope_ui.c（`#if SCOPE_LOCAL_UI`，默认关）。 */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -132,98 +118,9 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-		Key_Sacnf(&oscilloscope);
-		Key_Handle(&oscilloscope);
-		
-		if(oscilloscope.showbit==1)
-    {
-			oscilloscope.showbit=0;
-			oscilloscope.vpp=0;
-			min = 9999;
-			for(i=0;i<300;i++)
-      {
-				tempValue = (adc_value[i]*3.3f)/4095.0f;
-				oscilloscope.voltageValue[i] = (5-(2.0f*tempValue));
-				if((oscilloscope.vpp) < oscilloscope.voltageValue[i])
-				{
-						oscilloscope.vpp = oscilloscope.voltageValue[i];
-				}
-				if(min > oscilloscope.voltageValue[i])
-				{
-					min = oscilloscope.voltageValue[i];
-				}
-				if(oscilloscope.vpp <= 0.3)
-				{
-						oscilloscope.gatherFreq=0;
-				}
-			}
-			oscilloscope.vpp = oscilloscope.vpp - calibration_vol;
-			HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_value, ADC_VALUE_NUM);
-			
-			for(i=0;i<200;i++)
-			{
-					if(oscilloscope.voltageValue[i] < max_data)
-					{
-							for(;i<200;i++)
-							{
-									if(oscilloscope.voltageValue[i] > max_data)
-									{
-											Trigger_number=i;
-											break;
-									}
-							}
-							break;
-					}
-			}
-			
-			if(oscilloscope.vpp > 0.3)
-			{
-				if(min < -0.3){
-					median = oscilloscope.vpp;
-				}else{
-					median = oscilloscope.vpp / 2.0f;
-				}
-				//�Ŵ�������Ҫȷ���Ŵ�֮������䣬�ҽ����ι̶���ʾ�ڣ�18.75~41.25�У���(41.25-18.75)/2=11.25f
-				gainFactor = 11.25f/median;
-				
-			}
-			
-			for(i=Trigger_number;i<Trigger_number+100;i++)
-			{
-					KEYD_SCAN(&oscilloscope);
-					if(oscilloscope.keyValue == KEYDPRESS)
-					{
-							oscilloscope.keyValue = NoPRESS;
-							do
-							{
-									KEYD_SCAN(&oscilloscope);
-									if(oscilloscope.keyValue == KEYDPRESS){
-											oscilloscope.keyValue = NoPRESS;
-											break;
-									}
-							}while(1);
-					}
-					if(min < -0.3){
-						voltage = oscilloscope.voltageValue[i] + oscilloscope.vpp;
-					}
-					else{
-						voltage = oscilloscope.voltageValue[i];
-					}									
-					if(voltage >= median)
-					{
-							voltage = 30 + (voltage - median)*gainFactor;
-					}
-					else
-					{
-							voltage = 30 - (median - voltage)*gainFactor;
-					}
-					drawCurve(80,voltage);
-			} 
-		}
-		
-		TFT_ShowUI(&oscilloscope); 
-  }
+/* 上游的应用逻辑已移到 Hardware/src/scope_ui.c（`#if SCOPE_LOCAL_UI`，默认关）。 */
   /* USER CODE END 3 */
+  }
 }
 
 /**
@@ -273,18 +170,7 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-void Init_Oscilloscope(volatile struct Oscilloscope *value)
-{
-    (*value).showbit    = 0;                         //�����ʾ��־λ
-    (*value).sampletime = ADC_SAMPLETIME_239CYCLES_5;//adc��������
-    (*value).keyValue   = 0;                         //�������ֵ
-    (*value).ouptputbit = 0;                         //�����־λ
-    (*value).gatherFreq = 0;                         //�ɼ�Ƶ��
-    (*value).outputFreq = 1000;                      //���Ƶ��
-    (*value).pwmOut     = 500;                       //PWM���������PWMռ�ձ�
-    (*value).timerPeriod= 1000;                      //PWM�����ʱ������
-    (*value).vpp        = 0.0f;                      //���ֵ
-}
+/* 上游的应用逻辑已移到 Hardware/src/scope_ui.c（`#if SCOPE_LOCAL_UI`，默认关）。 */
 /* USER CODE END 4 */
 
 /**

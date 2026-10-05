@@ -45,7 +45,7 @@ firmware/
 │   ├─ adc_dma.c          ⏳ 待写：TIM4_CC4 → ADC1 → DMA1Ch1 → 8KB 环
 │   ├─ link_uart.c        ⏳ 待写：USART1 + 外接 CH340
 │   ├─ hal_impl.c         ⏳ 待写：把 9 个函数指针填进 `hal_t`
-│   └─ scope_ui.c         ⏳ 待写：上游的本机显示/按键逻辑，`#if SCOPE_LOCAL_UI`（默认 0）
+│   └─ scope_ui.c         上游的本机显示/按键/测频逻辑，`#if SCOPE_LOCAL_UI`（默认 0）
 │
 ├─ Core/            CubeMX 生成的时钟树与外设初始化（Inc/ + Src/）
 ├─ Drivers/         ST HAL + CMSIS（厂商代码，许可见 `NOTICE.md` §6）
@@ -55,6 +55,26 @@ firmware/
 
 > ⚠ **`Hardware/` 的目录形状是 `inc/` + `src/`**（沿用上游），不是平铺的。
 > 上面列表里带 ⏳ 的是本阶段要写的。
+
+---
+
+## 本机 UI：`SCOPE_LOCAL_UI`（默认关）
+
+上游那套「本机采集 + TFT 显示 + 按键/编码器」的完整应用搬到了
+`Hardware/src/scope_ui.c`，**整份代码被 `#if SCOPE_LOCAL_UI` 包着，默认 0**。
+
+为什么不直接删：路线图规定 P1 先不碰屏幕（先用串口把数据链路打通），
+但 P4 要接屏幕时那套逻辑还能用。**留着又不开，就有腐烂的风险** ——
+所以 CI 会带 `-DSCOPE_LOCAL_UI=1` 把它也编一遍（见「固件分层纪律检查」那一 job）。
+
+打开它的办法：把 `Hardware/inc/scope_ui.h` 里的默认值改成 1，
+并把 `Hardware/src/scope_ui.c` 加进 Keil 工程的 `Application/Hardware` 组。
+**注意它和我们自己的采集链抢同一批外设**（ADC/TIM），二者不能同时生效。
+
+> ⚠ 上游那三个文件（`main.c` / `main.h` / `gpio.c`）里的**中文注释已经被
+> 不可逆地损坏了**（GBK 字节被当 UTF-8 读坏，文件里只剩 U+FFFD）。不是本仓库
+> 造成的 —— 上游原件里就是坏的。所以 `struct Oscilloscope` 的字段注释是
+> **按代码用法重建**的，不是原文。字段名与行为一个字没改。
 
 ---
 

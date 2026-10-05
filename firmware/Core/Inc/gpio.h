@@ -49,9 +49,6 @@ extern "C" {
 void MX_GPIO_Init(void);
 
 /* USER CODE BEGIN Prototypes */
-void Key_Sacnf(volatile struct Oscilloscope *value);
-void KEYD_SCAN(volatile struct Oscilloscope *value);
-void Key_Handle(volatile struct Oscilloscope *value);
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus
