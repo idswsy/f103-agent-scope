@@ -298,8 +298,21 @@ void MX_TIM4_Init(void)
    * 一个 ADCCLK（83 ns）还短，ADC 很可能根本看不见这个上升沿。取一半就是
    * 干净的 50% 方波，每周期恰好一个上升沿。
    *
-   * 输出仍**不使能**（`CC4E = 0`，`HAL_TIM_OC_ConfigChannel` 会清掉它），
-   * 所以不会去驱动 PB9（底板编码器按下键）。`OC4REF` 不需要引脚使能。 */
+   * ⚠ **输出必须使能（`CC4E = 1`）** —— 详见 `AdcDma_Start` 里那段。
+   * 这一条原来写的是「`OC4REF` 不需要引脚使能」，**是错的**：
+   * ADC 取的是**输出通道**的信号，`CC4E = 0` 时那条路是断的。
+   *
+   * `CC4E = 1` 会把 CH4 的输出送到 **PB9**，而 PB9 是底板 EC11 编码器的
+   * 按下键 —— **但这里没有冲突，也不需要做 TIM4 重映射**：
+   *
+   *   `gpio.c` 把 PB9 配成了 `GPIO_MODE_INPUT` + 上拉（见 `MX_GPIO_Init`）。
+   *   而 F1 的引脚**只有配成「复用推挽输出」时，外设的输出才会接到引脚上**；
+   *   配成输入时引脚的输出驱动器是断开的。**所以 `CC4E = 1` 只驱动定时器
+   *   内部那一路信号，PB9 依然是个高阻输入。**（实测吻合：`CCER = 0x1000`
+   *   时采集立刻就活了，而 PB9 一直是输入。）
+   *
+   * ⚠ `HAL_TIM_OC_ConfigChannel` 会**清掉** `CC4E`，所以使能那一步放在
+   *   `AdcDma_Start` 里、每次布防时做（见 `Hardware/src/adc_dma.c`）。 */
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
   sConfigOC.Pulse = 42;      /* = period/2（period = 84 @ 857142 Hz） */
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
@@ -308,5 +321,6 @@ void MX_TIM4_Init(void)
   {
     Error_Handler();
   }
+
   /* 这里**不启动**计数器 —— 由 AdcDma_Start() 负责。 */
 }
