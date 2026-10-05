@@ -412,33 +412,54 @@ typedef struct {
 
 /* ── 布局断言：任何编译器/平台都不能改变线上的字节布局 ────────── */
 
-_Static_assert(sizeof(proto_header_t)    == 10, "proto_header_t must be 10 bytes");
-_Static_assert(offsetof(proto_header_t, sync0) == 0, "sync0 offset");
-_Static_assert(offsetof(proto_header_t, ver)   == 2, "ver offset");
-_Static_assert(offsetof(proto_header_t, flags) == 3, "flags offset");
-_Static_assert(offsetof(proto_header_t, seq)   == 4, "seq offset");
-_Static_assert(offsetof(proto_header_t, cmd)   == 6, "cmd offset");
-_Static_assert(offsetof(proto_header_t, len)   == 8, "len offset");
+/* ── 编译期断言 ──────────────────────────────────────────────────
+ * `_Static_assert` 是 **C11** 的。Keil MDK5 用的 ARMCC5 **没有 C11 模式**
+ *（只有 C90/C99，工程里配的是 `uC99=1`），所以在固件工程里编不过。
+ *
+ * 下面给一个 C99 等价物：条件为假时数组大小为负，编译期立刻报错。
+ * 效果一样；只是错误信息里没有那句 msg（C99 没地方放它）。
+ *
+ * ⚠ 回归（2026-10-05）：把 `proto/` 加进 Keil 的包含路径后**一次炸出 30 个错**，
+ *   全在这个宏上。注意它影响的不只是新代码 —— `App/proto_task.c` 也包含本
+ *   头文件，所以整条「固件 ↔ 协议」的路都靠它。
+ *
+ * ⚠ 检查方法：**`gcc -std=c99` 抓不到**（gcc 把 `_Static_assert` 当扩展收下了）。
+ *   必须带 `-pedantic-errors` 才等价于 ARMCC5 的严格 C99。CI 里就是这么跑的。 */
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+#  define PROTO_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#else
+#  define PROTO_SA_CAT_(a, b) a##b
+#  define PROTO_SA_CAT(a, b)  PROTO_SA_CAT_(a, b)
+#  define PROTO_STATIC_ASSERT(cond, msg)        typedef char PROTO_SA_CAT(proto_sa_, __LINE__)[(cond) ? 1 : -1]
+#endif
 
-_Static_assert(sizeof(chunk_header_t)    == 12, "chunk_header_t must be 12 bytes");
-_Static_assert(sizeof(read_buffer_req_t) == 10, "read_buffer_req_t must be 10 bytes");
-_Static_assert(sizeof(set_trigger_req_t) == 11, "set_trigger_req_t must be 11 bytes");
-_Static_assert(sizeof(set_channel_req_t) ==  6, "set_channel_req_t must be 6 bytes");
-_Static_assert(sizeof(set_acq_req_t)     ==  6, "set_acq_req_t must be 6 bytes");
-_Static_assert(sizeof(reset_req_t)       ==  1, "reset_req_t must be 1 byte");
-_Static_assert(sizeof(measure_req_t)     == 14, "measure_req_t must be 14 bytes");
+PROTO_STATIC_ASSERT(sizeof(proto_header_t)    == 10, "proto_header_t must be 10 bytes");
+PROTO_STATIC_ASSERT(offsetof(proto_header_t, sync0) == 0, "sync0 offset");
+PROTO_STATIC_ASSERT(offsetof(proto_header_t, ver)   == 2, "ver offset");
+PROTO_STATIC_ASSERT(offsetof(proto_header_t, flags) == 3, "flags offset");
+PROTO_STATIC_ASSERT(offsetof(proto_header_t, seq)   == 4, "seq offset");
+PROTO_STATIC_ASSERT(offsetof(proto_header_t, cmd)   == 6, "cmd offset");
+PROTO_STATIC_ASSERT(offsetof(proto_header_t, len)   == 8, "len offset");
+
+PROTO_STATIC_ASSERT(sizeof(chunk_header_t)    == 12, "chunk_header_t must be 12 bytes");
+PROTO_STATIC_ASSERT(sizeof(read_buffer_req_t) == 10, "read_buffer_req_t must be 10 bytes");
+PROTO_STATIC_ASSERT(sizeof(set_trigger_req_t) == 11, "set_trigger_req_t must be 11 bytes");
+PROTO_STATIC_ASSERT(sizeof(set_channel_req_t) ==  6, "set_channel_req_t must be 6 bytes");
+PROTO_STATIC_ASSERT(sizeof(set_acq_req_t)     ==  6, "set_acq_req_t must be 6 bytes");
+PROTO_STATIC_ASSERT(sizeof(reset_req_t)       ==  1, "reset_req_t must be 1 byte");
+PROTO_STATIC_ASSERT(sizeof(measure_req_t)     == 14, "measure_req_t must be 14 bytes");
 
 /* 响应体布局：Rust 端 DeviceInfo::decode / measure 解析按这些偏移写死，
    任何改动都会让两端静默错位 —— 所以这里必须锁死 */
-_Static_assert(sizeof(info_resp_t)       == 45, "info_resp_t must be 45 bytes");
-_Static_assert(sizeof(status_resp_t)     == 33, "status_resp_t must be 33 bytes");
-_Static_assert(sizeof(measure_resp_t)    == 30, "measure_resp_t must be 30 bytes");
-_Static_assert(sizeof(event_trigger_t)   == 18, "event_trigger_t must be 18 bytes");
-_Static_assert(sizeof(event_overrun_t)   ==  6, "event_overrun_t must be 6 bytes");
-_Static_assert(sizeof(error_resp_t)      == 36, "error_resp_t must be 36 bytes");
-_Static_assert(offsetof(info_resp_t, uid)       ==  7, "uid offset");
-_Static_assert(offsetof(info_resp_t, rate_max_hz) == 29, "rate_max_hz offset");
-_Static_assert(offsetof(info_resp_t, caps)      == 41, "caps offset");
+PROTO_STATIC_ASSERT(sizeof(info_resp_t)       == 45, "info_resp_t must be 45 bytes");
+PROTO_STATIC_ASSERT(sizeof(status_resp_t)     == 33, "status_resp_t must be 33 bytes");
+PROTO_STATIC_ASSERT(sizeof(measure_resp_t)    == 30, "measure_resp_t must be 30 bytes");
+PROTO_STATIC_ASSERT(sizeof(event_trigger_t)   == 18, "event_trigger_t must be 18 bytes");
+PROTO_STATIC_ASSERT(sizeof(event_overrun_t)   ==  6, "event_overrun_t must be 6 bytes");
+PROTO_STATIC_ASSERT(sizeof(error_resp_t)      == 36, "error_resp_t must be 36 bytes");
+PROTO_STATIC_ASSERT(offsetof(info_resp_t, uid)       ==  7, "uid offset");
+PROTO_STATIC_ASSERT(offsetof(info_resp_t, rate_max_hz) == 29, "rate_max_hz offset");
+PROTO_STATIC_ASSERT(offsetof(info_resp_t, caps)      == 41, "caps offset");
 
 /* ══════════════════════════════════════════════════════════════════
  * API

@@ -1,6 +1,15 @@
 /* 见 scope_ui.h 的文件头说明（许可、来源、注释重建）。 */
 
-#if SCOPE_LOCAL_UI
+#if !SCOPE_LOCAL_UI
+
+/* `SCOPE_LOCAL_UI=0` 时本文件整个是空的 —— 而**严格 C99 不允许空翻译单元**
+ *（`ISO C forbids an empty translation unit`）。一个 typedef 就够占位：
+ * 它是声明、不产生任何代码、也不会报「定义了没用」。
+ *
+ * 回归：加上严格 C99 检查（模拟 Keil 的 ARMCC5）后立刻报这个错。 */
+typedef int scope_ui_disabled_;
+
+#else
 
 #include "scope_ui.h"
 #include "tft.h"

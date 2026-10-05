@@ -199,6 +199,37 @@ jobs:
           if [ "$fail" -ne 0 ]; then exit 1; fi
           echo "✓ 硬件层在 SCOPE_LOCAL_UI=0 与 =1 两种开关下都编得过"
 
+      # 上面那条用 gcc 默认的 C11 编；**这条用严格 C99 编**。
+      #
+      # 为什么必需：Keil MDK5 用的 **ARMCC5 没有 C11 模式**（只有 C90/C99），
+      # 而 `proto/protocol.h` 里有 C11 的 `_Static_assert`。
+      # 2026-10-05 把 `proto/` 加进 Keil 包含路径后，固件工程一次炸出 30 个错。
+      #
+      # ⚠ 两个坑，都是变异测试试出来的，别把它们改回去：
+      #
+      #   1. **`-std=c99` 单独用抓不到** —— gcc 把 `_Static_assert` 当扩展收下了。
+      #      必须带 `-pedantic-errors`，那才是 ARMCC5 的严格 C99。
+      #   2. **绝对不能加 `-w`** —— 它会把 `-pedantic-errors` 的诊断一起关掉，
+      #      于是这条检查永远通过、形同虚设。第一版就是这么写的。
+      #      宿主的 64 位警告改用针对性的 `-Wno-int-to-pointer-cast` 压。
+      - name: Keil 兼容性：严格 C99（ARMCC5 没有 C11）
+        run: |
+          INC="-Ifirmware/Core/Inc -Ifirmware/Drivers/STM32F1xx_HAL_Driver/Inc"
+          INC="$INC -Ifirmware/Drivers/STM32F1xx_HAL_Driver/Inc/Legacy"
+          INC="$INC -Ifirmware/Drivers/CMSIS/Device/ST/STM32F1xx/Include"
+          INC="$INC -Ifirmware/Drivers/CMSIS/Include -Ifirmware/Hardware/inc"
+          INC="$INC -Ifirmware/App -Iproto"
+          DEF="-DUSE_HAL_DRIVER -DSTM32F103xB"
+          fail=0
+          for f in proto/protocol.c firmware/App/*.c firmware/Hardware/src/*.c firmware/Core/Src/*.c; do
+            if ! gcc -fsyntax-only -std=c99 -pedantic-errors \n                 -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast $DEF $INC "$f"; then
+              echo "::error file=$f::不满足严格 C99（Keil 的 ARMCC5 只有 C90/C99）"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "✓ 全部源文件满足严格 C99 —— Keil 那边不会因为语言标准炸
+
       # ⚠ 这个坑是**静默**的，必须由 CI 兜住。
       #
       # 在 Windows 上提交脚本时，git 默认不跟踪可执行位（core.fileMode=false），
