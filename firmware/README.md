@@ -41,7 +41,7 @@ firmware/
 ├─ run_tests.sh     PC 上编译并运行测试 —— **CI 会跑它**
 │
 ├─ Hardware/        硬件抽象层 —— 唯一允许碰寄存器的地方
-│   ├─ adc_dma.c          TIM3_TRGO → ADC1/ADC2 → DMA1Ch1 → 8KB 环
+│   ├─ adc_dma.c          TIM4_CC4 → ADC1 → DMA1Ch1 → 8KB 环
 │   ├─ tim_capture.c      LM393 → PA6 输入捕获（13.9 ns 时间戳）
 │   ├─ link_uart.c        USART1（PA9/PA10）
 │   ├─ link_usbcdc.c      USB CDC（PA11/PA12）
@@ -99,25 +99,53 @@ grep -rn '#include.*\(stm32\|hal_\|gd32\|HAL\)' firmware/App/ && exit 1 || exit 
 
 ## 数据链路选型
 
-核心板**板载 USB 转串口**，Type-C 连接后即出现一个 COM 口。
+串口经**外接 CH340 模块**接到 USART1，**需要接四根线**（模块 TX→PA10、模块 RX→PA9、GND↔GND、VCC）。
 
 | 优先级 | 链路 | 引脚 | 需要的额外硬件 |
 |---|---|---|---|
-| **P1 期主力** | USART1（板载 USB 转串口） | PA9 / PA10 | 一根 Type-C 线 |
+| **P1 期主力** | USART1 + 外接 CH340 模块 | PA9 (TX) / PA10 (RX) | 四根线，TX/RX **交叉** |
 | **P2 起备选** | USB CDC | PA11 / PA12 | 自写 USB device 固件 |
 | 🚫 **禁用** | ~~USART2~~ | ~~PA2 / PA3~~ | 硬冲突：PA2 = PWM 输出，PA3 = 模拟输入 |
 
-> 板载 USB 转串口的芯片型号与最高波特率 `【待核实】`。
-> 若板载桥实测不稳，可在 PA9 / PA10 外接 USB-TTL 小板替代。
+> 核心板**到底有没有**板载桥、以及外接模块的最高可靠波特率，均 `【待核实】`（见 [ADR-013](../docs/06-decisions.md)）。
+> ⚠ **不要同时给核心板 Type-C 与底板 Type-C 供电** —— 双路供电倒灌，见 `docs/02-hardware.md` §9。
 
 **无论是哪条，上层都用同一个 `App/proto_task.c`** —— 链路差异只在 `Hardware/link_*.c` 里。
+
+---
+
+## 外设分配 ⭐（2026-10-05 拿到真实工程后校正）
+
+**这张表是唯一的依据。** 它曾经是错的，见下面的说明。
+
+| 用途 | 定时器 | 引脚 | 为什么是它 |
+|---|---|---|---|
+| **ADC 采样触发** | **TIM4**（PSC=0、ARR=83、**CCR4=83**） | 无 | ADC1 的触发源表里**没有 `T4_TRGO`**，只有 `T4_CC4`（见 `stm32f1xx_hal_adc_ex.h`）。CC 事件**不需要启用输出脚**也能触发 ADC |
+| **比较器输入捕获** | **TIM3_CH1** | PA6 | PA6 在 F103 上**只有 TIM3_CH1 一个定时器功能**；TIM3 部分重映射会把 CH1 挪到 PB4，那样 PA6 就没有定时器功能了 —— 所以 TIM3 被它占死，没有别的选择 |
+| 微秒时基（`tick_us`） | TIM1（PSC=71 → 1 MHz） | 无 | 需要一个**独立**定时器做 32 位 µs 计数（协议要求约 71.6 分钟回绕）。不启用其输出脚，与 USART1 的 PA9/PA10 不冲突 |
+| 简易函数发生器 | TIM2_CH3 | PA2 | 底板自带，上游保留；P1 不用 |
+
+### ⚠ 这份表曾经是错的 —— 记一笔
+
+全仓从 `README.md` 到 `docs/01` 共 9 处写着「**TIM3_TRGO → ADC**」。
+那条路**根本不通**：
+
+1. ADC1 的外部触发源只有 `T1_CC1 / T1_CC2 / T1_CC3 / T2_CC2 / T3_TRGO / T4_CC4 / EXT_IT11`
+   —— **没有 `T2_TRGO`，也没有 `T4_TRGO`**（凭印象写的话很容易记反）
+2. 而 PA6 的捕获把 TIM3 占死了（见上表）
+
+**这个错误从写下的那天起就存在，只是没有任何东西能证伪它** ——
+直到 2026-10-05 拿到真实的 CubeMX 工程与引脚分配。
+
+> 这是「必须上板/拿真工程才能发现」那类问题的第一例，也是先做硬件的直接回报。
+> **教训：引脚与定时器通道的分配，要以数据手册/厂商头文件为准，不能凭印象。**
 
 ---
 
 ## 采样架构（定时器触发 + DMA + 环缓冲）
 
 ```
-TIM3 (PSC=0, ARR=83, 72MHz) ──TRGO──► ADC1/ADC2 同步转换
+TIM4 (PSC=0, ARR=83, CCR4=83) ──CC4───► ADC1（P1 单 ADC）
                                           │
                                           ▼
                               DMA1 Channel 1（循环模式）

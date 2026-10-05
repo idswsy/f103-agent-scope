@@ -143,17 +143,17 @@ gcc -std=c11 -Iproto -Iproto/build -o /tmp/tv \
 
 ### ⚠️ 数据链路的引脚选择
 
-**核心板板载 USB 转串口**（STM32F103C8T6 最小系统板），插上 Type-C 即出 COM 口。
-详见 [`02-hardware.md`](02-hardware.md) §4 与 [ADR-011](06-decisions.md)。
+串口经**外接 CH340 模块**接到 USART1，**需要接四根线**。
+详见 [`02-hardware.md`](02-hardware.md) §4 与 [ADR-013](06-decisions.md)。
 
 ```
-主力：USART1 + 板载 USB 转串口 → PA9(TX) / PA10(RX)   ← 插上即用
+主力：USART1 + 外接 CH340 模块 → PA9(TX) / PA10(RX)   ← 四根线，交叉接
 备选：USB CDC              → PA11 / PA12          ← 带宽高，但自写 USB device 固件
 🚫 禁止：USART2             → PA2 / PA3            ← 硬冲突（PWM 输出 + 模拟输入）
 ```
 
 > 2026-10-04 换板前，核心板没有串口桥，当时的方案是「外接 USB-TTL」。
-> 见 [ADR-009](06-decisions.md) 与取代它的 [ADR-011](06-decisions.md)。
+> 见 [ADR-009](06-decisions.md) 与取代它的 [ADR-012](06-decisions.md)。
 
 ---
 

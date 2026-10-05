@@ -50,7 +50,7 @@ firmware/
 │   ├─ i2c_decode       数字通路 I2C 解码器
 │   └─ ui               屏幕 / 编码器 / 按键
 ├─ Hardware/       硬件抽象（唯一碰寄存器的地方）
-│   ├─ adc_dma          TIM3_TRGO → 双 ADC → DMA1Ch1 → 8KB 环
+│   ├─ adc_dma          TIM4_CC4 → ADC1 → DMA1Ch1 → 8KB 环
 │   ├─ tim_capture      LM393 → TIM 输入捕获（13.9 ns 时间戳）
 │   ├─ uart / usb_cdc   链路
 │   ├─ tft_st7735       1.8 寸屏
@@ -107,11 +107,11 @@ I2C 解码要求：**SCL 与 SDA 必须同时刻采样**，且每比特至少 2 
 
 ```
 主机                                    设备
- │  SET_SAMPLE_RATE(857143)               │  量化到 TIM3 ARR=83 → 857142 Hz
+ │  SET_SAMPLE_RATE(857143)               │  量化到 TIM4 ARR=83 → 857142 Hz
  │ ◄──── ACTUAL(857142)  ← 必须回显实际值  │
  │  SET_TRIGGER(mode=normal, edge=↑, lvl) │
  │  ARM ─────────────────────────────────►│  状态 IDLE → ARMED
- │                                        │  TIM3_TRGO → ADC → DMA 循环写入 8KB 环
+ │                                        │  TIM4_CC4 → ADC → DMA 循环写入 8KB 环
  │                                        │  HT/TC 中断每 2048 点发布一个半区
  │                                        │  主循环在已发布半区上搜索触发点（迟滞）
  │                                        │  找到 T → 继续采 T+post+512 余量 → 停 DMA

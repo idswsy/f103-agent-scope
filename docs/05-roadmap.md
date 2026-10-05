@@ -35,7 +35,7 @@ cd host && cargo test       # Rust 端全部测试
 
 | 交付物 | 位置 | 验收标准 |
 |---|---|---|
-| 时钟树 + ADC/DMA 采集 | `firmware/Hardware/adc_dma.c` | TIM3_TRGO → ADC1 → DMA1Ch1，857.143 kSPS 实测（用 `actual_hz` 校验） |
+| 时钟树 + ADC/DMA 采集 | `firmware/Hardware/adc_dma.c` | TIM4_CC4 → ADC1 → DMA1Ch1，857.143 kSPS 实测（用 `actual_hz` 校验） |
 | 串口链路 + 帧解析 | `firmware/App/proto_task.c` | `PING` / `ECHO` / `GET_INFO` 在真机上通过 |
 | 主机传输层 | `host/crates/transport-serial/` | 能枚举串口、连接、超时重试 |
 | CLI | `host/crates/cli/` | `scope-cli capture -o wave.csv` 能出图 |
