@@ -43,22 +43,35 @@
 ```
 firmware/
 ├─ App/            应用层（与硬件无关的逻辑，可 PC 上单元测试）
+│   ├─ hal.h            硬件接口 —— 纯函数指针，无寄存器
 │   ├─ proto_task       帧解析状态机 → 命令分发 → 响应编码
-│   ├─ acq              采集状态机（IDLE/ARMED/DONE/STREAMING/FAULT）
+│   ├─ acq              采集状态机（IDLE / ARMED / DONE）
 │   ├─ trigger          触发搜索（迟滞电平比较）
-│   ├─ measure          定点测量（Vpp/频率/占空比/RMS）
-│   ├─ i2c_decode       数字通路 I2C 解码器
-│   └─ ui               屏幕 / 编码器 / 按键
+│   └─ waveform         采集窗 → 屏幕一帧（上下沿 / Vpp / 频率）
 ├─ Hardware/       硬件抽象（唯一碰寄存器的地方）
-│   ├─ adc_dma          TIM4_CC4 → ADC1 → DMA1Ch1 → 8KB 环
-│   ├─ tim_capture      LM393 → TIM 输入捕获（13.9 ns 时间戳）
-│   ├─ uart / usb_cdc   链路
-│   ├─ tft_st7735       1.8 寸屏
-│   └─ encoder          条 EC11
-└─ main.c
+│   ├─ hal_impl         装配层：把硬件实现填进 `hal_t`
+│   ├─ adc_dma          TIM4_CC4 → ADC1 → DMA1Ch1 → 8 KB 环
+│   ├─ link_uart        USART1 收发环
+│   ├─ display          TFT 渲染 + 分片刷新调度（见 ADR-014）
+│   ├─ tft / tft_init   上游的 ST7735S 驱动（原样并入，见 NOTICE.md §2）
+│   └─ scope_ui         上游那套本机 UI 的存档，`#if SCOPE_LOCAL_UI` 默认关
+├─ Core/           CubeMX 生成：时钟、GPIO、外设初始化、中断向量
+├─ Drivers/        ST HAL + CMSIS
+├─ MDK-ARM/        Keil 工程（含 `.map`，构建后最值得读的文件）
+├─ tests/          App 层测试（不需要板子）
+└─ run_tests.sh
 ```
 
-**规则**：`App/` 不许 `#include` 任何 HAL / 寄存器头文件。这样 `measure.c`、`i2c_decode.c`、`proto_task.c` 可以在 PC 上用 gcc 加 mock 编译测试 —— 这是本项目在没有硬件时也能推进的关键。
+**规则**：`App/` 不许 `#include` 任何 HAL / 寄存器头文件（ADR-008）。
+这样 `trigger.c`、`acq.c`、`proto_task.c`、`waveform.c` 可以在 PC 上用 gcc
+加 mock 编译测试 —— 这是本项目在没有硬件时也能推进的关键。
+
+`firmware/run_tests.sh` 覆盖 `App/`；`Hardware/` 与 `Core/` 由 CI 的
+「硬件层语法检查」按 `-DSCOPE_LOCAL_UI=0` 与 `=1` 各编一遍兜住语法。
+
+> **还没写的**：`App/measure.c`（定点测量）与 `App/i2c_decode.c`。
+> 前者不阻塞任何主机功能 —— 主机侧的测量走 `core::measure()` 本地算，
+> 从不调用设备的 `CMD_MEASURE`；后者卡在 ADR-010（本板只有一路比较器）。
 
 ---
 
