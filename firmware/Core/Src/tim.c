@@ -276,12 +276,32 @@ void MX_TIM4_Init(void)
     Error_Handler();
   }
 
-  /* FROZEN：只产生比较事件，不改变输出电平（反正输出也没使能）。
-   * Pulse = ARR → 每个周期比较一次。 */
-  /* F1 里「冻结」这个模式叫 `TIM_OCMODE_TIMING`（见 stm32f1xx_hal_tim.h，
-   * 注释就写着 Frozen）。`TIM_OCMODE_FROZEN` 是别的系列的写法。 */
-  sConfigOC.OCMode = TIM_OCMODE_TIMING;
-  sConfigOC.Pulse = 83;
+  /* ⚠ **必须是 PWM1，不能是 FROZEN（`TIM_OCMODE_TIMING`）。**
+   *
+   * ADC 的外部触发要的是 `OC4REF` 这个信号，它得经过「输出模式控制器」——
+   * 而 `OC4M = 000`（Frozen）时那条路不产生任何跳变。
+   *
+   * **最坑的地方：`CC4IF` 标志照样会置位**（它直接来自比较器，不走输出模式
+   * 控制器）。所以看标志位完全看不出问题 —— TIM4 的 SR 里 CC4IF 好好地置着、
+   * CNT 也在跑，ADC 却一次都不转换。
+   *
+   * 2026-10-05 真机实测：`OC4M = 000` 时 `ADC1->SR` 恒为 0（一次常规转换都
+   * 没启动过）、DMA 的 `CNDTR` 停在 4096 不动。把 `OC4M` 改成 `011`（Toggle）
+   * 之后立刻开始传 —— 机制确认。最终取 **PWM1**，因为：
+   *
+   *   - Toggle 每**两**个周期才有一个上升沿 → 采样率减半
+   *   - 而 F1 的 ADC 触发极性**固定在上升沿**（`ExternalTrigConvEdge` 是
+   *     F4/ L4 才有的字段），没有可配的余地
+   *
+   * **`Pulse` 取半个周期而不是 ARR**：PWM1 下 `OC4REF` 在 `CNT < CCR4` 时为高，
+   * 取 `CCR4 = ARR` 会得到「高 83 tick、低 1 tick」—— 那 13.9 ns 的低电平比
+   * 一个 ADCCLK（83 ns）还短，ADC 很可能根本看不见这个上升沿。取一半就是
+   * 干净的 50% 方波，每周期恰好一个上升沿。
+   *
+   * 输出仍**不使能**（`CC4E = 0`，`HAL_TIM_OC_ConfigChannel` 会清掉它），
+   * 所以不会去驱动 PB9（底板编码器按下键）。`OC4REF` 不需要引脚使能。 */
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 42;      /* = period/2（period = 84 @ 857142 Hz） */
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   if (HAL_TIM_OC_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)

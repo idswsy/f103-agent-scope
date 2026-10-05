@@ -119,9 +119,12 @@ void AdcDma_Start(uint32_t rate_hz)
 
     /* 采样周期 = ARR + 1 个 72 MHz tick */
     __HAL_TIM_SET_AUTORELOAD(&htim4, period - 1u);
-    /* CCR4 = ARR → 每周期产生一次比较事件。
+    /* CCR4 = **半个周期**。PWM1 下 `OC4REF` 在 CNT < CCR4 时为高，每周期给出
+     * 一个上升沿去触发 ADC（机制详见 tim.c 的 `MX_TIM4_Init` 里那段说明）。
+     * ⚠ **不能取 ARR** —— 那样低电平只剩 1 个 tick（13.9 ns），比一个 ADCCLK
+     *   （83 ns）还短，ADC 看不见那个上升沿。
      * **输出没使能**（CC4E=0），所以不会驱动 PB9（底板编码器按下键）。 */
-    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, period - 1u);
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, period / 2u);
     __HAL_TIM_SET_COUNTER(&htim4, 0u);
     __HAL_TIM_CLEAR_FLAG(&htim4, TIM_FLAG_UPDATE | TIM_FLAG_CC4);
 
