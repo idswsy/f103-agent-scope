@@ -166,6 +166,50 @@ jobs:
           sudo apt-get update && sudo apt-get install -y gcc
           ./firmware/run_tests.sh
 
+      # ⚠ 真机的栈只有 1024 B（`MDK-ARM/startup_stm32f103xb.s` 的
+      # `Stack_Size EQU 0x400`），而上面那条 `run_tests.sh` 跑在 PC 上，
+      # 宿主的栈有好几 MB —— **这一类的栈越界只有真机才炸**，而且不报错：
+      # 栈往下依次是堆（512 B）、C 库的 libspace、然后是 ZI 段，
+      # 越界会**静默改写**它们，症状是别的变量莫名其妙变值。
+      #
+      # 2026-10-05 的实例：`proto_task.c` 的 `cmd_read_buffer` 里
+      # `uint8_t buf[12 + 1024*2]` 是 **2060 B** 的局部数组，越界 1036 B。
+      # 改 `static` 后 App/ 最大的栈帧从 2192 B 降到 240 B。
+      #
+      # 只量 `firmware/App/`：它是纯 C（ADR-008 保证宿主编得过）；
+      # `Hardware/src/adc_dma.c` 有 ARM 内联汇编，x86 的 gcc 编不了。
+      - name: App/ 单帧栈预算（宿主栈抓不到的越界）
+        run: |
+          BUDGET=512   # 真机栈 1024 B 的一半：任何单帧都得给调用者留位
+          rm -rf /tmp/su && mkdir -p /tmp/su
+          n=0
+          for f in firmware/App/*.c; do
+            # 编译失败就没有 .su 文件。**必须显式判失败**，否则这条检查
+            # 会因为「量不到东西」而静默变绿 —— 本项目已经栽过两次。
+            # （这里的 `-w` 只是不想看警告；错误仍然会让 gcc 非零退出。）
+            gcc -fstack-usage -c -O1 -w -Ifirmware/App -Iproto "$f" \
+                -o "/tmp/su/$(basename "$f" .c).o" \
+              || { echo "::error file=$f::量不到栈帧（-fstack-usage 编译失败）"; exit 1; }
+            n=$((n + 1))
+          done
+          got=$(ls /tmp/su/*.su 2>/dev/null | wc -l)
+          if [ "$got" -ne "$n" ]; then
+            echo "::error::.su 文件 $got 个，源文件 $n 个 —— 测量不完整"
+            exit 1
+          fi
+          # 失败必须**显式**判：`run:` 块的默认 shell 带 `-e`，
+          # 但依赖它是隐式的 —— 本地不带 `-e` 复现时行为不同（踩过）。
+          if cat /tmp/su/*.su | awk -F'\t' -v b="$BUDGET" '
+               $2 > b { bad = 1; printf "::error file=%s::栈帧 %s B，超过 %d B 预算\n", $1, $2, b }
+               { if ($2 > max) { max = $2; who = $1 } }
+               END { printf "  最大栈帧 %d B @ %s（预算 %d B）\n", max, who, b;
+                     if (bad) exit 1 }'; then
+            echo "✓ App/ 没有超过 ${BUDGET} B 的单帧"
+          else
+            echo "::error::App/ 有单帧超出 ${BUDGET} B —— 真机栈只有 1024 B，且溢出是静默的"
+            exit 1
+          fi
+
       # 上面那条是「App/ 不许碰 HAL」的验收；这一条是它的**反面** ——
       # Hardware/ 与 Core/ 本来就该碰 HAL，所以要带着 HAL 包含路径编一遍。
       #
@@ -220,15 +264,21 @@ jobs:
           INC="$INC -Ifirmware/Drivers/CMSIS/Include -Ifirmware/Hardware/inc"
           INC="$INC -Ifirmware/App -Iproto"
           DEF="-DUSE_HAL_DRIVER -DSTM32F103xB"
+          # ⚠ `-Werror=comment`：块注释里再出现注释起始符时，ARMCC5 会对
+          #   **每一个**包含该头的 .c 各报一次 `#9-D: nested comment is not allowed`。
+          #   2026-10-05 的 Keil Rebuild 报了 4 条，全部来自 usart.h 同一行里
+          #   连写的路径分隔符。**上面那条 C11 检查带 `-w`，抓不到这一类。**
+          WARN="-Werror=comment -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast"
           fail=0
           for f in proto/protocol.c firmware/App/*.c firmware/Hardware/src/*.c firmware/Core/Src/*.c; do
-            if ! gcc -fsyntax-only -std=c99 -pedantic-errors \n                 -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast $DEF $INC "$f"; then
+            if ! gcc -fsyntax-only -std=c99 -pedantic-errors $WARN $DEF $INC "$f"; then
               echo "::error file=$f::不满足严格 C99（Keil 的 ARMCC5 只有 C90/C99）"
               fail=1
             fi
           done
           if [ "$fail" -ne 0 ]; then exit 1; fi
-          echo "✓ 全部源文件满足严格 C99 —— Keil 那边不会因为语言标准炸
+          echo "✓ 全部源文件满足严格 C99 —— Keil 那边不会因为语言标准炸"
+          echo "✓ 块注释内没有嵌套的注释起始符（ARMCC5 的 #9-D）"
 
       # ⚠ 这个坑是**静默**的，必须由 CI 兜住。
       #

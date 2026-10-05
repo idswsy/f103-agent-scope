@@ -331,8 +331,15 @@ static void cmd_read_buffer(proto_task_t *pt, uint16_t seq, const proto_frame_t 
     }
 
     /* 分片头 + 样点，一次编码。**分片头算在 payload 之内** ——
-     * 这一点很容易算漏（见 protocol.h 的 PROTO_CHUNK_SAMPLES_MAX 注释）。 */
-    uint8_t buf[PROTO_CHUNK_HEADER_LEN + PROTO_CHUNK_SAMPLES_MAX * 2u];
+     * 这一点很容易算漏（见 protocol.h 的 PROTO_CHUNK_SAMPLES_MAX 注释）。
+     *
+     * ⚠ **必须保持 static**。这块 2060 B 若放在栈上，就是 `Stack_Size`
+     *   （`startup_stm32f103xb.s`，0x400 = 1024 B）的两倍。栈向下生长，
+     *   越界的那 1036 B 会吃掉整个堆（512 B）与 C 库的 libspace，
+     *   再改写 `protocol.o` 的静态缓冲 —— 全程**没有任何征兆**。
+     *   改成 `static` 之后，`App/` 里最大的栈帧是 `proto_task_poll` 的 240 B。
+     * ⚠ `firmware/run_tests.sh` 看不见这一类：宿主的栈有好几 MB。 */
+    static uint8_t buf[PROTO_CHUNK_HEADER_LEN + PROTO_CHUNK_SAMPLES_MAX * 2u];
     chunk_header_t h = {.capture_id = req.capture_id,
                         .start_sample = start,
                         .count = (uint16_t)n,
