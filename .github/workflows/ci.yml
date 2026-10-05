@@ -243,6 +243,65 @@ jobs:
           if [ "$fail" -ne 0 ]; then exit 1; fi
           echo "✓ 硬件层在 SCOPE_LOCAL_UI=0 与 =1 两种开关下都编得过"
 
+      # ⚠ 上面那条是 `-fsyntax-only`，**不做链接** —— 它抓不到「两个 .c 定义了
+      #   同一个 HAL 回调」这类跨文件重定义。而这一类在本仓是真会发生的：
+      #   `Hardware/src/scope_ui.c`（上游本机 UI 的存档）与
+      #   `Hardware/src/adc_dma.c` 都定义 `HAL_ADC_ConvCpltCallback`。
+      #
+      # 后者才是真正要防的：`scope_ui.c` 那个回调会 `HAL_ADC_Stop_DMA`，
+      # 一旦被链接进构建，采集链会被它**静默掐死**。ADR-014 决定它是存档、
+      # 永不启用，所以这里直接盯住「有没有人把它加进 Keil 工程」——
+      # 比泛泛地 grep 重名精确得多。
+      - name: HAL 回调归属（scope_ui.c 不得进构建；已构建文件之间不得重名）
+        run: |
+          if grep -q 'scope_ui\.c' firmware/MDK-ARM/*.uvprojx; then
+            echo "::error file=firmware/Hardware/src/scope_ui.c::scope_ui.c 被加进了 Keil 工程。"
+            echo "它重定义了 HAL_ADC_ConvCpltCallback（与 Hardware/src/adc_dma.c 冲突），"
+            echo "而且那个回调会调 HAL_ADC_Stop_DMA —— 采集链会被它静默掐死。见 ADR-014。"
+            exit 1
+          fi
+          echo "✓ scope_ui.c 仍是存档状态，没有进构建"
+          # 会进构建的源文件里，同一个 HAL 回调只能有一个定义。
+          build_src=$(ls firmware/Hardware/src/*.c firmware/Core/Src/*.c | grep -v 'scope_ui\.c')
+          dup=$(grep -hoE 'void[[:space:]]+HAL_[A-Za-z0-9_]+Callback' $build_src \
+                | awk '{print $2}' | sort | uniq -d)
+          if [ -n "$dup" ]; then
+            echo "::error::这些 HAL 回调被多于一个文件定义：$dup"
+            echo "需要多人响应同一个回调时，由 owner 转发（见 firmware/README.md 的归属表）。"
+            exit 1
+          fi
+          echo "✓ 已构建文件之间没有重复的 HAL 回调定义"
+
+      # ⚠ 2026-10-06 真机踩到：**`local_gen.c` 写好了、测试也过了，却没被加进
+      #   Keil 工程** —— 症状是链接期一串 `Undefined symbol LocalGen_*`。
+      #
+      # 根因是**竞态**：Keil 把工程常驻内存，编辑 `.uvprojx` 之后只要 Keil 一保存
+      # （Rebuild、翻选项、关窗口都可能触发），外部改动就被整个冲掉。
+      # 前六轮加的 6 个文件都进去了，唯独漏掉最后一个 —— 因为那次编辑发生在
+      # Keil 载入工程**之后**。
+      #
+      # 所以这条**不能只靠"记得加"**。
+      - name: 每个该进构建的源文件都在 Keil 工程里
+        run: |
+          fail=0
+          for f in firmware/App/*.c firmware/Hardware/src/*.c; do
+            b=$(basename "$f")
+            [ "$b" = "scope_ui.c" ] && continue   # 上游存档，故意不编（ADR-014）
+            if ! grep -q ">$b<" firmware/MDK-ARM/*.uvprojx; then
+              echo "::error file=$f::$b 没有被加进 Keil 工程。"
+              echo "后果是链接期一串 Undefined symbol，而不是编译错误 —— 很容易以为是代码写错。"
+              echo "在 Keil 里右键 Application/App 或 Application/Hardware 组 → Add Existing Files。"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "✓ 所有该进构建的源文件都在 Keil 工程里"
+
+      # ⚠ 「用到 NULL 就必须显式 include」这一类**不需要单独的 lint** ——
+      #   上面那条严格 C99 检查加了 `-ffreestanding` 之后已经把它整个覆盖了，
+      #   而且覆盖的是一整类「宿主头文件比 ARMCC5 宽松」的差异，
+      #   不止 NULL 一个标识符。**别在这里再加一条更弱的重复检查。**
+
       # 上面那条用 gcc 默认的 C11 编；**这条用严格 C99 编**。
       #
       # 为什么必需：Keil MDK5 用的 **ARMCC5 没有 C11 模式**（只有 C90/C99），
@@ -269,9 +328,23 @@ jobs:
           #   2026-10-05 的 Keil Rebuild 报了 4 条，全部来自 usart.h 同一行里
           #   连写的路径分隔符。**上面那条 C11 检查带 `-w`，抓不到这一类。**
           WARN="-Werror=comment -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast"
+          # ⚠ **`-ffreestanding` 不是修辞，它挡的是真发生过的一类错。**
+          #
+          # 2026-10-05 真机编译：ARMCC5 报 `#20: identifier "NULL" is undefined`
+          # 四处，而本机 gcc 与 CI 的 Ubuntu runner **都放行** ——
+          # `__STDC_HOSTED__=1` 时 gcc 的 `<stdint.h>` 会 `#include_next` 宿主那份，
+          # 而宿主那份传递引入了 `<stddef.h>`；ARMCC5 的 `<stdint.h>` 不会。
+          #
+          # `-ffreestanding` 把 `__STDC_HOSTED__` 置 0，gcc 改用自带的
+          # `stdint-gcc.h`（不引入 stddef）—— 于是**复现 ARMCC5 的严格性**。
+          # 实测：同一个缺 `#include <stddef.h>` 的文件，不加这个开关通过、
+          # 加了就报错（gcc 还会直接提示该 include 哪个头）。
+          #
+          # 这是「宿主的头文件比目标宽松」这一类，与栈大小、DMA 行为同族：
+          # **在主机上怎么编都看不出来**。
           fail=0
           for f in proto/protocol.c firmware/App/*.c firmware/Hardware/src/*.c firmware/Core/Src/*.c; do
-            if ! gcc -fsyntax-only -std=c99 -pedantic-errors $WARN $DEF $INC "$f"; then
+            if ! gcc -fsyntax-only -std=c99 -pedantic-errors -ffreestanding $WARN $DEF $INC "$f"; then
               echo "::error file=$f::不满足严格 C99（Keil 的 ARMCC5 只有 C90/C99）"
               fail=1
             fi
@@ -279,6 +352,42 @@ jobs:
           if [ "$fail" -ne 0 ]; then exit 1; fi
           echo "✓ 全部源文件满足严格 C99 —— Keil 那边不会因为语言标准炸"
           echo "✓ 块注释内没有嵌套的注释起始符（ARMCC5 的 #9-D）"
+
+      # ⚠ 2026-10-06 真机 Keil 报了
+      #   `#177-D: function "fmt_u32" was declared but never referenced`
+      #   —— 重写 `display.c` 的格式化函数时留下了死代码，而**在那之前一直是
+      #   0 warning**，所以没有任何一步检查抓到它。
+      #
+      # ⚠ **抓它必须用 `-S`，不能用 `-fsyntax-only`。** 这类警告在**代码生成**
+      #   阶段才发；实测同一份文件：`-fsyntax-only` 通过、`-c` 报错。
+      #
+      # 为什么是 `-S` 而不是更直觉的 `-c`：`Hardware/src/adc_dma.c` 与
+      # `Core/Src/main.c` 里有 **ARM 内联汇编**（`cpsid i` / `mrs primask`），
+      # x86 的汇编器不认，`-c` 会在这里断掉 —— 于是那两个文件**静默地没被检查**。
+      # `-S` 只产出汇编、不调用汇编器，刚好停在代码生成之后。
+      - name: 死代码：未引用的静态函数 / 变量（ARMCC5 会报 #177-D）
+        run: |
+          INC="-Ifirmware/Core/Inc -Ifirmware/Drivers/STM32F1xx_HAL_Driver/Inc"
+          INC="$INC -Ifirmware/Drivers/STM32F1xx_HAL_Driver/Inc/Legacy"
+          INC="$INC -Ifirmware/Drivers/CMSIS/Device/ST/STM32F1xx/Include"
+          INC="$INC -Ifirmware/Drivers/CMSIS/Include -Ifirmware/Hardware/inc"
+          INC="$INC -Ifirmware/App -Iproto"
+          DEF="-DUSE_HAL_DRIVER -DSTM32F103xB"
+          W="-Werror=unused-function -Werror=unused-variable -Werror=unused-but-set-variable"
+          fail=0
+          for ui in 0 1; do
+            for f in proto/protocol.c firmware/App/*.c firmware/Hardware/src/*.c firmware/Core/Src/*.c; do
+              if ! gcc -S -O1 -std=c99 $W $DEF -DSCOPE_LOCAL_UI=$ui \
+                     -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast \
+                     $INC "$f" -o /dev/null 2>/tmp/deadcode.txt; then
+                grep -v 'core_cm3\.h\|CMSIS' /tmp/deadcode.txt | head -5
+                echo "::error file=$f::有未引用的静态函数/变量 —— Keil 会报 #177-D，而目标一直是 0 warning"
+                fail=1
+              fi
+            done
+          done
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "✓ 没有未引用的静态函数 / 变量"
 
       # ⚠ 这个坑是**静默**的，必须由 CI 兜住。
       #
