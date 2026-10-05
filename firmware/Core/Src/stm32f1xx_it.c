@@ -23,6 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "adc_dma.h"
+#include "usart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -265,6 +266,17 @@ void ADC1_2_IRQHandler(void)
  * 溢出频率只有 15.26 Hz，负担可忽略。
  * ⚠ 这里**不走 `HAL_TIM_IRQHandler()`**：TIM1 只是被借来数 µs 的，
  *   没有用 HAL 的定时器对象（htim1 不存在），走 HAL 反而会去碰空指针。 */
+void USART1_IRQHandler(void)
+{
+  /* USER CODE BEGIN USART1_IRQn 0 */
+
+  /* USER CODE END USART1_IRQn 0 */
+  HAL_UART_IRQHandler(&huart1);
+  /* USER CODE BEGIN USART1_IRQn 1 */
+
+  /* USER CODE END USART1_IRQn 1 */
+}
+
 void TIM1_UP_IRQHandler(void)
 {
   /* USER CODE BEGIN TIM1_UP_IRQn 0 */

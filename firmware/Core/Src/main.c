@@ -38,6 +38,11 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "hal.h"
+#include "acq.h"
+#include "proto_task.h"
+#include "hal_impl.h"
+#include "usart.h"
 #include "tft.h"
 #include "tft_init.h"
 /* USER CODE END Includes */
@@ -60,6 +65,10 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+/* 应用层的两个状态机。放在文件作用域是因为它们要活到整个程序生命周期；
+ * 初始化在 `main()` 的 USER CODE 2 段（见那里）。 */
+static acq_t        g_acq;
+static proto_task_t g_pt;
 /* 上游的应用逻辑已移到 Hardware/src/scope_ui.c（`#if SCOPE_LOCAL_UI`，默认关）。 */
 /* USER CODE END PV */
 
@@ -107,9 +116,18 @@ int main(void)
   MX_SPI1_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
-  MX_TIM4_Init();   /* ADC 采样触发，必须早于 MX_ADC1_Init */
+  MX_TIM4_Init();   /* ADC 采样触发。与 MX_ADC1_Init 的先后无所谓 ——
+                     * 这里只是写寄存器；ADC 真正开始跑要等 HAL_ADC_Start_DMA。 */
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-/* 上游的应用逻辑已移到 Hardware/src/scope_ui.c（`#if SCOPE_LOCAL_UI`，默认关）。 */
+  /* 应用层在这里接上。App/ 是硬件无关的（ADR-008），硬件能力由
+   * `HalImpl_Get()` 交进去 —— 装配点只有一处，见 Hardware/hal_impl.c。 */
+  {
+    const hal_t *hal = HalImpl_Get();
+    HalImpl_Init();                    /* µs 时基、收发环、点起第一次接收中断 */
+    acq_init(&g_acq, hal);
+    proto_task_init(&g_pt, hal, &g_acq);
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -119,7 +137,23 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-/* 上游的应用逻辑已移到 Hardware/src/scope_ui.c（`#if SCOPE_LOCAL_UI`，默认关）。 */
+    /* 先收命令：`proto_task_poll` 自己会把「能收多少收多少、能处理多少处理多少」
+     * 做完，且**绝不阻塞**（见 App/proto_task.h）。 */
+    proto_task_poll(&g_pt);
+
+    /* 再推进采集状态机。`acq_poll` 一轮只回一个事件，所以这里排空它。
+     *
+     * ⚠ 循环**有上限**：万一 `acq_poll` 出于任何原因不返回 NONE，
+     *   无上限的排空会把上面那句 `proto_task_poll` 永远饿死 ——
+     *   表现是串口突然哑掉，而且没有任何迹象。上限 4 只是兜底，
+     *   正常路径一轮最多一两个事件。 */
+    for (int guard = 0; guard < 4; guard++) {
+        acq_out_t out;
+        if (acq_poll(&g_acq, &out) == ACQ_EV_NONE) {
+            break;
+        }
+        proto_task_emit(&g_pt, &out);
+    }
   /* USER CODE END 3 */
   }
 }

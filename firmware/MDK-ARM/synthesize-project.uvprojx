@@ -435,6 +435,11 @@
               <FileType>1</FileType>
               <FilePath>../Core/Src/stm32f1xx_hal_msp.c</FilePath>
             </File>
+            <File>
+              <FileName>usart.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/usart.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -454,6 +459,46 @@
               <FileName>adc_dma.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Hardware\src\adc_dma.c</FilePath>
+            </File>
+            <File>
+              <FileName>link_uart.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Hardware\src\link_uart.c</FilePath>
+            </File>
+            <File>
+              <FileName>hal_impl.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Hardware\src\hal_impl.c</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>Application/App</GroupName>
+          <Files>
+            <File>
+              <FileName>trigger.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/trigger.c</FilePath>
+            </File>
+            <File>
+              <FileName>acq.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/acq.c</FilePath>
+            </File>
+            <File>
+              <FileName>proto_task.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/proto_task.c</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>Application/Protocol</GroupName>
+          <Files>
+            <File>
+              <FileName>protocol.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../../proto/protocol.c</FilePath>
             </File>
           </Files>
         </Group>
@@ -539,6 +584,11 @@
               <FileName>stm32f1xx_hal_tim_ex.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_tim_ex.c</FilePath>
+            </File>
+            <File>
+              <FileName>stm32f1xx_hal_uart.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_uart.c</FilePath>
             </File>
           </Files>
         </Group>
