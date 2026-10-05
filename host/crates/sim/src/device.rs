@@ -120,7 +120,10 @@ impl Default for Config {
             capture_samples: 4096,
             format: 0,
             decimation: 1,
-            trigger_mode: 1,
+            // 必须与 `firmware/App/acq.c` 的 `acq_init()` 一致 —— 见那里的长注释。
+            // 默认 AUTO 而不是 NORMAL：直流信号在边沿触发下**任何电平都不会触发**，
+            // 默认成 NORMAL 会让「接上、没接信号、点采集」必然超时。
+            trigger_mode: 0,
             trigger_source: 0,
             trigger_edge: 0,
             trigger_level_lsb: 2048,

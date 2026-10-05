@@ -164,9 +164,14 @@ pub fn acquire_cancellable<P: DevicePort>(
     // 最刺眼的一处：采集超时的错误提示写着「改用 auto 模式」，而按提示
     // 配好的 auto 会在 ARM 之前被这几行改回 normal —— 提示是条死路。
     //
-    // 沿用现值是**兼容**的：`Config::default()` 恰好就是
-    // `trigger_mode=normal / source=0 / edge=rising / format=RAW16 /
-    // decimation=1`，所以从不碰触发配置的调用方，行为一字不变。
+    // 沿用现值的语义：设备上电默认（`Config::default()` 与
+    // `firmware/App/acq.c` 的 `acq_init()`，两者必须一致）是
+    // `trigger_mode=auto / source=0 / edge=rising / format=RAW16 / decimation=1`。
+    //
+    // ⚠ **默认是 auto 而不是 normal，这是 2026-10-05 改的。** 边沿触发要求
+    // 信号先跌破 `level-16` 再升破 `level+16`，所以**直流信号在任何电平下都
+    // 不可能触发** —— 默认 normal 会让「接上板子、没接信号、点采集」必然等满
+    // 超时。auto 约 200 ms 无触发即强制完成，先给出波形。
     let cfg = bus.config.as_ref();
     let (t_mode, t_src, t_edge) = cfg
         .map(|c| (c.trigger_mode, c.trigger_source, c.trigger_edge))

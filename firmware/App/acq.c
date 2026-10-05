@@ -30,7 +30,18 @@ void acq_init(acq_t *a, const hal_t *hal)
 
     /* 上电默认值。必须与 host/crates/sim 的 Config::default() 一致 ——
      * 主机侧有一批「省略就沿用现值」的语义，两边不一致会让
-     * 「什么都没配」和「配过」产生不同的行为。 */
+     * 「什么都没配」和「配过」产生不同的行为。
+     *
+     * ⚠ **触发模式是 `TRIG_MODE_AUTO`，不是 `NORMAL`。**
+     * 边沿触发要求信号**先跌破 `level-16` 再升破 `level+16`**（见 trigger.c），
+     * 所以一个**直流信号在任何电平下都不可能触发**：电平在它下方时它始终在
+     * 高处、不会"从下往上穿过"；在它上方时它始终在低处、升不上去。
+     * 上电默认成 `NORMAL` 会让「接上板子、什么都没接、点采集」这件事
+     * **必然 2 s 超时**（2026-10-05 真机实测）。AUTO 约 200 ms 无触发即强制完成，
+     * 先给出波形，用户再按需要切 `NORMAL` 去等真正的边沿。
+     *
+     * `protocol.h` 里 `TRIG_MODE_AUTO` 的注释本来就是「避免 Agent 永久阻塞」——
+     * 默认成它是那个设计意图的落地。 */
     a->requested_rate_hz = ACQ_RATE_MAX_HZ;
     a->rate_hz = ACQ_RATE_MAX_HZ;
     a->capture_samples = 4096;
@@ -38,7 +49,7 @@ void acq_init(acq_t *a, const hal_t *hal)
     a->format = FMT_RAW16;
     a->decimation = 1;
 
-    a->trig_cfg.mode = TRIG_MODE_NORMAL;
+    a->trig_cfg.mode = TRIG_MODE_AUTO;
     a->trig_cfg.source = 0;
     a->trig_cfg.edge = TRIG_EDGE_RISING;
     a->trig_cfg.level_lsb = 2048;

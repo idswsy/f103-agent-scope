@@ -158,7 +158,10 @@ impl App {
 
             want_rate: scope_core::f103::MAX_SAMPLE_RATE_HZ,
             want_samples: 4096,
-            want_trigger_mode: 1, // normal
+            // auto —— 与设备上电默认一致（`firmware/App/acq.c` 的 `acq_init`）。
+            // 默认 normal 时，接一个直流或没接信号会**必然**等不到边沿、
+            // 2 s 超时，用户看到的是「采集没结果」。
+            want_trigger_mode: 0,
             want_trigger_edge: 0, // 上升
             want_trigger_level: 2048,
 
