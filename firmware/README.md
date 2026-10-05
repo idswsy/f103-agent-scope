@@ -40,17 +40,21 @@ firmware/
 ├─ tests/           PC 上的单元测试（与 App/ 一起编译，见 run_tests.sh）
 ├─ run_tests.sh     PC 上编译并运行测试 —— **CI 会跑它**
 │
-├─ Hardware/        硬件抽象层 —— 唯一允许碰寄存器的地方
-│   ├─ adc_dma.c          TIM4_CC4 → ADC1 → DMA1Ch1 → 8KB 环
-│   ├─ tim_capture.c      LM393 → PA6 输入捕获（13.9 ns 时间戳）
-│   ├─ link_uart.c        USART1（PA9/PA10）
-│   ├─ link_usbcdc.c      USB CDC（PA11/PA12）
-│   ├─ tft_st7735.c       1.8" 屏
-│   └─ encoder.c          EC11 + 3 按键
+├─ Hardware/        硬件层 —— 唯一允许碰寄存器的地方
+│   ├─ inc/  src/         上游的 ST7735S 显示驱动（tft.c / tft_init.c / font.h）
+│   ├─ adc_dma.c          ⏳ 待写：TIM4_CC4 → ADC1 → DMA1Ch1 → 8KB 环
+│   ├─ link_uart.c        ⏳ 待写：USART1 + 外接 CH340
+│   ├─ hal_impl.c         ⏳ 待写：把 9 个函数指针填进 `hal_t`
+│   └─ scope_ui.c         ⏳ 待写：上游的本机显示/按键逻辑，`#if SCOPE_LOCAL_UI`（默认 0）
 │
-├─ MDK-ARM/         Keil 工程（*.uvprojx）—— **尚未创建，P1 任务**
-└─ Core/            CubeMX 生成的时钟树与初始化（若用 HAL）
+├─ Core/            CubeMX 生成的时钟树与外设初始化（Inc/ + Src/）
+├─ Drivers/         ST HAL + CMSIS（厂商代码，许可见 `NOTICE.md` §6）
+├─ MDK-ARM/         Keil 工程（`synthesize-project.uvprojx`）—— **已并入，可编译**
+└─ synthesize-project.ioc   CubeMX 工程定义
 ```
+
+> ⚠ **`Hardware/` 的目录形状是 `inc/` + `src/`**（沿用上游），不是平铺的。
+> 上面列表里带 ⏳ 的是本阶段要写的。
 
 ---
 

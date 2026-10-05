@@ -42,10 +42,29 @@
 - 分支：`master`（GD32E230）、`CW32版本`、`STM32版本`、`MSPG3507版本`
 - **许可证：MulanPSL-2.0（木兰宽松许可证 v2）**
 
+### ⚠️ 本项目**已经引入**了它的代码（2026-10-05）
+
+用户 2026-10-05 确认：`firmware/` 里的 TFT 驱动与 CubeMX 文件的 USER CODE 段
+来自上游仓库的 STM32 移植分支。**那条条件句现在生效了。**
+
+引入清单（均已在文件头加 MulanPSL-2.0 声明）：
+
+| 文件 | 内容 |
+|---|---|
+| `firmware/Hardware/src/tft.c` · `tft_init.c` | ST7735S 显示驱动 |
+| `firmware/Hardware/inc/tft.h` · `tft_init.h` · `font.h` | 显示驱动头 + 点阵字库 |
+| `firmware/Core/Src/main.c` · `gpio.c` · `tim.c` · `adc.c` | CubeMX 文件，**USER CODE 段**是上游的应用逻辑（按键、测频、本机显示） |
+
+> 注：`Core/` 与 `Drivers/` 里 ST 生成的代码另有 ST 的许可证，见 §6。
+>
+> ⚠ **待确认**：上游仓库的确切名字与分支。目前只知道「上游的 STM32 移植分支」，
+> 上面表格里的 `GD32E230-Oscilloscope` 是最可能的来源（它的分支列表里有
+> `STM32版本`）。若将来查清是别的仓库/分支，**改这一节**。
+
 ### 对本项目的约束
 
-- 若 `firmware/` 中引入或改写该仓库的代码，相关文件必须保留 MulanPSL-2.0 许可声明。
-- MulanPSL-2.0 与 GPL-3.0 兼容，本项目整体以 GPL-3.0 发布不构成冲突。
+- 上述文件的 MulanPSL-2.0 声明**不得删除**
+- MulanPSL-2.0 与 GPL-3.0 兼容，本项目整体以 GPL-3.0 发布不构成冲突
 
 ---
 
@@ -84,3 +103,26 @@
 - Rust：`host/Cargo.toml`
 - C 固件：`firmware/README.md`
 - 工具：`tools/README.md`
+
+---
+
+## 6. 固件里的厂商代码（2026-10-05 起）
+
+`firmware/Core/` 与 `firmware/Drivers/` 现在是 ST 生成的代码。
+**它们的许可与本仓库的 GPL-3.0 不同，但兼容**，且**各文件自带的声明不得删除**：
+
+| 目录 | 内容 | 许可证 | 许可文件 |
+|---|---|---|---|
+| `firmware/Drivers/STM32F1xx_HAL_Driver/` | STM32F1 HAL 驱动 | **BSD-3-Clause** | 同目录 `LICENSE.txt` |
+| `firmware/Drivers/CMSIS/Include/`、`Device/ST/STM32F1xx/` | ARM CMSIS | **Apache-2.0** | 各目录下 `LICENSE.txt` |
+| `firmware/Core/` | CubeMX 生成的初始化与时钟树 | **BSD-3-Clause**（ST） | 各文件头 |
+
+**兼容性**：BSD-3-Clause 与 Apache-2.0 都与 GPL-3.0 兼容，
+所以本项目整体以 GPL-3.0 发布不构成冲突 —— 前提是**保留上述声明**。
+
+> ⚠ **裁剪记录**：入库时丢掉了上游包里的 `Drivers/CMSIS/DSP/`（14 MB）
+> 与 `Drivers/CMSIS/Lib/`（35 MB，数学库的 `.lib`/`.a`），本工程用不到。
+> 设备头只保留了 F103xB 相关的三个。**将来若要换型号或用到 DSP，要重新拉原始包。**
+
+> ⚠ `firmware/MDK-ARM/synthesize-project/`（构建产物，34 MB）**不入库** ——
+> `.gitignore` 已经挡掉，Keil 打开工程时会自己重建。
