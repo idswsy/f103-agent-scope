@@ -45,6 +45,11 @@
 #include "usart.h"
 #include "tft.h"
 #include "tft_init.h"
+#include "display.h"
+#include "local_io.h"
+#include "local_policy.h"
+#include "local_freq.h"
+#include "local_gen.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -127,6 +132,26 @@ int main(void)
     HalImpl_Init();                    /* µs 时基、收发环、点起第一次接收中断 */
     acq_init(&g_acq, hal);
     proto_task_init(&g_pt, hal, &g_acq);
+
+    /* 屏幕放在**最后**。它内部有约 420 ms 的阻塞延时（面板复位与寄存器
+     * 序列），放在 `HalImpl_Init()` 之前会让那 420 ms 里串口根本没在收；
+     * 放之后，主机的第一条命令会被 1 KB 的收包环接住，等主循环转起来再答。
+     * 屏幕是最慢、最可缺的一个外设，不该排在链路前面。 */
+    Display_Init();
+
+    /* 本地按键 / 编码器 / LED。它要关掉 `gpio.c` 配的两组 EXTI ——
+     * 理由见 `Hardware/inc/local_io.h` 的文件头。 */
+    LocalIo_Init();
+
+    /* 函数发生器（TIM2_CH3 → PA2）。上电是**关**的。 */
+    LocalGen_Init();
+
+    /* TIM3 输入捕获测频（比较器 → PA6）。
+     *
+     * ⚠ 它内部会把 TIM3 的中断优先级从 1 降到 6 —— `tim.c` 配的 1 高于
+     * µs 时基（3）与串口（5），一个高频输入会把采集和串口一起压住。
+     * 没有信号时 PA6 没有边沿，也就没有中断，所以空载不花 CPU。 */
+    LocalFreq_Init();
   }
   /* USER CODE END 2 */
 
@@ -149,11 +174,72 @@ int main(void)
      *   正常路径一轮最多一两个事件。 */
     for (int guard = 0; guard < 4; guard++) {
         acq_out_t out;
-        if (acq_poll(&g_acq, &out) == ACQ_EV_NONE) {
+        acq_event_t ev = acq_poll(&g_acq, &out);
+        if (ev == ACQ_EV_NONE) {
             break;
         }
         proto_task_emit(&g_pt, &out);
+
+        /* 采集完成 —— **当场**把采集窗压成一帧屏幕能画的东西。
+         * 挑这个时候是因为 `capture_ready` 此刻一定为真（DMA 已停、窗口已冻结），
+         * 而快照之后环再被怎么写、主机什么时候再 ARM，都与这一帧无关了。 */
+        if (ev == ACQ_EV_TRIGGERED) {
+            Display_Capture(&g_acq);
+            /* LED2：每完成一次采集翻转一次 —— 一个「链路在动」的心跳。
+             * 没有它的话，一块静止的屏幕分不出「设备在待命」和「设备死了」。 */
+            LocalIo_LedToggle(LOCAL_LED2);
+        }
     }
+
+    /* 本地按键与编码器：只采样与分发，一轮几微秒。
+     *
+     * 排在屏幕**之前** —— 屏幕坏了不该挡住按键。 */
+    LocalIo_Poll();
+    /* 排空事件。上限只为兜底：事件源（按键/编码器）本身就是稀疏的，
+     * 而队列只有 4 深。 */
+    for (int guard = 0; guard < 8; guard++) {
+        local_event_t lev;
+        if (!LocalIo_PopEvent(&lev)) {
+            break;
+        }
+        /* 「按下去做什么」是 `App/local_policy.c` 的纯函数 —— 那里有测试
+         * 钉着「空闲时按急停不该有动作」「DONE 时按急停不该丢掉已采的帧」。
+         *
+         * ⚠ 这里**必须看返回值**：`acq_arm`/`acq_stop` 自己也有门禁，
+         * 状态不对时它们会拒绝 —— 不能假定成功。
+         *
+         * ⚠ 本地动作目前**不上报主机**。上报（`EVENT_KEY`）与协议扩展
+         * 一起做 —— 在那之前，人手打断 Agent 的采集，Agent 只会看到超时。 */
+        local_action_t act = local_policy_decide(lev, acq_state(&g_acq));
+
+        switch (act) {
+        case LOCAL_ACT_ACQ_STOP:
+            (void)acq_stop(&g_acq);
+            break;
+        case LOCAL_ACT_ACQ_ARM:
+            (void)acq_arm(&g_acq);
+            break;
+        case LOCAL_ACT_GEN_TOGGLE:
+            LocalGen_SetEnabled(!LocalGen_IsEnabled());
+            break;
+        case LOCAL_ACT_GEN_FASTER:
+        case LOCAL_ACT_GEN_SLOWER:
+            (void)LocalGen_SetHz(local_policy_next_gen_hz(LocalGen_GetHz(),
+                                                          act == LOCAL_ACT_GEN_FASTER));
+            break;
+        case LOCAL_ACT_NONE:
+        default:
+            break;
+        }
+    }
+
+    /* LED1 常亮 = 采集进行中。 */
+    LocalIo_LedSet(LOCAL_LED1, acq_state(&g_acq) == STATE_ARMED);
+
+    /* 屏幕绘制放**最后**。它一轮最多花几百微秒（见 `Hardware/src/display.c`
+     * 的预算常量），绝不能排到收包前面 —— 串口收包环只有 1 KB，
+     * 921600 波特率下约 11 ms 就满，满了直接丢字节。 */
+    Display_Poll(acq_state(&g_acq) == STATE_ARMED);
   /* USER CODE END 3 */
   }
 }

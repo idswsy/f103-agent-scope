@@ -470,6 +470,26 @@
               <FileType>1</FileType>
               <FilePath>..\Hardware\src\hal_impl.c</FilePath>
             </File>
+            <File>
+              <FileName>display.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Hardware\src\display.c</FilePath>
+            </File>
+            <File>
+              <FileName>local_io.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Hardware\src\local_io.c</FilePath>
+            </File>
+            <File>
+              <FileName>local_freq.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Hardware\src\local_freq.c</FilePath>
+            </File>
+            <File>
+              <FileName>local_gen.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Hardware\src\local_gen.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -489,6 +509,26 @@
               <FileName>proto_task.c</FileName>
               <FileType>1</FileType>
               <FilePath>../App/proto_task.c</FilePath>
+            </File>
+            <File>
+              <FileName>waveform.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/waveform.c</FilePath>
+            </File>
+            <File>
+              <FileName>local_input.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/local_input.c</FilePath>
+            </File>
+            <File>
+              <FileName>local_policy.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/local_policy.c</FilePath>
+            </File>
+            <File>
+              <FileName>freq_meter.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/freq_meter.c</FilePath>
             </File>
           </Files>
         </Group>
