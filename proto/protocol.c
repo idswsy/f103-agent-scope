@@ -366,3 +366,45 @@ bool proto_cmd_allowed(scope_state_t state, uint16_t cmd)
         return false;
     }
 }
+/* ── 采样率量化 ────────────────────────────────────────────────── */
+
+uint32_t proto_quantize_rate_hz(uint32_t requested_hz)
+{
+    const uint32_t TIMER_HZ   = 72000000u;
+    const uint32_t PERIOD_MAX = 65536u;
+
+    if (requested_hz == 0u || requested_hz > PROTO_RATE_MAX_HZ) {
+        return 0u;
+    }
+
+    /* ideal = 72e6 / requested，整数版四舍五入（+n/2 再除） */
+    uint32_t base = (TIMER_HZ + requested_hz / 2u) / requested_hz;
+    if (base < 1u) { base = 1u; }
+    if (base > PERIOD_MAX) { base = PERIOD_MAX; }
+
+    uint32_t best_rate = TIMER_HZ / base;
+    uint32_t best_err  = (best_rate > requested_hz) ? (best_rate - requested_hz)
+                                                    : (requested_hz - best_rate);
+
+    /* 只扫 ±1 就够了：理想周期取整后，最近的两档一定在相邻周期里 */
+    uint32_t cand[2];
+    cand[0] = (base > 1u) ? (base - 1u) : 1u;
+    cand[1] = ((base + 1u) < PERIOD_MAX) ? (base + 1u) : PERIOD_MAX;
+
+    for (int i = 0; i < 2; i++) {
+        uint32_t p    = cand[i];
+        uint32_t rate = TIMER_HZ / p;
+        uint32_t err  = (rate > requested_hz) ? (rate - requested_hz)
+                                              : (requested_hz - rate);
+        /* 误差相等时取**更快**的 —— 与上位机同一条 tie 规则 */
+        if (err < best_err || (err == best_err && rate > best_rate)) {
+            best_err  = err;
+            best_rate = rate;
+        }
+    }
+
+    if (best_rate == 0u || best_rate > PROTO_RATE_MAX_HZ) {
+        return 0u;
+    }
+    return best_rate;
+}

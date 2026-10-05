@@ -69,4 +69,7 @@ void EXTI15_10_IRQHandler(void);
 }
 #endif
 
+/* 本工程加的：TIM1 更新中断（1 MHz 微秒时基，见 Hardware/adc_dma.c） */
+void TIM1_UP_IRQHandler(void);
+
 #endif /* __STM32F1xx_IT_H */

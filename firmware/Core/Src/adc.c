@@ -56,10 +56,18 @@ void MX_ADC1_Init(void)
   /** Common config
   */
   hadc1.Instance = ADC1;
+  /* 上游原来是「自由连续转换 + 软件启动」（约 47.6 kSa/s，采样率不确定）。
+   * 本工程要的是**定时器精确定时**的 857.142 kSPS：
+   *   - 连续模式关掉：一次触发 = 一次转换（否则触发一次就停不下来）
+   *   - 触发源 = TIM4 的 CC4 比较事件（见 tim.c 的 MX_TIM4_Init）
+   *     ⚠ ADC1 的触发源表里**没有 T4_TRGO**，只有 T4_CC4 —— 见 firmware/README.md */
   hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
-  hadc1.Init.ContinuousConvMode = ENABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
-  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T4_CC4;
+  /* ⚠ F1 的 `ADC_InitTypeDef` **没有** `ExternalTrigConvEdge` 字段
+   *（那个字段是 F4/L4 才有的）—— F1 的触发极性固定在上升沿，
+   * 没有可配的余地。写上去会编译不过。 */
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc1.Init.NbrOfConversion = 1;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
@@ -71,7 +79,11 @@ void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_3;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
+  /* 1.5 周期是 857 kSPS 的前提：12-bit 转换 12.5 周期 + 采样 1.5 = 14 个
+   * ADCCLK，12 MHz / 14 = 857.142 kSPS。
+   * ⚠ 代价是源阻抗必须 ≤0.4 kΩ（`docs/04-performance.md` §3）：TL072 输出的
+   *   实际源阻抗**还没量过**，见 `docs/02-hardware.md` §9 第 9 项。 */
+  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();

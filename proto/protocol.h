@@ -84,6 +84,12 @@ extern "C" {
 /** 设备时钟频率：1 MHz（u32 tick_us，约 71.6 分钟回绕） */
 #define PROTO_TICK_HZ            1000000u
 
+/**
+ * 单 ADC 的采样率上限（`docs/04-performance.md`：12 MHz ADCCLK ÷ 14 周期）。
+ * **不是 1 MSPS**。与 `App/hal.h` 的 `ACQ_RATE_MAX_HZ` 是同一个数。
+ */
+#define PROTO_RATE_MAX_HZ 857142u
+
 /* ══════════════════════════════════════════════════════════════════
  * FLAGS 位
  * ══════════════════════════════════════════════════════════════════ */
@@ -540,6 +546,31 @@ void proto_unpack12_pair(const uint8_t in[3], uint16_t *s0, uint16_t *s1);
  * @return true = 允许
  */
 bool proto_cmd_allowed(scope_state_t state, uint16_t cmd);
+
+
+/**
+ * @brief 采样率量化：把请求值吸附到定时器真正能达到的档位
+ *
+ * **这条规则三端共用** —— 固件用它决定 ARR，上位机用它生成档位菜单，
+ * 模拟器用它回显 `actual_hz`。放在协议层就是为了只有一份：
+ * 各写一份的话，同一个请求在模拟器和真机上会得到不同的档位，而没人会发现。
+ *
+ * 规则：
+ *   - 采样周期 = 72 MHz / requested，四舍五入到整数 `ARR+1`（范围 1..65536）
+ *   - 再把周期 ±1 比一遍，取误差小的；**误差相等时取更快的那档**
+ *   - 吸附之后仍超出 `PROTO_RATE_MAX_HZ` → 返回 0（**达不到**，不静默给个别的档位）
+ *   - `requested == 0` 或已超上限 → 返回 0
+ *
+ * ⚠ **与上位机的 `nearest_achievable_rate` 有一处刻意的不同**：那个函数
+ *   不做能力门控（超上限就返回超上限的档位），因为它的调用方 —— MCP 的
+ *   schema —— 已经用 `range(max=...)` 拦住了。而固件这边必须自己拦：
+ *   `App/acq.c` 的原则是「硬件说达不到就说达不到」，**不静默吸附**。
+ *   所以这里多一道 `> PROTO_RATE_MAX_HZ → 0`。
+ *   两者在**上限以内逐条一致**（已对拍过）。
+ *
+ * @return 实际能达到的采样率（Hz）；0 表示这个请求做不到
+ */
+uint32_t proto_quantize_rate_hz(uint32_t requested_hz);
 
 #ifdef __cplusplus
 }

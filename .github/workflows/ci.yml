@@ -182,7 +182,10 @@ jobs:
           INC="-Ifirmware/Core/Inc -Ifirmware/Drivers/STM32F1xx_HAL_Driver/Inc"
           INC="$INC -Ifirmware/Drivers/STM32F1xx_HAL_Driver/Inc/Legacy"
           INC="$INC -Ifirmware/Drivers/CMSIS/Device/ST/STM32F1xx/Include"
+          # App/ 提供 hal.h（环大小等常量的单一真相源），proto/ 提供采样率量化。
+          # ⚠ proto/ 在仓库根，不在 firmware/ 下。
           INC="$INC -Ifirmware/Drivers/CMSIS/Include -Ifirmware/Hardware/inc"
+          INC="$INC -Ifirmware/App -Iproto"
           DEF="-DUSE_HAL_DRIVER -DSTM32F103xB"
           fail=0
           for ui in 0 1; do

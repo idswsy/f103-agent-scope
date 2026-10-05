@@ -107,6 +107,7 @@ int main(void)
   MX_SPI1_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
+  MX_TIM4_Init();   /* ADC 采样触发，必须早于 MX_ADC1_Init */
   /* USER CODE BEGIN 2 */
 /* 上游的应用逻辑已移到 Hardware/src/scope_ui.c（`#if SCOPE_LOCAL_UI`，默认关）。 */
   /* USER CODE END 2 */

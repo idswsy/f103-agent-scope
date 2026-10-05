@@ -22,6 +22,7 @@
 #include "stm32f1xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "adc_dma.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -260,6 +261,21 @@ void ADC1_2_IRQHandler(void)
 /**
   * @brief This function handles TIM3 global interrupt.
   */
+/* TIM1 的更新中断 —— 本工程借来做 1 MHz 的微秒时基（见 adc_dma.c）。
+ * 溢出频率只有 15.26 Hz，负担可忽略。
+ * ⚠ 这里**不走 `HAL_TIM_IRQHandler()`**：TIM1 只是被借来数 µs 的，
+ *   没有用 HAL 的定时器对象（htim1 不存在），走 HAL 反而会去碰空指针。 */
+void TIM1_UP_IRQHandler(void)
+{
+  /* USER CODE BEGIN TIM1_UP_IRQn 0 */
+
+  /* USER CODE END TIM1_UP_IRQn 0 */
+  AdcDma_TickIsr();
+  /* USER CODE BEGIN TIM1_UP_IRQn 1 */
+
+  /* USER CODE END TIM1_UP_IRQn 1 */
+}
+
 void TIM3_IRQHandler(void)
 {
   /* USER CODE BEGIN TIM3_IRQn 0 */
