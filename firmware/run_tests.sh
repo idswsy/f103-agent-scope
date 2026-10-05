@@ -36,7 +36,7 @@ command -v "$CC" >/dev/null 2>&1 || { echo "找不到 C 编译器: $CC" >&2; exi
 mkdir -p "$BUILD"
 
 # App 层里被测试覆盖到的源文件。
-APP_SRC="App/trigger.c App/acq.c App/proto_task.c"
+APP_SRC="App/trigger.c App/acq.c App/proto_task.c App/waveform.c App/local_input.c App/local_policy.c App/freq_meter.c"
 
 VERBOSE=0
 [ "${1:-}" = "-v" ] && VERBOSE=1
