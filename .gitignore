@@ -19,6 +19,13 @@
 *.build_log.htm
 *.uvguix.*
 *.uvoptx.bak
+# ⚠ `.uvoptx` 是 Keil 的**用户选项**文件（调试器选择、窗口布局、断点、
+# 展开状态），跟 `.uvprojx`（工程定义）不是一回事。**每次开一次调试会话
+# 它就会变** —— 2026-10-05 一晚上就churn 了两次（一次是加文件后同步工程树，
+# 一次是开调试会话时写进 `DLGUARM`/`ARMRTXEVENTFLAGS` 之类）。
+*.uvoptx
+# Keil 用 Event Recorder 时自动生成的，与工程无关
+*.scvd
 JLinkLog.txt
 JLinkSettings.ini
 # ⚠ 必须写成 `**/`：含斜杠的模式会**锚定到仓库根**，`MDK-ARM/*/` 匹配不到
@@ -29,9 +36,9 @@ RTE/
 Objects/
 Listings/
 
-# 注意：*.uvprojx / *.uvoptx / *.ioc 是工程定义文件，必须提交
+# 注意：*.uvprojx / *.ioc 是工程定义文件，**必须提交**。
+# `.uvoptx` **不在**此列 —— 它是用户选项，见上面那段。
 !*.uvprojx
-!*.uvoptx
 !*.ioc
 
 # ── 纯 C 协议测试 ──────────────────────────────────────────────
