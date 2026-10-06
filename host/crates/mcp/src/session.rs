@@ -887,6 +887,21 @@ impl Session {
                 if has(MetricKind::Rise) {
                     row.insert("rise_ns".into(), json!(m.rise_ns));
                 }
+                if has(MetricKind::Fall) {
+                    row.insert("fall_ns".into(), json!(m.fall_ns));
+                }
+                if has(MetricKind::Overshoot) {
+                    row.insert("overshoot_pct".into(), json!(m.overshoot_pct));
+                }
+                if has(MetricKind::Undershoot) {
+                    row.insert("undershoot_pct".into(), json!(m.undershoot_pct));
+                }
+                if has(MetricKind::High) {
+                    row.insert("high_ns".into(), json!(m.high_ns));
+                }
+                if has(MetricKind::Edges) {
+                    row.insert("edges".into(), json!(m.edges));
+                }
                 out.insert(format!("ch{ch}"), Value::Object(row));
             }
         }
@@ -1390,6 +1405,13 @@ fn capture_summary_json(cap: &Capture, max_preview: usize, scales: &ScaleSet) ->
             "freq_hz": m.as_ref().and_then(|m| m.freq_hz),
             "duty_pct": m.as_ref().and_then(|m| m.duty_pct),
             "rise_ns": m.as_ref().and_then(|m| m.rise_ns),
+            "fall_ns": m.as_ref().and_then(|m| m.fall_ns),
+            "overshoot_pct": m.as_ref().and_then(|m| m.overshoot_pct),
+            "undershoot_pct": m.as_ref().and_then(|m| m.undershoot_pct),
+            "high_ns": m.as_ref().and_then(|m| m.high_ns),
+            // ⚠ 与上面 `rising_edges` **不同源**：那个固定在 2048 LSB 判定，
+            // 这个用实测中点（见 MetricKind::Edges 的说明）
+            "edges_mid": m.as_ref().map(|m| m.edges),
         }));
     }
 
@@ -2143,6 +2165,46 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains("freqency"), "实测 {msg}");
         assert!(msg.contains("freq"), "错误里应当列出合法取值，实测 {msg}");
+    }
+
+    /// 新增的五个指标（fall/overshoot/undershoot/high/edges）要能取到，
+    /// 且**不请求时不得出现** —— 这一条防的是「变体加了、输出行忘了」
+    /// 的静默错：schema 里列着指标，返回却永远是空的。
+    ///
+    /// 变异（杀掉）：把 session.rs 里五个 `if has(...)` 行删掉任意一条 ——
+    /// 这条的对应断言红。
+    #[test]
+    fn the_new_metrics_are_served_only_when_asked() {
+        let mut s = connected();
+        let _ = s.capture(&args(json!({}))).unwrap();
+
+        let v = s
+            .measure(&args(json!({
+                "capture_id": 1, "channel": 0,
+                "metrics": ["fall", "overshoot", "undershoot", "high", "edges"]
+            })))
+            .unwrap();
+        let ch0 = &v["measurements"]["ch0"];
+        for key in [
+            "fall_ns",
+            "overshoot_pct",
+            "undershoot_pct",
+            "high_ns",
+            "edges",
+        ] {
+            assert!(ch0.get(key).is_some(), "请求了却没回：{key}");
+        }
+
+        let v2 = s
+            .measure(&args(
+                json!({ "capture_id": 1, "metrics": ["vpp"], "channel": 0 }),
+            ))
+            .unwrap();
+        let ch0 = &v2["measurements"]["ch0"];
+        assert!(
+            ch0.get("fall_ns").is_none() && ch0.get("edges").is_none(),
+            "没要的指标不该回"
+        );
     }
 
     #[test]
