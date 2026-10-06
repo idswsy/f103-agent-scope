@@ -294,14 +294,20 @@ fn preview_section(s: &mut String, cap: &Capture) {
 }
 
 /// I2C 解码结果 —— 帧表 + **未过滤的**告警原文。
+///
+/// 段首声明**场景**（有解码 / 无解码），供模型选择分析分支。
+/// 场景是**分类**，不是重算 —— 数据里本来就知道的事。
 fn decode_section(s: &mut String, input: &EvidenceInput<'_>) {
     let _ = writeln!(s);
     let _ = writeln!(s, "== I2C 解码 ==");
 
     let Some(d) = input.decode else {
+        let _ = writeln!(s, "场景: 模拟信号（无总线解码）—— 按波形质量分析");
         let _ = writeln!(s, "（没有解码结果 —— 通道数不足 2，或还没解码）");
         return;
     };
+
+    let _ = writeln!(s, "场景: I2C 总线解码");
 
     if let Some(cfg) = input.decode_cfg {
         // 说明通道是**用户选的**，不是自动检测的 —— 这一点影响模型对结论的信任度
@@ -1301,6 +1307,46 @@ mod tests {
         assert!(
             text.contains("没有解码结果"),
             "没解码就要说没解码，不能整段消失"
+        );
+    }
+
+    // ── 场景声明：证据包告诉模型该走哪个分析分支 ─────────────────────
+
+    /// 无解码时声明「模拟信号」场景 —— 提示词的模拟分支据此生效。
+    #[test]
+    fn missing_decode_declares_the_analog_scenario() {
+        let cap = flat_capture();
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
+        let text = build_evidence(&input(&cap, &scale));
+        assert!(
+            text.contains("场景: 模拟信号（无总线解码）"),
+            "无解码时要声明模拟场景，供模型选分支\n{text}"
+        );
+        assert!(
+            !text.contains("场景: I2C 总线解码"),
+            "没解码就不能声明 I2C 场景\n{text}"
+        );
+    }
+
+    /// 有解码时声明 I2C 场景。
+    #[test]
+    fn decode_declares_the_i2c_scenario() {
+        let cap = i2c_capture(true);
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
+        let d = decode_capture(&cap, &I2cDecodeConfig::default()).expect("应能解码");
+        let cfg = I2cDecodeConfig::default();
+        let mut i = input(&cap, &scale);
+        i.decode = Some(&d);
+        i.decode_cfg = Some(&cfg);
+
+        let text = build_evidence(&i);
+        assert!(
+            text.contains("场景: I2C 总线解码"),
+            "有解码时要声明 I2C 场景\n{text}"
+        );
+        assert!(
+            !text.contains("模拟信号（无总线解码）"),
+            "有解码就不该说「无总线解码」\n{text}"
         );
     }
 }
