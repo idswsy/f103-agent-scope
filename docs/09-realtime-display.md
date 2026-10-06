@@ -108,9 +108,9 @@ GUI 增加「连续刷新」开关。打开后 worker 循环执行「采集一�
 - 预期 **32 fps**（帧率数字待真机 + 2 Mbps 实测）
 - 硬判据：**同一份采集，PACK12 解出的样点与 RAW16 逐点相同** —— 已由固件 PACK12 往返组、主机 `decode_chunk_samples` 单测、scope-mcp 端到端回归钉住
 
-### 4.4 第四步：冻结屏幕代码
+### 4.4 第四步：冻结屏幕代码（已完成 2026-10-06）
 
-`Hardware/src/display.c` 以编译开关包裹并从 Keil 工程移除（文件保留）。
+`Hardware/src/display.c` 从 Keil 工程移除（文件保留，无编译开关）。
 
 - 释放约 **450 B** RAM（`display.c` 的 `.bss` 实测 448 B）
 - 板载屏幕不再驱动；`SCOPE_LOCAL_UI` 维持 0 不变

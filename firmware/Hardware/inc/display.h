@@ -1,5 +1,8 @@
 /* Hardware/inc/display.h —— 板载 1.8 寸 TFT（ST7735S，160×128）的渲染。
  *
+ * ⚠ **已冻结**：本模块不在 Keil 工程内（docs/09 §4.4），文件保留、无编译开关；
+ * 恢复时把 `Hardware/src/display.c` 加回 Keil 工程的 `Application/Hardware` 组。
+ *
  * # 刷新模型：被动的
  *
  * 采集完成后刷一帧，空闲时画面静止。设备**不会**自己去抢 ADC ——

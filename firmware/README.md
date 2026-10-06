@@ -60,6 +60,9 @@ firmware/
 
 ## 屏幕（板载 1.8 寸 TFT，160×128，ST7735S）
 
+> ⚠ **屏幕已冻结**（[docs/09-realtime-display.md](../docs/09-realtime-display.md) §4.4）：
+> `display.c` 已从 Keil 工程移除、代码保留不编；**本节以下规则仅在恢复屏幕时适用**。
+
 渲染在 `Hardware/src/display.c`，要画什么由 `App/waveform.c` 算 ——
 后者是纯算术（采集窗 → 100 列的上下沿 + Vpp + 频率），**PC 上可测**，
 所以把它放在 App 层（ADR-008 的用意）。
@@ -115,7 +118,7 @@ x 0..99 y 30..80。坐标逐项对着上游 `TFT_StaticUI` / `TFT_ShowUI` 抄的
 打开它的办法：把 `Hardware/inc/scope_ui.h` 里的默认值改成 1，
 并把 `Hardware/src/scope_ui.c` 加进 Keil 工程的 `Application/Hardware` 组。
 
-⚠ **它与现在在用的屏幕（`Hardware/src/display.c`）互斥，不要同时开**，
+⚠ **它与已冻结的屏幕驱动（`Hardware/src/display.c`，docs/09 §4.4）互斥，不要同时开**，
 理由三条，每一条单独都足以致命：
 
 - 它和我们自己的采集链**抢同一批外设**（ADC1 + DMA1Ch1 + TIM），二者不能同时生效
@@ -123,7 +126,7 @@ x 0..99 y 30..80。坐标逐项对着上游 `TFT_StaticUI` / `TFT_ShowUI` 抄的
   两个都编会重定义**
 - 同一块屏会有两套驱动在写
 
-本 ADR-014 之后，屏幕那条路走的是 `display.c`；`scope_ui.c` 的定位是
+本 ADR-014 之后，屏幕那条路走的是 `display.c`（现已冻结，见 docs/09 §4.4）；`scope_ui.c` 的定位是
 **上游逻辑的存档**（P4 若要参考它的按键/编码器/测频可以回来看）。
 它默认不编，但 CI 会用 `-DSCOPE_LOCAL_UI=1` 编它一遍兜住语法，
 所以不会烂掉。

@@ -36,7 +36,7 @@ local_action_t local_policy_decide(local_event_t ev, scope_state_t acq_state)
         return LOCAL_ACT_GEN_SLOWER;
 
     case LOCAL_EV_ENC_PUSH:
-        /* 暂未分配（上游的语义是冻结画面）。等 `display.c` 支持冻结再定。 */
+        /* 该动作槽保持未分配（上游的语义是冻结画面）；屏幕已冻结（docs/09 §4.4）。 */
         return LOCAL_ACT_NONE;
 
     case LOCAL_EV_NONE:
