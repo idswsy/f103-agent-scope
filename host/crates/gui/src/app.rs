@@ -144,6 +144,7 @@ impl App {
         ctx: &egui::Context,
         font: FontOutcome,
         demo: bool,
+        demo_cont: bool,
         scenario: Option<Scenario>,
     ) -> App {
         let worker = Worker::spawn(ctx.clone());
@@ -166,7 +167,9 @@ impl App {
             config: None,
             state: None,
             connected: false,
-            continuous: false,
+            // `--demo-cont`：演示模式直接开连续刷新 —— 用于脚本验证
+            // 「连续采集下缩放/平移是否仍可用」这类交互问题
+            continuous: demo_cont,
 
             want_rate: scope_core::f103::MAX_SAMPLE_RATE_HZ,
             want_samples: 4096,
@@ -794,6 +797,9 @@ impl eframe::App for App {
             1 if self.connected && !self.is_busy() => {
                 self.demo_stage = 2;
                 self.acquire_in_flight = true;
+                // 与勾选框路径一致：会话第一帧适配默认窗口
+                // （`--demo-cont` 下后续帧不再重置视口，见 Update::Acquired）
+                self.fit_pending = true;
                 self.worker.send(Request::Acquire {
                     samples: self.want_samples,
                     rate_hz: self.want_rate,

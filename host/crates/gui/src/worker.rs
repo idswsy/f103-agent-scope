@@ -148,6 +148,36 @@ impl WorkerState {
         }
     }
 
+    /// 切换模拟器场景后重新握手，刷新 `info`（含 ch_count）。
+    ///
+    /// 只重发 GET_INFO + GET_CONFIG，**不重建 Transport、不丢连接状态** ——
+    /// 采集循环按 `bus.info.ch_count` 决定拉几个通道，不刷新的话
+    /// 从单通道场景切到 I2C 双通道只会显示一条泳道。
+    fn refresh_after_scenario_switch(&mut self) {
+        // 借用限制在一个表达式内（与 `with_bus` 同一条规矩）
+        let done = match self.bus.as_mut() {
+            Some(bus) => match bus.connect() {
+                Ok(info) => {
+                    let state = bus.get_status().map(|s| s.state).unwrap_or(State::Idle);
+                    Some((info, bus.config.clone(), state, bus.is_simulated()))
+                }
+                Err(e) => {
+                    self.fail(&e);
+                    None
+                }
+            },
+            None => None,
+        };
+        if let Some((info, config, state, simulated)) = done {
+            self.emit(Update::Connected {
+                info,
+                config,
+                state,
+                simulated,
+            });
+        }
+    }
+
     fn fail(&self, e: &ScopeError) {
         let (text, hint) = describe_error(e);
         self.emit(Update::Failed { text, hint });
@@ -307,7 +337,14 @@ impl WorkerState {
                     }
                 });
                 match r {
-                    Ok(()) => self.emit(Update::StateChanged(State::Idle)),
+                    Ok(()) => {
+                        // **场景换了通道数也会换**（单通道 ↔ I2C 双通道）——
+                        // 必须重新 connect 刷新 info，否则采集循环按旧的
+                        // `ch_count` 拉数据，双通道场景只显示一条泳道
+                        // （2026-10-07 观察：从其他场景切到 I2C 只显示单通道）。
+                        // 与 MCP 的 `sim_set_scenario` 同一条规矩。
+                        self.refresh_after_scenario_switch();
+                    }
                     Err(e) => self.fail(&e),
                 }
             }
@@ -346,5 +383,75 @@ impl WorkerState {
                 self.busy("复位", false);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scope_sim::Scenario;
+
+    /// 轮询等一个满足条件的回执（worker 是异步的，测试要等它）。
+    fn wait_for(w: &Worker, mut pred: impl FnMut(&Update) -> bool) -> Option<Update> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut found = None;
+            w.drain(|u| {
+                if found.is_none() && pred(&u) {
+                    found = Some(u);
+                }
+            });
+            if let Some(u) = found {
+                return Some(u);
+            }
+            if std::time::Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// **切场景必须刷新 `info` 的通道数。**
+    ///
+    /// 2026-10-07 的 bug：从单通道场景切到 I2C 双通道，界面只显示一条泳道 ——
+    /// 采集循环按缓存的 `bus.info.ch_count` 拉数据，而切场景只改了模拟器
+    /// 内部、没重新握手。
+    ///
+    /// 变异（杀掉）：把 `refresh_after_scenario_switch` 里的 `bus.connect()`
+    /// 删掉（或改成只 emit StateChanged）—— 这条红（等不到第二次 Connected，
+    /// 或第二次的 ch_count 还是 1）。
+    #[test]
+    fn switching_scenario_refreshes_the_channel_count() {
+        let mut w = Worker::spawn(egui::Context::default());
+
+        w.send(Request::Connect {
+            transport: TransportKind::Sim,
+            port: String::new(),
+            baud: 921_600,
+            scenario: Scenario::Sine1k3v3,
+        });
+        let first = wait_for(&w, |u| matches!(u, Update::Connected { .. }))
+            .expect("第一次连接应在 10 s 内完成");
+        match &first {
+            Update::Connected { info, .. } => {
+                assert_eq!(info.ch_count, 1, "sine 场景是单通道");
+            }
+            _ => unreachable!(),
+        }
+
+        w.send(Request::SetScenario(Scenario::I2c100k));
+        let second =
+            wait_for(&w, |u| matches!(u, Update::Connected { .. })).expect("切场景后应重新握手");
+        match &second {
+            Update::Connected { info, .. } => {
+                assert_eq!(
+                    info.ch_count, 2,
+                    "切到 i2c_100k 后 info 必须刷新成 2 通道 —— 否则只显示单通道"
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        w.shutdown();
     }
 }

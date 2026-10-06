@@ -57,6 +57,11 @@ fn main() -> eframe::Result<()> {
     // 用途二是空状态和满状态的布局差很多，调界面时需要在两者之间切换。
     let demo = args.iter().any(|a| a == "--demo");
 
+    // --demo-cont：--demo 的加强版，采完第一帧后打开「连续刷新」。
+    // 用途是脚本验证连续采集下的交互（缩放/平移/双击是否仍可用），
+    // 不用人手去点勾选框。
+    let demo_cont = args.iter().any(|a| a == "--demo-cont");
+
     // --scenario <name>：指定初始模拟器场景。
     // 逐场景核对波形显示时用得上（界面上那个下拉框没法用脚本点）。
     let scenario = args
@@ -101,7 +106,8 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app::App::new(
                 &cc.egui_ctx,
                 outcome,
-                demo,
+                demo || demo_cont,
+                demo_cont,
                 scenario,
             )))
         }),

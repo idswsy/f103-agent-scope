@@ -148,7 +148,7 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
         };
         if ui
             .selectable_label(app.ai.panel_open, ai_label)
-            .on_hover_text("把这次采集的测量、解码帧与信号质量发给大模型，让它给一段解释")
+            .on_hover_text("把这次采集的测量、信号分类、解码帧与信号质量发给大模型，让它给一段解释")
             .clicked()
         {
             app.ai.panel_open = !app.ai.panel_open;
@@ -523,7 +523,7 @@ pub fn help_page(app: &mut App, ui: &mut egui::Ui) {
                 "上升时间的分辨率下限为 1 个采样周期。",
                 "频率与占空比已排除事务之间的空闲区间；非周期信号报出的是边沿速率。",
                 "协议解码走数字通路（LM393 比较器 + 定时器输入捕获），与 ADC 采样率无关；ADC 通路负责信号质量评估。",
-                "AI 分析结果的正确性不作保证。其输入为本次采集的测量值、解码帧与信号质量，\
+                "AI 分析结果的正确性不作保证。其输入为本次采集的测量值、信号分类、解码帧与信号质量，\
                  输出文本应视为注释而非测量数据。",
                 "API 密钥以明文存储于用户配置目录（Windows: %APPDATA%\\scope-gui\\config.json）。\
                  本应用不提供加密存储；该文件不得置于项目目录之内（应用会拒绝写入此类路径）。",
@@ -771,7 +771,12 @@ pub fn plot(app: &mut App, ui: &mut egui::Ui) {
         };
         // 重叠模式下所有泳道同基线，标签会叠在同一个位置互相盖住 ——
         // 按通道号纵向错开。分开模式下各泳道本来就不在一处，居中即可。
-        let label_y = if app.lanes_overlap {
+        // 单通道自适应纵轴时（见 y_top/y_bot 的计算），标签贴在波形顶部
+        // 上方 —— 固定位置会落在自适应范围之外，标签直接消失。
+        let label_y = if ch_count == 1 && !show_band {
+            let hi = pts.iter().map(|p| p[1]).fold(f64::MIN, f64::max);
+            (hi + 0.25).max(0.4)
+        } else if app.lanes_overlap {
             LANE_H * (0.42 - ch as f64 * 0.20)
         } else {
             base + LANE_H * 0.5
@@ -851,11 +856,43 @@ pub fn plot(app: &mut App, ui: &mut egui::Ui) {
         .trigger_index
         .map(|i| i as f64 * 1_000_000.0 / cap.rate_hz.max(1) as f64);
 
-    let y_top = lane_bottom(0) + LANE_H + 0.4;
-    let y_bot = if show_band {
-        decode_bottom - 0.3
+    // 单通道时 y 轴按信号实际范围自适应 —— 示波器的「自动量程」。
+    //
+    // 泳道布局为 3.3 V 满量程信号预留了固定高度：一个 ±1.15 V 的方波
+    // 只占纵向空间的一半多，上下留白把波形衬得很小（2026-10-07 用户做
+    // 单通道连续检测时的反馈：「波形在采集框里看不全」）。
+    //
+    // 双通道保持泳道布局：两路信号要对齐同一纵轴做时序对照，各自
+    // 适配会破坏对比。`default_y_bounds` 每帧都设，所以**双击重置**会
+    // 按当帧信号重新适配；连续模式下信号幅度稳定时画面不跳。
+    let (y_bot, y_top) = if ch_count == 1 && !show_band {
+        let mut lo = f64::MAX;
+        let mut hi = f64::MIN;
+        if let Some((_, pts, _)) = series.first() {
+            for p in pts {
+                lo = lo.min(p[1]);
+                hi = hi.max(p[1]);
+            }
+        }
+        if lo.is_finite() && hi > lo {
+            // 上下各留 10% 边距，最小 0.15 个单位 —— 全平之外的退化由下面兜住
+            let m = ((hi - lo) * 0.1).max(0.15);
+            (lo - m, hi + m)
+        } else {
+            // 全平信号（直流）：以信号电平为中心的固定小窗。
+            // ⚠ 不能用固定 (-0.3, 0.3)：信号不在 0 V 附近时（比如 0.24 V
+            // 的直流），平线会被压在绘图区边缘贴边（2026-10-07 截图验证）。
+            let center = if lo.is_finite() { lo } else { 0.0 };
+            (center - 0.3, center + 0.3)
+        }
     } else {
-        lane_bottom(ch_count - 1) - 0.3
+        let y_top = lane_bottom(0) + LANE_H + 0.4;
+        let y_bot = if show_band {
+            decode_bottom - 0.3
+        } else {
+            lane_bottom(ch_count - 1) - 0.3
+        };
+        (y_bot, y_top)
     };
 
     let fit = app.fit_pending;
@@ -891,6 +928,25 @@ pub fn plot(app: &mut App, ui: &mut egui::Ui) {
     };
 
     p.show(ui, move |pui| {
+        // **普通滚轮 = 时间轴缩放**（示波器惯例，与上方提示「滚轮缩放」对齐）。
+        //
+        // egui 的 `zoom_delta` 只由 **Ctrl+滚轮** / 触控板捏合驱动（见 egui
+        // input_state 的说明），普通滚轮走 scroll 路径 —— 而本图显式关了
+        // `allow_scroll`，于是「滚轮缩放」这句提示在普通滚轮上是**假的**。
+        // 2026-10-06 注入测试实测：普通滚轮 0 像素变化，Ctrl+滚轮才缩放。
+        //
+        // 这里把普通滚轮手动映射成 x 轴缩放（只动时间轴，泳道布局动 y 没有
+        // 意义）；Ctrl+滚轮仍走 egui_plot 内置路径，两者不冲突。
+        let (scroll_y, ctrl) = pui
+            .ctx()
+            .input(|i| (i.smooth_scroll_delta.y, i.modifiers.ctrl));
+        if scroll_y.abs() > 0.0 && !ctrl && pui.response().hovered() {
+            // exp 映射：向上滚放大、向下滚缩小，格数越多缩放越平滑。
+            // 0.003 / 格（约 50 pt）≈ 每格 1.16 倍。
+            let factor = ((scroll_y as f64) * 0.003).exp();
+            pui.zoom_bounds_around_hovered(egui::Vec2::new(factor as f32, 1.0));
+        }
+
         for (pts, color) in span_polys {
             pui.polygon(Polygon::new("", pts).fill_color(color));
         }
@@ -1068,15 +1124,41 @@ fn measure_section(app: &mut App, ui: &mut egui::Ui) {
             .rise_ns
             .map(|r| format!("{r:.0} ns"))
             .unwrap_or_else(|| "—".into());
+        let fall = m
+            .fall_ns
+            .map(|f| format!("{f:.0} ns"))
+            .unwrap_or_else(|| "—".into());
+        let over = m
+            .overshoot_pct
+            .map(|p| format!("{p:.1}%"))
+            .unwrap_or_else(|| "—".into());
+        let under = m
+            .undershoot_pct
+            .map(|p| format!("{p:.1}%"))
+            .unwrap_or_else(|| "—".into());
+        let high = m
+            .high_ns
+            .map(|h| {
+                if h >= 1000.0 {
+                    format!("{:.1} µs", h / 1000.0)
+                } else {
+                    format!("{h:.0} ns")
+                }
+            })
+            .unwrap_or_else(|| "—".into());
         ui.monospace(format!(
-            "CH{:<2}  Vpp {:>6.2} V   均值 {:>6.2} V   有效值 {:>6.2} V   频率 {:>10}   占空比 {:>6}   上升 {:>8}",
-            ch + 1,
-            m.vpp,
-            m.mean,
-            m.ac_rms,
-            freq,
-            duty,
-            rise
+            "CH{:<2}  Vpp {:>6.2} V   均值 {:>6.2} V   有效值 {:>6.2} V   频率 {:>10}   占空比 {:>6}",
+            ch + 1, m.vpp, m.mean, m.ac_rms, freq, duty
+        ));
+        // 第二行：新增的量。过冲/下冲的参考电平是平台均值（不是全窗最大值），
+        // 这个口径必须和证据包一致 —— 两个地方两个口径，用户对不上数。
+        ui.monospace(format!(
+            "      上升 {:>8}   下降 {:>8}   过冲/下冲 {:>11}   脉宽 {:>8}   跃变 {:>3}",
+            rise,
+            fall,
+            format!("{over}/{under}"),
+            high,
+            m.edges
         ));
     }
     // 这几个边界必须写出来，否则数字会被过度解读：
@@ -1090,8 +1172,8 @@ fn measure_section(app: &mut App, ui: &mut egui::Ui) {
     };
     ui.weak(format!(
         "有效值 = 扣除直流后的 RMS · 占空比按 min/max 中值判定（与解码门限无关）\
-         · 频率与占空比已排除事务间空闲 · 上升时间分辨率下限 1 个采样周期（{dt_ns:.0} ns）\
-         · 非周期信号（数据线）的「频率」只是边沿速率，参考意义有限"
+         · 频率与占空比已排除事务间空闲 · 上升/下降时间分辨率下限 1 个采样周期（{dt_ns:.0} ns）\
+         · 过冲参考电平为平台均值 · 非周期信号（数据线）的「频率」只是边沿速率，参考意义有限"
     ));
 }
 
@@ -1268,6 +1350,15 @@ pub fn ai_panel(app: &mut App, ui: &mut egui::Ui) {
         ui.small(format!("模型 {}", answer.model));
         ui.small(format!("· 用时 {:.1} s", answer.elapsed.as_secs_f32()));
     });
+
+    // 被截断的正文与完整的正文在屏幕上长得一样 —— 而「话说了一半」正是
+    // 最容易被当成「说完了」的那种错。所以这条提示必须紧贴正文上方。
+    if answer.truncated {
+        ui.colored_label(
+            egui::Color32::from_rgb(230, 160, 30),
+            "⚠ 响应被服务端截断（max_tokens）—— 以下内容不完整。",
+        );
+    }
     ui.add_space(4.0);
 
     // 正文用等宽 + 可选中：结论里全是数字，等宽好读也好复制
@@ -1518,7 +1609,10 @@ fn decode_panel(app: &mut App, ui: &mut egui::Ui) {
     span_legend(ui);
 
     ui.horizontal(|ui| {
-        ui.heading("I2C 解码");
+        // 面板叫「总线解码」而不是「I2C 解码」—— 与证据包里的段名
+        // `== 总线解码 ==` 同一个名字。这里曾经两个地方各叫各的，
+        // 用户按界面名去对 AI 的分析文本对不上（同物两名缺陷）。
+        ui.heading("总线解码");
 
         let has_cap = app.capture.is_some();
         let ch_count = app.capture.as_ref().map(|c| c.channels.len()).unwrap_or(0);
