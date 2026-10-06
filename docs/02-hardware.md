@@ -277,7 +277,11 @@ TL072 的 GBW 只有 3 MHz，对 400 kHz I2C 的 300 ns 边沿已经偏软，
 
 - 上游硬件工程：<https://oshwhub.com/course-examples/yi-qi-yi-biao-jian-yi-shu-zi-shi-bo-qi-she-ji-cha-jian-ban>
 - 上游开发 wiki：<https://wiki.lceda.cn/zh-hans/course-projects/microcontroller/32-simple-oscilloscope/introduce.html>
-- 上游参考代码：<https://gitee.com/chen11232/GD32E230-Oscilloscope>
+- 上游参考代码：外部提供的 `STM32-Oscilloscope` 工作副本（无仓库地址、
+  无许可文件）。来源与许可状态见 [NOTICE.md](../NOTICE.md) §2。
+
+> **2026-10-07 更正**：本节此前把上游参考代码记为 Gitee 上的
+> `chen11232/GD32E230-Oscilloscope`。用户明确**未使用该工程**，该链接已删除。
 - 上一块核心板（地阔星）资料，仅作留档：
   - 官方文档 <https://wiki.lckfb.com/zh-hans/dkx-stm32f103c8t6/>
   - 商城页 <https://item.szlcsc.com/24005615.html>
