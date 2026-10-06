@@ -143,6 +143,10 @@ enum Action {
         #[arg(long, default_value_t = 2000)]
         timeout_ms: u64,
 
+        /// 连续采集 n 次并报告帧率（用于验证链路吞吐，不需要 GUI）。
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        continuous: u32,
+
         /// 输出 CSV 路径（省略则只打印摘要，不落盘）
         #[arg(short = 'o', long)]
         out: Option<String>,
@@ -542,9 +546,48 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
             rate,
             level,
             timeout_ms,
+            continuous,
             out,
         } => {
-            let capture = capture_once(&mut bus, samples, rate, level, timeout_ms)?;
+            // 连续采集：跑 `continuous` 次，只有最后一帧打摘要。
+            // 失败即停 —— 与 GUI 的「连续刷新」同一语义（docs/09 §8）。
+            let start = std::time::Instant::now();
+            let mut ok: u32 = 0;
+            let mut last_err: Option<scope_core::ScopeError> = None;
+            let mut capture: Option<Capture> = None;
+            for i in 0..continuous {
+                let quiet = i + 1 < continuous;
+                match capture_once(&mut bus, samples, rate, level, timeout_ms, quiet) {
+                    Ok(c) => {
+                        ok += 1;
+                        capture = Some(c);
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            let elapsed = start.elapsed();
+            if ok > 0 {
+                println!(
+                    "# 连续采集 {ok}/{} 次成功，平均 {:.1} fps",
+                    continuous,
+                    ok as f64 / elapsed.as_secs_f64()
+                );
+            }
+            if let Some(e) = &last_err {
+                // 用 `summary()` 而不是 Display —— 与 GUI / MCP 的显示纪律
+                // 一致（见 `scope_core::error` 里对这两者的说明）。
+                println!("✗ 第 {} 次失败：{}", ok + 1, e.summary());
+            }
+            // 一帧都没成：没有摘要可打，把错误原样交出去（退出码非 0）。
+            // `--continuous` 有范围校验（≥1），到这里必然是首帧即败。
+            let Some(capture) = capture else {
+                return Err(last_err
+                    .map(anyhow::Error::new)
+                    .unwrap_or_else(|| anyhow::anyhow!("--continuous 至少为 1")));
+            };
             let ch_count = capture.channels.len();
             let capture_id = capture.id;
 
@@ -599,6 +642,11 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
             let _ = bus.stop();
             let mut store = CaptureStore::default();
             store.push(capture);
+            if let Some(e) = last_err {
+                // 部分成功：摘要已打，但退出码必须是失败 ——
+                // 这个入口的存在意义就是给脚本/Agent 验证链路
+                return Err(e.into());
+            }
             Ok(())
         }
 
@@ -614,7 +662,7 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
             timeout_ms,
             out,
         } => {
-            let capture = capture_once(&mut bus, samples, rate, 2048, timeout_ms)?;
+            let capture = capture_once(&mut bus, samples, rate, 2048, timeout_ms, false)?;
 
             // I2C 解码至少要两条线。单通道场景（如 dc / sine_1k_3v3）在这里
             // 就要说清楚，而不是等 decode_capture 报一个「通道越界」让人猜。
@@ -703,7 +751,7 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
         } => {
             // 没有跨调用的采集存储（`Action::Capture` 的 store 是局部变量），
             // 所以测量必须自己先采一次 —— 与 `i2c` 同样复用 `capture_once`。
-            let capture = capture_once(&mut bus, samples, rate, level, timeout_ms)?;
+            let capture = capture_once(&mut bus, samples, rate, level, timeout_ms, false)?;
             let ch_count = capture.channels.len();
 
             let targets: Vec<usize> = match channel {
@@ -767,13 +815,21 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
 ///
 /// `capture` 与 `i2c` 两个动作共用 —— 采集逻辑只写一遍，
 /// 免得解码那条路上的分片处理与落盘那条路走出两个版本的 bug。
+///
+/// `quiet = true` 时跳过函数内部的打印 —— 连续采集的中间帧用，
+/// 只留最后一帧的摘要。
+///
+/// 错误保持 `ScopeError` 原样（core 的错误模型，本函数也只可能产生它）：
+/// 连续采集的失败行要用 [`scope_core::ScopeError::summary`]，裹成 `anyhow`
+/// 之后就只剩 Display 可打了。调用方照常 `?` 进 `anyhow::Result`。
 fn capture_once<D: DevicePort>(
     bus: &mut CommandBus<D>,
     samples: u16,
     rate: u32,
     level: u16,
     timeout_ms: u64,
-) -> Result<Capture> {
+    quiet: bool,
+) -> scope_core::Result<Capture> {
     bus.connect()?;
 
     // 采集编排在 core 里（`scope_core::acquire`）—— 它替我们处理了
@@ -786,6 +842,10 @@ fn capture_once<D: DevicePort>(
         timeout: std::time::Duration::from_millis(timeout_ms),
     };
     let capture = scope_core::acquire(bus, &params)?;
+
+    if quiet {
+        return Ok(capture);
+    }
 
     if capture.rate_hz != rate {
         println!(

@@ -61,11 +61,13 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
         let why = "设备已交给 AI —— 左侧控件停用是交接的必然，不是界面故障";
 
         let mut acq = ui.add_enabled(
-            connected && !busy && !driving,
+            connected && !busy && !driving && !app.continuous,
             egui::Button::new(acq_label(busy)),
         );
         if driving {
             acq = acq.on_disabled_hover_text(why);
+        } else if app.continuous {
+            acq = acq.on_disabled_hover_text("连续刷新已开启 —— 取消勾选即停，恢复单次采集");
         }
         if acq.clicked() {
             app.worker.send(Request::Acquire {
@@ -93,6 +95,24 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
             .clicked()
         {
             app.worker.send(Request::Reset);
+        }
+
+        // 连续刷新开关（docs/09 §8：默认关、出错即停、点数/采样率沿用当前设置）
+        let cont_resp = ui
+            .add_enabled_ui(connected, |ui| {
+                ui.checkbox(&mut app.continuous, "连续刷新")
+            })
+            .inner
+            .on_hover_text("采集一帧后立即采下一帧；出错自动停止。测直流或无信号时受 AUTO 模式 200 ms 超时限制（约 5 fps）")
+            .on_disabled_hover_text("连接设备后可用");
+        // 打开开关即发第一帧 —— 之后每帧回来由 Update::Acquired 自动续采
+        if cont_resp.clicked() && app.continuous && !busy {
+            app.worker.send(Request::Acquire {
+                samples: app.want_samples,
+                rate_hz: app.want_rate,
+                trigger_level_lsb: app.want_trigger_level,
+                timeout_ms: 2000,
+            });
         }
 
         ui.separator();

@@ -48,6 +48,10 @@ pub struct App {
     pub(crate) state: Option<State>,
     /// 是否已连接。
     pub(crate) connected: bool,
+    /// 「连续刷新」：收到一帧后立即采下一帧。默认关（docs/09 §8）。
+    /// 连续帧不进历史 —— store 只留最近 16 条（容量由 core 决定），
+    /// 30 fps 连跑几秒就会把用户手动采的记录全顶掉。
+    pub(crate) continuous: bool,
 
     // ── 期望配置（UI 意图，与真值分开）──
     /// 请求的采样率。
@@ -155,6 +159,7 @@ impl App {
             config: None,
             state: None,
             connected: false,
+            continuous: false,
 
             want_rate: scope_core::f103::MAX_SAMPLE_RATE_HZ,
             want_samples: 4096,
@@ -577,6 +582,9 @@ impl App {
             Update::Disconnected => {
                 self.note("已断开");
                 self.connected = false;
+                // 断开即复位开关 —— 否则迟到的 Acquired 回执会按开关
+                // 继续向一个已经不存在的连接发采集
+                self.continuous = false;
                 self.simulated = false;
                 self.info = None;
                 self.config = None;
@@ -623,9 +631,23 @@ impl App {
                     self.scl_channel = self.scl_channel.min(n - 1);
                     self.sda_channel = self.sda_channel.min(n - 1);
                 }
-                self.store.push(cap.clone());
+                // 连续帧不进历史 —— store 只留最近 16 条（容量由 core 决定），
+                // 30 fps 连跑几秒就会把用户手动采的记录全顶掉（docs/09 §8）。
+                if !self.continuous {
+                    self.store.push(cap.clone());
+                }
                 self.capture = Some(cap);
                 self.decode_dirty.store(true, Ordering::Relaxed);
+                // 连续刷新：收到一帧立即要下一帧。循环由 UI 线程驱动 ——
+                // 每收到一帧就再发一个 Acquire，worker 一行不改。
+                if self.continuous {
+                    self.worker.send(Request::Acquire {
+                        samples: self.want_samples,
+                        rate_hz: self.want_rate,
+                        trigger_level_lsb: self.want_trigger_level,
+                        timeout_ms: 2000,
+                    });
+                }
             }
 
             Update::StateChanged(s) => {
@@ -639,6 +661,11 @@ impl App {
             Update::Failed { text, hint } => {
                 self.note(format!("✗ {text}"));
                 self.last_error = Some((text, hint));
+                // 连续刷新的失败即停止循环 —— 不静默重试（docs/09 §8）。
+                if self.continuous {
+                    self.continuous = false;
+                    self.note("连续刷新已停止（上次采集失败）");
+                }
             }
         }
     }
