@@ -96,6 +96,13 @@ pub struct App {
     // ── UI 态 ──
     /// 正在进行的操作名。
     pub(crate) busy: Option<&'static str>,
+    /// 已发出、还没等到回执（`Acquired` / `Failed`）的 Acquire。
+    ///
+    /// 连续刷新的首帧发送用它做守卫，**不能用 `busy`**：`busy` 在
+    /// 「应用配置 / 复位」期间同样是 Some，而这两个操作成功只回
+    /// `ConfigApplied` / `StateChanged`，永远不会有 Acquired 来续采 ——
+    /// 拿 `busy` 守卫会把开关卡在「开着但什么都不采」。
+    pub(crate) acquire_in_flight: bool,
     /// 最后一次错误：`(说明, 怎么办)`。
     pub(crate) last_error: Option<(String, Option<String>)>,
     /// 滚动日志。
@@ -182,6 +189,7 @@ impl App {
             sda_channel: 1,
 
             busy: None,
+            acquire_in_flight: false,
             last_error: None,
             log: Vec::new(),
             font_notice: font.notice(),
@@ -266,6 +274,10 @@ impl App {
 
         // 停掉 --demo 自动机 —— 否则它会在 AI 跑的时候插一脚
         self.demo_stage = 3;
+
+        // 交接期间设备不在 GUI 手上：续采（或刚排队的那一发）会撞上断开，
+        // 报一条与事实不符的错误。连续刷新是「断开即停」的语义，这里先关。
+        self.continuous = false;
 
         self.note("设备交接：GUI 断开，释放串口");
         self.worker.send(Request::Disconnect);
@@ -605,6 +617,7 @@ impl App {
             }
 
             Update::Acquired(cap) => {
+                self.acquire_in_flight = false;
                 let cap = *cap;
                 let mut msg = format!(
                     "采集完成：{} 点 @ {} Hz（{:.3} ms）",
@@ -622,7 +635,10 @@ impl App {
                 // 这次采集成功了，上一次的错误就不再适用 —— 不清的话，
                 // 之前那条红字会一直挂在底栏
                 self.last_error = None;
-                self.fit_pending = true;
+                // 连续模式下**不重置视口**：每帧 reset 会把用户的滚轮缩放 /
+                // 拖拽清掉，等于连续跑起来就没法看细节。会话第一帧的适配
+                // 由勾选框打开时置的一次 `fit_pending` 负责。
+                self.fit_pending = !self.continuous;
 
                 // 通道数可能变少（比如从双通道场景切到单通道），
                 // 把通道选择夹回合法范围 —— 越界的话解码会直接报错。
@@ -641,6 +657,7 @@ impl App {
                 // 连续刷新：收到一帧立即要下一帧。循环由 UI 线程驱动 ——
                 // 每收到一帧就再发一个 Acquire，worker 一行不改。
                 if self.continuous {
+                    self.acquire_in_flight = true;
                     self.worker.send(Request::Acquire {
                         samples: self.want_samples,
                         rate_hz: self.want_rate,
@@ -659,6 +676,7 @@ impl App {
             }
 
             Update::Failed { text, hint } => {
+                self.acquire_in_flight = false;
                 self.note(format!("✗ {text}"));
                 self.last_error = Some((text, hint));
                 // 连续刷新的失败即停止循环 —— 不静默重试（docs/09 §8）。
@@ -772,6 +790,7 @@ impl eframe::App for App {
             // 连接失败就一直停在 1 —— 不重试，免得每帧刷屏
             1 if self.connected && !self.is_busy() => {
                 self.demo_stage = 2;
+                self.acquire_in_flight = true;
                 self.worker.send(Request::Acquire {
                     samples: self.want_samples,
                     rate_hz: self.want_rate,

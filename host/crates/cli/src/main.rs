@@ -144,6 +144,8 @@ enum Action {
         timeout_ms: u64,
 
         /// 连续采集 n 次并报告帧率（用于验证链路吞吐，不需要 GUI）。
+        ///
+        /// 任一帧失败即停；只要有过失败，摘要照打但退出码非 0。
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         continuous: u32,
 
@@ -553,6 +555,7 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
             // 失败即停 —— 与 GUI 的「连续刷新」同一语义（docs/09 §8）。
             let start = std::time::Instant::now();
             let mut ok: u32 = 0;
+            let mut overruns: u32 = 0;
             let mut last_err: Option<scope_core::ScopeError> = None;
             let mut capture: Option<Capture> = None;
             for i in 0..continuous {
@@ -560,6 +563,9 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
                 match capture_once(&mut bus, samples, rate, level, timeout_ms, quiet) {
                     Ok(c) => {
                         ok += 1;
+                        if c.overrun {
+                            overruns += 1;
+                        }
                         capture = Some(c);
                     }
                     Err(e) => {
@@ -569,12 +575,18 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
                 }
             }
             let elapsed = start.elapsed();
-            if ok > 0 {
-                println!(
-                    "# 连续采集 {ok}/{} 次成功，平均 {:.1} fps",
-                    continuous,
-                    ok as f64 / elapsed.as_secs_f64()
-                );
+            // 单次采集（默认）不打这行 —— 输出与从前逐字一致，fps 对 n=1 也没意义
+            if continuous > 1 && ok > 0 {
+                let fps = ok as f64 / elapsed.as_secs_f64();
+                // 溢出是链路健康的信号之一。quiet 把中间帧的溢出警告吞掉了，
+                // 所以这里按帧数补一个计数 —— 「验证吞吐」的入口不能漏掉它。
+                if overruns > 0 {
+                    println!(
+                        "# 连续采集 {ok}/{continuous} 次成功，平均 {fps:.1} fps，其中 {overruns} 帧溢出"
+                    );
+                } else {
+                    println!("# 连续采集 {ok}/{continuous} 次成功，平均 {fps:.1} fps");
+                }
             }
             if let Some(e) = &last_err {
                 // 用 `summary()` 而不是 Display —— 与 GUI / MCP 的显示纪律

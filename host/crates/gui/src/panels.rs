@@ -70,6 +70,7 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
             acq = acq.on_disabled_hover_text("连续刷新已开启 —— 取消勾选即停，恢复单次采集");
         }
         if acq.clicked() {
+            app.acquire_in_flight = true;
             app.worker.send(Request::Acquire {
                 samples: app.want_samples,
                 rate_hz: app.want_rate,
@@ -97,16 +98,26 @@ pub fn toolbar(app: &mut App, ui: &mut egui::Ui) {
             app.worker.send(Request::Reset);
         }
 
-        // 连续刷新开关（docs/09 §8：默认关、出错即停、点数/采样率沿用当前设置）
+        // 连续刷新开关（docs/09 §8：默认关、出错即停、点数/采样率沿用当前设置）。
+        // 交接期间与旁边的采集/复位按钮一样禁用 —— 那时设备不在 GUI 手上。
+        let cont_why = if driving { why } else { "连接设备后可用" };
         let cont_resp = ui
-            .add_enabled_ui(connected, |ui| {
+            .add_enabled_ui(connected && !driving, |ui| {
                 ui.checkbox(&mut app.continuous, "连续刷新")
             })
             .inner
             .on_hover_text("采集一帧后立即采下一帧；出错自动停止。测直流或无信号时受 AUTO 模式 200 ms 超时限制（约 5 fps）")
-            .on_disabled_hover_text("连接设备后可用");
-        // 打开开关即发第一帧 —— 之后每帧回来由 Update::Acquired 自动续采
-        if cont_resp.clicked() && app.continuous && !busy {
+            .on_disabled_hover_text(cont_why);
+        // 打开开关即发第一帧 —— 之后每帧回来由 Update::Acquired 自动续采。
+        // 守卫用 `acquire_in_flight` 而不是 `busy`：应用配置 / 复位期间
+        // `busy` 也是 Some，但那些操作只回 ConfigApplied / StateChanged，
+        // 不会有 Acquired 来接着续采，用它们守卫会把开关卡成「开着但不采」；
+        // 已经有一帧在途时不重发，那一帧的回执会自己接上循环。
+        if cont_resp.clicked() && app.continuous && !app.acquire_in_flight {
+            app.acquire_in_flight = true;
+            // 连续模式在 Update::Acquired 里不再每帧重置视口（否则一开连续
+            // 就没法缩放/平移），所以会话第一帧的适配由这里置一次。
+            app.fit_pending = true;
             app.worker.send(Request::Acquire {
                 samples: app.want_samples,
                 rate_hz: app.want_rate,
@@ -243,6 +254,9 @@ pub fn device(app: &mut App, ui: &mut egui::Ui) {
                 .on_disabled_hover_text("设备已交给 AI")
                 .clicked()
             {
+                // 先关连续刷新再断开 —— 顺序反了的话，在途的续采会排在
+                // Disconnect 之后，对着一个已断开的链路报错（docs/09 §8 断开即停）
+                app.continuous = false;
                 app.worker.send(Request::Disconnect);
             }
         } else if ui.add_enabled(!busy, egui::Button::new("连接")).clicked() {
