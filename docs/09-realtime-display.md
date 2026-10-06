@@ -51,8 +51,8 @@
 
 ### 3.1 波特率余量 2 倍
 
-- `Core/Src/usart.c` 的波特率硬编码为 921600
-- F103 的 USART1 挂 APB2 = 72 MHz；**2 Mbps 时 BRR = 36，整数、零误差**
+- 设备波特率由 `LINK_BAUD` 宏决定（默认 921600，`Core/Src/usart.c`）
+- F103 的 USART1 挂 APB2 = 72 MHz；**2 Mbps 时 USARTDIV = 2.25（= 2 + 4/16，可精确表示）→ BRR = 0x24 = 36，零误差**
 - CH340 系列（G/C/E）按数据手册支持至 2 Mbps
 - 上位机 `transport-serial` 的 `SerialDevice::open(port, baud, timeout)` 本就接受波特率参数，只需在常量表中增加一档
 

@@ -40,8 +40,10 @@ pub mod baud {
     pub const B_115200: u32 = 115_200;
     /// 推荐的默认档。
     pub const B_460800: u32 = 460_800;
-    /// CH340/CP2102 上通常能跑的最高档。**波形传输建议用这个。**
+    /// 通常能稳定跑的最高档（2 Mbps 一档须先实测，见下一档）。**波形传输建议用这个。**
     pub const B_921600: u32 = 921_600;
+    /// 2 Mbps：F103 侧 BRR=36 零误差。**必须与固件 `LINK_BAUD` 一致，且先实测。**
+    pub const B_2000000: u32 = 2_000_000;
 }
 
 /// 串口设备。
@@ -183,7 +185,12 @@ mod tests {
     #[test]
     fn baud_constants_are_sane() {
         // 用运行期取值比较，避免 clippy 把常量断言判成"恒真"
-        let rates = [baud::B_115200, baud::B_460800, baud::B_921600];
+        let rates = [
+            baud::B_115200,
+            baud::B_460800,
+            baud::B_921600,
+            baud::B_2000000,
+        ];
         assert!(
             rates.windows(2).all(|w| w[0] < w[1]),
             "波特率档位应递增: {rates:?}"

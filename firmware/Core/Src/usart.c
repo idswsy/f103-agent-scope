@@ -20,7 +20,15 @@ UART_HandleTypeDef huart1;
 void MX_USART1_UART_Init(void)
 {
     huart1.Instance = USART1;
-    huart1.Init.BaudRate = 921600;
+    /* 链路波特率。主机侧 `scope-cli serial --baud` 必须与它一致。
+     *
+     * 921600 是默认档；实测稳定后可切 2000000（USART1 挂 APB2=72 MHz，
+     * USARTDIV = 2.25（= 2 + 4/16，4 位小数部分可精确表示）→ BRR = 0x24 = 36，
+     * 零误差；CH340 系列按手册支持 2 Mbps）。
+     * ⚠ 2 Mbps 在杜邦线上是否可靠只能实测 —— 切换后必须先过
+     * docs/09 §4.2 的压测判据（连续 50 次 capture 无 CRC 错误）。 */
+#define LINK_BAUD 921600u
+    huart1.Init.BaudRate = LINK_BAUD;
     huart1.Init.WordLength = UART_WORDLENGTH_8B;
     huart1.Init.StopBits = UART_STOPBITS_1;
     huart1.Init.Parity = UART_PARITY_NONE;

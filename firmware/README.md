@@ -190,6 +190,12 @@ grep -rn '#include.*\(stm32\|hal_\|gd32\|HAL\)' firmware/App/ && exit 1 || exit 
 
 > 核心板**到底有没有**板载桥、以及外接模块的最高可靠波特率，均 `【待核实】`（见 [ADR-013](../docs/06-decisions.md)）。
 > ⚠ **不要同时给核心板 Type-C 与底板 Type-C 供电** —— 双路供电倒灌，见 `docs/02-hardware.md` §9。
+>
+> **链路波特率**由固件宏 `LINK_BAUD`（`Core/Src/usart.c`）决定，默认 **921600**，
+> 主机侧 `scope-cli serial --baud` 必须与它一致；实测稳定后可切 **2000000**
+> （USART1 挂 APB2 = 72 MHz，BRR = 36 为整数、零误差；CH340 系列按手册支持 2 Mbps）——
+> ⚠ **切换必须先实测**：过 `docs/09-realtime-display.md` §4.2 的压测判据（连续 50 次
+> capture 无 CRC 错误）。默认值暂不动。
 
 **无论是哪条，上层都用同一个 `App/proto_task.c`** —— 链路差异只在 `Hardware/link_*.c` 里。
 
