@@ -56,8 +56,9 @@ pub const RESULT_CHAR_CAP: usize = 12_000;
 /// 工具循环的轮数上限。与 `agent.py` 的 `MAX_TURNS` 一致。
 pub const MAX_TURNS: usize = 24;
 
-/// 回复长度上限。
-pub const MAX_TOKENS: u32 = 8192;
+// 回复长度上限**不在这里定义** —— 从前的回归正是「单发」与「驱动会话」
+// 各写一个值（2048 / 8192），没有任何东西守着它们不分家。
+// 唯一出处是 `crate::ai::MAX_TOKENS`，用之前先看那里的说明。
 
 /// 单次 MCP 请求的等待上限。
 ///
@@ -633,7 +634,7 @@ pub fn run_session(
     for turn in 0..MAX_TURNS {
         let body = json!({
             "model": job.cfg.model,
-            "max_tokens": MAX_TOKENS,
+            "max_tokens": crate::ai::MAX_TOKENS,
             // ⚠ **必须带 system**。回归：第一版这里没有它 —— 模型既不知道
             // 输出该收敛成什么形状，也不知道界面上的通道是 CH1/CH2，
             // 于是把接口的 0 起编号原样转述给了用户。
@@ -665,6 +666,23 @@ pub fn run_session(
                 .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
                 .collect::<Vec<_>>()
                 .join("\n");
+
+            // 「没有工具调用」也可能是**话没说完就没预算了**：整轮的 token
+            // 全烧在思考块上，正文与 tool_use 一个都没轮到。
+            //
+            // 不区分的话，这条路会以 `Finished { text: "" }` 收场，界面显示
+            // 「无分析结果」—— 与「模型认为没什么可说」长得一模一样，而两者
+            // 的处置完全相反（前者要缩短证据包重试，后者不必）。这一次会话
+            // 的钱已经花掉了，至少要让用户知道它为什么是空的。
+            if text.trim().is_empty()
+                && resp.get("stop_reason").and_then(|s| s.as_str()) == Some("max_tokens")
+            {
+                return Err(AiError::new(
+                    "会话在最后一轮用光了 token 预算，未留下任何结论".to_string(),
+                    "整个预算被思考块吃掉了。减少采集点数后重试，或把任务描述得更具体",
+                ));
+            }
+
             emit(DriveEvent::Finished {
                 text,
                 turns: turn + 1,

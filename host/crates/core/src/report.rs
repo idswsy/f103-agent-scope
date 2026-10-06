@@ -95,6 +95,7 @@ pub fn build_evidence(input: &EvidenceInput<'_>) -> String {
     config_section(&mut s, input.config);
     capture_section(&mut s, input.capture);
     channels_section(&mut s, input);
+    signal_section(&mut s, input);
     preview_section(&mut s, input.capture);
     decode_section(&mut s, input);
     footer_section(&mut s, input);
@@ -243,15 +244,221 @@ fn channels_section(s: &mut String, input: &EvidenceInput<'_>) {
             Some(r) => format!("{r:.1} ns"),
             None => "测不出（没有干净的边沿）".to_string(),
         };
-        let _ = writeln!(s, "     频率={freq}  占空比={duty}  上升时间={rise}");
+        let fall = match m.fall_ns {
+            Some(f) => format!("{f:.1} ns"),
+            None => "测不出（没有干净的边沿）".to_string(),
+        };
+        let over = match m.overshoot_pct {
+            Some(p) => format!("{p:.1} %"),
+            None => "测不出（无双电平参考）".to_string(),
+        };
+        let under = match m.undershoot_pct {
+            Some(p) => format!("{p:.1} %"),
+            None => "测不出（无双电平参考）".to_string(),
+        };
+        let high = match m.high_ns {
+            Some(h) => format!("{h:.1} ns"),
+            None => "测不出（没有高电平段）".to_string(),
+        };
+        let _ = writeln!(
+            s,
+            "     频率={freq}  占空比={duty}  上升/下降={rise}/{fall}",
+        );
+        let _ = writeln!(
+            s,
+            "     过冲/下冲={over}/{under}  高电平脉宽={high}  跃变数={}",
+            m.edges
+        );
     }
     if !any {
         let _ = writeln!(s, "（所有通道都测不出 —— 采集可能是空的）");
     }
     let _ = writeln!(
         s,
-        "注：频率与占空比已排除空闲段；上升时间受采样周期限制，分辨率约 1 个采样周期。"
+        "注：频率与占空比已排除空闲段；上升/下降时间受采样周期限制，分辨率约 1 个采样周期。\
+         过冲的参考电平是平台均值，不是全窗最大值。"
     );
+}
+
+/// 波形形状 —— **工具自动判断，不是实测**。
+///
+/// # 三条纪律
+///
+/// 1. **表头必须声明这是推断**：分类会作为「事实」进提示词，不标出处的话，
+///    模型会把它当实测转述，而用户无从核对。
+/// 2. **每个判断必须带依据**（门限、数值、参与计算的 n）。判错了读者要能
+///    一眼看出来：数字贴着门限 = 边际薄；数字与标签矛盾 = 判错了。
+/// 3. **判不出的要如实说判不出 + 原因** —— 所有措辞是「本工具边界」句式
+///    （「未检出」「低于门限」），不是「信号有缺陷」。
+///
+/// 分类与证据全部来自 [`crate::signal::classify`]，本函数只格式化。
+fn signal_section(s: &mut String, input: &EvidenceInput<'_>) {
+    let _ = writeln!(s);
+    let _ = writeln!(
+        s,
+        "== 波形形状（工具自动判断，不是实测；依据与判断冲突时以依据为准）=="
+    );
+
+    let mut any = false;
+    for ch in 0..input.capture.channels.len() {
+        let name = channel_label(ch);
+        let Some(c) = crate::signal::classify(input.capture, ch) else {
+            let _ = writeln!(s, "{name}: 判不出（通道无数据）");
+            continue;
+        };
+        any = true;
+        let _ = writeln!(s, "{name}: {}", kind_line(&c));
+    }
+    if !any {
+        let _ = writeln!(s, "（没有可判的通道）");
+    }
+}
+
+/// 一条通道的分类行：`判成了什么 + 依据`。
+///
+/// 依据只印**判定路径上真正用过**的两三项 —— 全印出来一行会超预算，
+/// 而模型只需要知道「这个判断有多少证据撑着」。
+fn kind_line(c: &crate::signal::Classification) -> String {
+    use crate::signal::SignalKind;
+
+    let ev = &c.evidence;
+    let levels = &ev.levels;
+
+    // 双电平判定的公共依据（只在判定成立时印 —— 判不出路径上的
+    // occupancy 是占位值，印出去就是编造的数字）
+    let two_level = |extra: &str| {
+        format!(
+            "双电平占用率={:.2}(≥0.70)  Vlo={:.0}/Vhi={:.0} LSB{}",
+            levels.occupancy, levels.vlo_lsb, levels.vhi_lsb, extra
+        )
+    };
+    let gap_part = |g: &crate::signal::GapStats| format!("间隔cv={:.2}(≤0.10,n={})", g.cv, g.kept);
+
+    match c.kind {
+        SignalKind::Dc => format!(
+            "直流  依据: AC-RMS={:.1}(≤4.6 LSB)  峰峰={} LSB",
+            ev.ac_rms_lsb, ev.pp_lsb
+        ),
+        SignalKind::Square => {
+            let duty = ev.duty_pct.unwrap_or(50.0);
+            let g = ev.gaps.as_ref().map(gap_part).unwrap_or_default();
+            format!(
+                "方波  依据: {}  占空比={duty:.1}%(25–75)  {}",
+                two_level(""),
+                g
+            )
+        }
+        SignalKind::Pulse => {
+            let duty = ev
+                .duty_pct
+                .map(|d| format!("{d:.1}%"))
+                .unwrap_or_else(|| "测不出".into());
+            let g = ev.gaps.as_ref().map(gap_part).unwrap_or_default();
+            format!(
+                "脉冲  依据: {}  占空比={duty}(25–75 之外)  {g}",
+                two_level("")
+            )
+        }
+        SignalKind::Step => {
+            let over = ev
+                .overshoot_pct
+                .map(|p| format!("过冲={p:.1}%"))
+                .unwrap_or_default();
+            format!(
+                "阶跃响应  依据: 沿={}升/{}降(实测中点)  {}  {over}",
+                ev.rising,
+                ev.falling,
+                two_level("")
+            )
+        }
+        SignalKind::Sine => {
+            let ff = ev.form_factor.unwrap_or(0.0);
+            let g = ev.gaps.as_ref().map(gap_part).unwrap_or_default();
+            let am = match ev.seg_var {
+                Some(v) => format!("调幅检查已做: 滑窗起伏={v:.2}(≤0.25)"),
+                None => "调幅检查未做(窗数不足)".to_string(),
+            };
+            format!("正弦  依据: 波形因数={ff:.3}(0.354±0.045)  {g}  {am}")
+        }
+        SignalKind::Am => {
+            let sv = ev.seg_var.unwrap_or(0.0);
+            format!("调幅  依据: 滑窗起伏={sv:.2}(>0.25)")
+        }
+        SignalKind::Noise => format!("噪声  依据: 上升沿={}(≥8)  未检出稳定周期", ev.rising),
+        SignalKind::Unknown(reason) => unknown_line(reason, &c.evidence),
+    }
+}
+
+/// 判不出时的一行 —— 措辞必须让用户知道「这是工具的边界，不是信号坏了」。
+fn unknown_line(
+    reason: crate::signal::UncertainReason,
+    ev: &crate::signal::ShapeEvidence,
+) -> String {
+    use crate::signal::UncertainReason::*;
+    let head = |name: &str| format!("判不出·{name}");
+    match reason {
+        TooFewSamples => format!(
+            "{}  依据: 实际 {} 点，低于判定下限 16 点 —— 加大采集点数后重判",
+            head("样点不足"),
+            ev.n
+        ),
+        TooSmallAmplitude => format!(
+            "{}  依据: 峰峰 {} LSB，低于形状判定门限 256 LSB —— 此幅度以下不出形状结论",
+            head("幅度太小"),
+            ev.pp_lsb
+        ),
+        NoPeriodicity => format!(
+            "{}  依据: 上升沿 {} 个，判定需 ≥4（未检出不等于没有）",
+            head("未检出稳定周期"),
+            ev.rising
+        ),
+        IntervalUnstable => {
+            let g = ev
+                .gaps
+                .as_ref()
+                .map(|g| format!("间隔cv={:.2}(>0.10,n={})", g.cv, g.kept))
+                .unwrap_or_default();
+            format!(
+                "{}  依据: {} —— 数据/突发信号属正常，不按周期波形归类",
+                head("边沿间隔不固定"),
+                g
+            )
+        }
+        FrequencyDrift => {
+            let d = ev
+                .gaps
+                .as_ref()
+                .map(|g| format!("前后段周期差 {:.0}%(>15%)", g.drift * 100.0))
+                .unwrap_or_default();
+            format!(
+                "{}  依据: {} —— 扫频/变频出现这条是预期行为，不是故障",
+                head("窗内频率漂移"),
+                d
+            )
+        }
+        Aliased => {
+            let p = ev
+                .period_samples
+                .map(|p| format!("{p:.1} 样点(下限 3)"))
+                .unwrap_or_default();
+            format!(
+                "{}  依据: 周期仅 {} —— 采样密度不足，看到的形状不代表真实波形",
+                head("采样密度不足"),
+                p
+            )
+        }
+        ShapeUnrecognized => {
+            let ff = ev
+                .form_factor
+                .map(|f| format!("波形因数={f:.3}"))
+                .unwrap_or_default();
+            format!(
+                "{}  依据: {} —— 本工具只判方波/脉冲/正弦/调幅/阶跃/噪声",
+                head("形状不在可判范围"),
+                ff
+            )
+        }
+    }
 }
 
 /// 波形包络。**必须写明「桶内细节不可见」**，否则模型会对着 128 个数编形状。
@@ -293,17 +500,26 @@ fn preview_section(s: &mut String, cap: &Capture) {
     }
 }
 
-/// I2C 解码结果 —— 帧表 + **未过滤的**告警原文。
+/// 总线解码结果 —— 帧表 + **未过滤的**告警原文。
 ///
 /// 段首声明**场景**（有解码 / 无解码），供模型选择分析分支。
 /// 场景是**分类**，不是重算 —— 数据里本来就知道的事。
+///
+/// # 段名为什么不是「I2C 解码」
+///
+/// 2026-10-06 真机回归：屏幕上给一个 2 kHz 方波，模型的三段回答里两段在讲
+/// 「缺 SDA，I2C 解码做不了」—— 而段名写着「I2C 解码」、无解码时还要求
+/// 模型解释为什么解不出来，注意力被整个钉在 I2C 上。段名改成「总线解码」，
+/// 无解码时**一句话带过**，波形本身的分析交给上一段（波形形状 / 测量）。
 fn decode_section(s: &mut String, input: &EvidenceInput<'_>) {
     let _ = writeln!(s);
-    let _ = writeln!(s, "== I2C 解码 ==");
+    let _ = writeln!(s, "== 总线解码 ==");
 
     let Some(d) = input.decode else {
-        let _ = writeln!(s, "场景: 模拟信号（无总线解码）—— 按波形质量分析");
-        let _ = writeln!(s, "（没有解码结果 —— 通道数不足 2，或还没解码）");
+        // 「场景」行不能没有 —— 它是模型选分析分支的依据（提示词里同名）。
+        // 但**不再要求解释为什么解不出来**：非 I2C 波形没有解码结果就是
+        // 正常状态，不是故障；原因栏只会把模型拉回 I2C 那一套。
+        let _ = writeln!(s, "场景: 模拟信号（无总线解码）");
         return;
     };
 
@@ -1155,6 +1371,83 @@ mod tests {
         );
     }
 
+    // ── 波形形状段（2026-10-06 新增）─────────────────────────────────
+
+    /// 每个通道都有一行分类，且**必须带依据**。
+    ///
+    /// 分类会作为「事实」进提示词 —— 不带依据的话，判错了谁也看不出来。
+    ///
+    /// 变异（杀掉）：`kind_line` 只印标签不印依据 —— 这条的「依据」断言红。
+    #[test]
+    fn every_channel_gets_a_classification_with_evidence() {
+        let cap = flat_capture();
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
+        let text = build_evidence(&input(&cap, &scale));
+        assert!(text.contains("== 波形形状"), "证据包必须有波形形状段");
+        assert!(text.contains("CH1: "), "每个通道都要有一行分类");
+        assert!(
+            text.contains("依据:"),
+            "分类必须带依据 —— 判错了读者要能一眼看出来"
+        );
+        assert!(
+            text.contains("工具自动判断，不是实测"),
+            "表头必须声明这是推断，不是实测"
+        );
+    }
+
+    /// 判不出时，原因必须带着**数字**（实际值 vs 门限）。
+    ///
+    /// 变异（杀掉）：把 `unknown_line` 里的数值格式删成纯文字 —— 这条红。
+    #[test]
+    fn an_unknown_verdict_names_the_number_and_the_limit() {
+        // 平线 → Dc 是可判的；这里用 2 个样点逼出「样点不足」
+        let mut cap = Capture::new(1, 857_142, 1, 2);
+        cap.channels = vec![vec![2048, 2049]];
+        let scale = ScaleSet::uncalibrated(1);
+        let text = build_evidence(&input(&cap, &scale));
+        assert!(
+            text.contains("判不出·样点不足"),
+            "必须用「判不出」句式而不是「异常」"
+        );
+        assert!(
+            text.contains("实际 2 点") && text.contains("16 点"),
+            "原因要带实际值与门限：{text}"
+        );
+    }
+
+    /// 形状段要有**尺寸刻度尺** —— 它每轮都跟着证据包一起发。
+    ///
+    /// 变异：某一行把全部证据都印上（没有「只印两三样」的约束）——
+    /// 这条的尺寸断言红。
+    #[test]
+    fn the_signal_section_stays_within_its_budget() {
+        let cap = i2c_capture(true);
+        let scale = ScaleSet::uncalibrated(cap.channels.len());
+        let d = decode_capture(&cap, &I2cDecodeConfig::default()).unwrap();
+        let cfg = I2cDecodeConfig::default();
+        let mut i = input(&cap, &scale);
+        i.decode = Some(&d);
+        i.decode_cfg = Some(&cfg);
+        let text = build_evidence(&i);
+
+        let marker = "== 波形形状";
+        let next = "== 波形包络";
+        let start = text.find(marker).expect("形状段必须存在");
+        let end = text.find(next).expect("包络段必须存在");
+        let section: String = text[start..end].to_string();
+        let per_channel = section.chars().count() / cap.channels.len().max(1);
+        println!(
+            "形状段共 {} 字符（{} 通道，每通道约 {}）",
+            section.chars().count(),
+            cap.channels.len(),
+            per_channel
+        );
+        assert!(
+            per_channel < 140,
+            "每通道分类行 {per_channel} 字符 —— 依据印得太多了"
+        );
+    }
+
     // ── 桶数的**真实**上界 ───────────────────────────────────────────
 
     /// 桶数是「约」PREVIEW_POINTS，不是「最多」。
@@ -1299,14 +1592,26 @@ mod tests {
 
     // ── 没解码时也要说得清 ───────────────────────────────────────────
 
+    /// **段不能凭空消失，但不再要求解释「为什么解不出来」。**
+    ///
+    /// 2026-10-06 真机回归：无解码时要求解释原因，把模型的整段回答拉回了
+    /// I2C（「缺 SDA，解码做不了」）—— 而非 I2C 波形没有解码结果就是
+    /// 正常状态。新契约：场景行必须声明「无总线解码」，但**不再印原因**。
+    ///
+    /// 变异（杀掉）：把「没有解码结果 —— 通道数不足 2」那句加回来 ——
+    /// 这条的第二个断言红。
     #[test]
-    fn missing_decode_explains_itself() {
+    fn missing_decode_declares_the_scene_without_explaining_itself() {
         let cap = flat_capture(); // 只有 1 个真通道有数据，且没解
         let scale = ScaleSet::uncalibrated(cap.channels.len());
         let text = build_evidence(&input(&cap, &scale));
         assert!(
-            text.contains("没有解码结果"),
-            "没解码就要说没解码，不能整段消失"
+            text.contains("场景: 模拟信号（无总线解码）"),
+            "场景行必须声明无解码 —— 它是模型选分支的依据"
+        );
+        assert!(
+            !text.contains("没有解码结果 —— 通道数不足 2"),
+            "不要再向模型解释为什么解不出来 —— 那是它跑偏的入口"
         );
     }
 
