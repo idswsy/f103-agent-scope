@@ -273,9 +273,21 @@ acq_event_t acq_poll(acq_t *a, acq_out_t *out)
             }
         }
 
-        /* 溢出：还没收尾，而已经推进的样点超过了环能装下的量 ——
-         * 最早那些已经被 DMA 覆盖掉了，这份采集不再完整。 */
-        if (!a->overrun && a->total_samples > ACQ_RING_SAMPLES) {
+        /* 溢出：**只在已经触发之后**才计数。
+         *
+         * 触发之前环的回绕是「滚动等待」—— 尤其 AUTO 模式在静默总线上
+         * 要滚满 200 ms（≈ 17 万个样点），那**不是故障**：交付的窗口
+         * 本来就是「最后 N 个样点」，环里最新的就是它们，一个都没丢。
+         * 但触发之后，预触发窗（trigger_at 之前的样点）还在环里等着
+         * 凑后置窗，此时回绕会**真的把触发上下文覆盖掉** —— 那份数据
+         * 确实不完整，必须如实标 INVALID。
+         *
+         * 2026-10-06 真机回归：连续刷新在无信号时每帧都报「溢出」，
+         * 根因就是这里把滚动等待也当成了故障；而且 `overrun_samples`
+         * 健康计数器被每次静默采集污染几百万点，「三个计数器为 0」
+         * 的连通性闸门永远过不了。 */
+        if (a->trigger_at != ACQ_NO_TRIGGER && !a->overrun &&
+            a->total_samples > ACQ_RING_SAMPLES) {
             uint32_t lost = a->total_samples - ACQ_RING_SAMPLES;
             a->overrun = true;
             a->overrun_samples += lost;

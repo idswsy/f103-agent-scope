@@ -303,6 +303,88 @@ static void case_auto_mode_forces_completion(void)
     }
 }
 
+static void case_auto_rolling_wait_is_not_an_overrun(void)
+{
+    GROUP("AUTO 滚动等待不是溢出（真机回归）");
+
+    mock_reset();
+    acq_t a;
+    acq_init(&a, &MOCK);
+    acq_out_t out;
+
+    set_acq_req_t acq_req = {.mode = ACQ_MODE_SINGLE,
+                             .capture_samples = 1024,
+                             .format = FMT_RAW16,
+                             .decimation = 1};
+    acq_set_acq(&a, &acq_req);
+    set_trigger_req_t tr = {.mode = TRIG_MODE_AUTO,
+                            .source = TRIG_SRC_CH1,
+                            .edge = TRIG_EDGE_RISING,
+                            .level_lsb = 2048,
+                            .pre_samples = 512,
+                            .holdoff_us = 1000};
+    acq_set_trigger(&a, &tr);
+    acq_arm(&a);
+
+    /* 静默总线：滚过 3 个半区（6144 样点 > 环的 4096）——
+     * 真机上这就是 AUTO 模式无信号的 200 ms（约 17 万个样点）。
+     * 2026-10-06 真机回归：这段滚动曾被当成「溢出」，
+     * 每帧都标 INVALID，健康计数器被污染几百万点。 */
+    feed(gen_flat_low);
+    CHECK(pump(&a, &out, 4) == ACQ_EV_NONE, "还没超时，不该完成");
+    feed(gen_flat_low);
+    CHECK(pump(&a, &out, 4) == ACQ_EV_NONE, "环回绕（滚动等待）不该报溢出");
+    feed(gen_flat_low);
+    CHECK(pump(&a, &out, 4) == ACQ_EV_NONE, "同上");
+
+    g_ms += ACQ_AUTO_TIMEOUT_MS;
+    CHECK(pump(&a, &out, 8) == ACQ_EV_TRIGGERED, "超时应强制完成");
+    CHECK(!a.overrun,
+          "滚动等待的窗口是「最后 N 个样点」，完整无缺 —— 不该标溢出");
+    CHECK(a.capture_ready, "交付的窗口应当可用");
+}
+
+static void case_late_trigger_overwrites_pretrigger_window(void)
+{
+    GROUP("触发过晚 → 预触发窗被覆盖，如实标溢出");
+
+    mock_reset();
+    acq_t a;
+    acq_init(&a, &MOCK);
+    acq_out_t out;
+
+    set_acq_req_t acq_req = {.mode = ACQ_MODE_SINGLE,
+                             .capture_samples = 4096,
+                             .format = FMT_RAW16,
+                             .decimation = 1};
+    acq_set_acq(&a, &acq_req);
+    set_trigger_req_t tr = {.mode = TRIG_MODE_NORMAL,
+                            .source = TRIG_SRC_CH1,
+                            .edge = TRIG_EDGE_RISING,
+                            .level_lsb = 2048,
+                            .pre_samples = 2048,
+                            .holdoff_us = 1000};
+    acq_set_trigger(&a, &tr);
+    acq_arm(&a);
+
+    feed(gen_flat_low);   /* 半区 0，无触发 */
+    CHECK(pump(&a, &out, 4) == ACQ_EV_NONE, "还没触发");
+    feed(gen_flat_low);   /* 半区 1，无触发 */
+    CHECK(pump(&a, &out, 4) == ACQ_EV_NONE, "同上");
+    feed(gen_step_up);    /* 半区 2：T = 5120 触发 */
+    /* need = 5120 + 2048(后置) + 512(余量) = 7680；
+     * 此刻 total = 6144 < need，且环（4096）已回绕 —— 预触发窗在丢 */
+    {
+        acq_event_t e = pump(&a, &out, 4);
+        CHECK(e == ACQ_EV_OVERRUN, "触发后环已回绕，应报溢出（拿到 %d）", (int)e);
+        CHECK(a.overrun, "溢出标志应当置位");
+    }
+
+    feed(gen_flat_high);  /* 半区 3：凑够后置窗 */
+    CHECK(pump(&a, &out, 4) == ACQ_EV_TRIGGERED, "应当完成");
+    CHECK(a.overrun, "完成后溢出标志仍在 —— 主机据此把分片标 INVALID");
+}
+
 static void case_stop_is_always_allowed(void)
 {
     GROUP("STOP 任何时候都允许");
@@ -475,6 +557,8 @@ int main(void)
     case_already_high_never_triggers();
     case_trigger_spanning_two_halves();
     case_auto_mode_forces_completion();
+    case_auto_rolling_wait_is_not_an_overrun();
+    case_late_trigger_overwrites_pretrigger_window();
     case_stop_is_always_allowed();
     case_config_rejected_while_armed();
     case_bad_params_rejected();
