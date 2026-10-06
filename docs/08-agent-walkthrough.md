@@ -518,6 +518,11 @@
 > **不必去读那句中文**。
 >
 > 标定表见 [`host/crates/core/src/calib.rs`](../host/crates/core/src/calib.rs)
+>
+> **2026-10-06 补注**：`scope_measure` 的响应还多了五个指标
+> （`fall_ns` / `overshoot_pct` / `undershoot_pct` / `high_ns` / `edges`），
+> 经 `metrics` 参数按需请求，不请求不返回 —— 上面这段 JSON 是请求
+> `["vpp","freq","duty","rise"]` 时的原样记录，字段集不再完整。
 > 与 [`05-roadmap.md`](05-roadmap.md) 的 P1。
 
 **调用** `scope_list_captures`
@@ -693,6 +698,11 @@
 …（略）
 ```
 </details>
+
+> **2026-10-06 补注**：上面这段 `scope_capture` 响应是**原样记录，不改写**。
+> 通道摘要现在多了 `fall_ns` / `overshoot_pct` / `undershoot_pct` / `high_ns`
+> 与 `edges_mid`（实测中点处的跃变数，与 `rising_edges` 那个固定 2048 LSB
+> 的计数器**不同源**）—— 上面这段 JSON 的字段集不再完整。
 
 ### 第 8 轮（1.8s）
 

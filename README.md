@@ -64,7 +64,8 @@ I2C 解码的瓶颈是边沿时间精度，不是采样率。857 kSPS 的 ADC �
 | I2C 解码 | **100 kHz / 400 kHz / 1 MHz 全部可靠**（数字通路） | 时序合规性验证（t<sub>SU;DAT</sub> / t<sub>r</sub> 的 ns 级判定） |
 | 模拟带宽 | ≤ 100 kHz 保证 | > 0.5 MHz |
 | 上传 | 单次 8 KB：USB 约 12 ms / UART 921600 约 91 ms | 1.71 MB/s 原始数据连续流 |
-| 测量 | Vpp / 频率 / 占空比 / RMS（定点） | THD / SFDR / ENOB；12 bit 绝对精度 |
+| 测量 | Vpp / 频率 / 占空比 / RMS / 上升与下降时间 / 过冲与下冲 / 高电平脉宽 / 边沿数（定点） | THD / SFDR / ENOB；12 bit 绝对精度 |
+| 波形分类 | 直流 / 方波 / 脉冲 / 阶跃响应 / 正弦 / 调幅 / 噪声。判不出时给出**原因**（未检出周期、采样密度不足…），不硬猜 | 三角 / 锯齿（波形因数与正弦只差 0.065，要 rise/fall 不对称才能分开）；抖动（857 kSPS 下测不出） |
 | 量程切换 | — | 自动量程（SW2/SW3 为机械开关，见 7.3 节） |
 
 > 采样率上限为 857.14 kSPS，**不得写作 1 MSPS**。推导：PCLK2 = 72 MHz 时
@@ -117,8 +118,8 @@ I2C 解码的瓶颈是边沿时间精度，不是采样率。857 kSPS 的 ADC �
 
 ```
 F103/
-├─ docs/          设计文档 00~08（起源 / 架构 / 硬件 / 协议 / 性能边界 /
-│                 路线图 / 决策记录 / 开发环境 / Agent 工作流实录）
+├─ docs/          设计文档 00~09（起源 / 架构 / 硬件 / 协议 / 性能边界 /
+│                 路线图 / 决策记录 / 开发环境 / Agent 工作流实录 / 实时显示）
 ├─ proto/         协议唯一真相源：C 头文件 + 纯 C 编解码 + 双端共用的黄金测试向量
 ├─ firmware/      STM32F103 固件（C，分层 App/Hardware）
 ├─ host/          Rust workspace，8 个 crate：
@@ -165,6 +166,10 @@ F103/
 ./host/run.sh run -p scope-cli -- sim capture --scenario i2c_100k -n 2048 -o i2c.csv
 ./host/run.sh run -p scope-cli -- sim i2c --scenario i2c_100k -n 4096
 
+# 3b. 非 I2C 波形（共 15 个场景）：PWM 占空比 / 阶跃响应（过冲+振铃）/ RC / UART
+./host/run.sh run -p scope-cli -- measure --scenario pwm_1k_25
+./host/run.sh run -p scope-cli -- measure --scenario step_ring
+
 # 4. MCP 工具链自检
 ./host/run.sh run -p scope-mcp -- --selftest
 ```
@@ -173,6 +178,35 @@ F103/
 seq 去重缓存，以及 6 个故障注入字段（丢帧 / CRC 错 / 延迟尖峰概率 / 尖峰时长 /
 永不触发 / 强制溢出）。CLI、GUI、MCP 切至 `sim` 后 Agent 逻辑无需改动。
 模拟器不按波特率节流；链路的实际速率只影响命令层的超时估算。
+
+**模拟器场景（15 个）**
+
+`--scenario <名称>` 的取值。场景名同时是 CLI 参数、MCP schema 的 `sim_scenario`
+枚举、GUI 下拉项与证据包里的链路描述 —— 同一份清单，三处不手抄。
+
+| 名称 | 波形 | 用途 |
+|---|---|---|
+| `sine_1k_3v3` | 1 kHz 正弦，3.3 Vpp | 最基本的「能看到东西」 |
+| `square_50k` | 50 kHz 方波 | 高频下的混叠与边沿 |
+| `pulse_glitch` | 带单样点毛刺的脉冲串 | minmax 预览是否保住尖峰 |
+| `noise` | 白噪声 | 质量标志与「不要回垃圾数」 |
+| `dc` | 纯直流 | FORCE_TRIGGER 与 auto 模式 |
+| `am` | 20 kHz 载波 / 200 Hz 包络调幅 | RMS / 包络类测量 |
+| `i2c_100k` | 100 kHz I2C（SCL + SDA，**双通道**） | 解码器回归的主场景 |
+| `i2c_400k` | 400 kHz I2C（双通道） | 「模拟通路解不了、数字通路能解」的边界 |
+| `i2c_nack` | 含一个 NACK 的 I2C 总线（双通道） | 验收场景「告诉我为什么 NACK」 |
+| `pwm_1k_25` | 1 kHz、25% 方波 | 占空比测量（偏离 50% 才有意义） |
+| `pwm_1k_75` | 1 kHz、75% 方波 | 上一条的镜像：只测窄脉冲抓不到「100−duty」这类错 |
+| `pwm_1k_5` | 1 kHz、5% 窄脉冲 | 双电平检测最危险的退化情形（平台样点数差 19 倍） |
+| `step_ring` | 500 Hz 设定方波经二阶欠阻尼系统 | **PID / 控制系统**：过冲 ≈31%、12 kHz 衰减振铃 |
+| `rc_charge` | 一阶 RC，τ = 150 µs | 指数曲线；同时验证「不是方波就别硬叫方波」 |
+| `uart_115k` | 115200 baud，三字节循环 + 空闲位 | 数字时序但非 I2C；帧边界在波形上可见 |
+
+> `step_ring` 的过冲是 `exp(-πζ/√(1-ζ²))` 在 ζ = 0.35 下的值 —— 场景文档、
+> 实现与测试断言引用的是同一个解析式，不是互相抄。
+>
+> ⚠ 857.14 kSPS 采样下 `uart_115k` 每位只有 **7.4 个样点**：波形看得见，脉宽
+> 与边沿时间都被采样分辨率卡住，读数只当相对量看。
 
 ### 5.2 桌面 GUI
 
@@ -191,9 +225,11 @@ AI 分析、故障注入、日志、帮助。
 | 参数 | 作用 |
 |---|---|
 | `--demo` | 免交互启动并采集一帧 |
+| `--demo-cont` | `--demo` 的加强版：采完第一帧后打开「连续刷新」（脚本验证交互用） |
 | `--scenario <名称>` | 指定初始场景 |
 | `--font <路径>` | 指定中文字体 |
 | `--drive "<需求>"` | 无窗口启动一次 AI 自采集会话，见 5.4.4 节 |
+| `--port <串口>` | 仅与 `--drive` 联用：把会话的目标从模拟器换成真机 |
 
 ### 5.3 连接实机
 
@@ -261,14 +297,22 @@ python tools/agent_demo/agent.py
 #### 5.4.3 GUI「AI 分析」面板
 
 将当前采集**已经算好的**证据（链路与设备信息、配置回显、采集统计、通道测量、
-32 桶 minmax 包络、I2C 帧表与信号质量）发送至语言模型，结论直接显示在界面上。
-证据包由 `scope_core::report::build_evidence` 生成，只转述 `scope_core::measure`
-与解码器的计算结果，不含原始样点数组；上限 8000 字符、64 帧。
+**信号分类**、32 桶 minmax 包络、总线解码帧表与信号质量）发送至语言模型，
+结论直接显示在界面上。证据包由 `scope_core::report::build_evidence` 生成，
+只转述 `scope_core::measure`、`scope_core::signal` 与解码器的计算结果，
+不含原始样点数组；上限 8000 字符、64 帧。
+
+信号分类（`core/src/signal.rs`）是 2026-10-06 加入的：直流 / 方波 / 脉冲 /
+阶跃响应 / 正弦 / 调幅 / 噪声，判不出时给出**原因**（「未检出稳定周期」、
+「采样密度不足」…），不硬猜。AI 按「场景」行与「波形形状」段选分析分支，
+非 I2C 波形（PWM、PID 阶跃响应）有专门的诊断指引。
 
 请求格式为 Anthropic Messages 格式，经 HTTPS 单发。配置存于用户配置目录
 （Windows：`%APPDATA%\scope-gui\config.json`），**密钥为明文存储**。
 默认端点为 `api.deepseek.com/anthropic/v1/messages`，默认模型 `deepseek-flash`。
-分析在独立线程执行，连接超时 10 s、总超时 60 s、`max_tokens` 2048。
+分析在独立线程执行，连接超时 10 s、总超时 60 s、`max_tokens` 8192
+（与 §5.4.4 的会话**共用同一个常量** —— 两处曾经各写一个值，见下）。
+响应被服务端按 `max_tokens` 截断时，结论照常显示，但上方会标出「内容不完整」。
 
 #### 5.4.4 GUI「交给 AI 采集」
 
@@ -281,7 +325,7 @@ python tools/agent_demo/agent.py
 | 参数 | 取值 |
 |---|---|
 | 工具循环上限 | 24 轮 |
-| 单次模型请求 | 8192 tokens |
+| 单次模型请求 | 8192 tokens（与 §5.4.3 共用同一常量） |
 | 单条工具结果上限 | 12000 字符（超出时带说明截断） |
 | LLM 超时 | 180 s |
 | JSON-RPC 超时 | 30 s |
@@ -365,20 +409,17 @@ SW2（AC/DC 耦合）与 SW3（X1/X50 衰减）为手拨开关，AI 与固件均
 
 ## 8 许可与致谢
 
-本项目的硬件设计基于以下上游开源工程；固件侧的上游参考在引入代码时生效。
+本项目的硬件设计基于以下上游开源工程。
 
 **表 8. 上游来源与许可**
 
 | 上游 | 内容 | 许可 |
 |---|---|---|
 | [立创开源《简易数字示波器设计（入门版）》](https://oshwhub.com/course-examples/yi-qi-yi-biao-jian-yi-shu-zi-shi-bo-qi-she-ji-cha-jian-ban) | 硬件设计（原理图 / PCB） | **GPL-3.0** |
-| [chen11232/GD32E230-Oscilloscope](https://gitee.com/chen11232/GD32E230-Oscilloscope) | 固件参考资料（外设驱动层）；含 `STM32版本` 分支 | **MulanPSL-2.0** |
 
 - 硬件部分为上游设计的修改版本，按 GPL-3.0 发布。
-- 上游固件代码**尚未引入**：`firmware/App/` 四个模块为本项目自研，
-  `firmware/Hardware/` 尚未创建。引入或改写后，相关文件须保留 MulanPSL-2.0
-  声明，见 [`NOTICE.md`](NOTICE.md) §2。
 - 上游页面明文禁止商业性使用。
-- 本仓库整体以 GPL-3.0 发布，见 [`LICENSE`](LICENSE) 与 [`NOTICE.md`](NOTICE.md)。
+- 本仓库整体以 GPL-3.0 发布，见 [`LICENSE`](LICENSE)。
+- 固件中外设驱动层的来源另见 [`NOTICE.md`](NOTICE.md) §2。
 
-致谢：立创开源硬件平台、立创EDA-莫工、EDA课程案例团队、chenlong。
+致谢：立创开源硬件平台、立创EDA-莫工、EDA课程案例团队。
