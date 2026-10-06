@@ -27,6 +27,9 @@ static uint8_t g_rx[512];
 static uint32_t g_rx_len;
 static uint32_t g_ms;
 static uint32_t g_tick;
+/* 已发布的半区（ACQ_HALF_FIRST / SECOND），由 acq_poll 领取。
+ * 与 test_acq.c 的 g_pub 同一套路 —— 采集状态机只认**发布过**的半区。 */
+static uint8_t g_pub;
 
 static void m_write(const uint8_t *d, uint32_t n)
 {
@@ -57,7 +60,12 @@ static uint32_t m_quantize(uint32_t hz)
 static void m_start(uint32_t hz) { (void)hz; }
 static void m_stop(uint32_t extra) { (void)extra; }
 static const uint16_t *m_ring(void) { return g_ring; }
-static uint8_t m_take(void) { return 0; }
+static uint8_t m_take(void)
+{
+    uint8_t v = g_pub;
+    g_pub = 0;
+    return v;
+}
 
 static const hal_t MOCK = {
     .link_write = m_write,
@@ -82,6 +90,20 @@ static void reset_world(void)
     g_rx_len = 0;
     g_ms = 0;
     g_tick = 1000;
+    g_pub = 0;
+}
+
+/* 往环里填第一个半区并「发布」它。
+ *
+ * 只有在发布之后，`acq_poll` 才会把这块数据算进采集进度 ——
+ * 这是 `hal_t.take_published_halves` 的语义（见 test_acq.c 的 feed()）。
+ * 本文件只需要一个半区：窗口 5 点，auto 超时强制完成后数据够用。 */
+static void publish_first_half(uint16_t (*gen)(uint32_t i))
+{
+    for (uint32_t i = 0; i < ACQ_HALF_SAMPLES; i++) {
+        g_ring[i] = gen(i);
+    }
+    g_pub |= ACQ_HALF_FIRST;
 }
 
 /* 把一条请求编码进「主机→设备」的接收缓冲。 */
@@ -327,6 +349,124 @@ static void case_read_buffer_rejects_stale_id(void)
     }
 }
 
+/* 窗口数据生成器：恒低于触发电平（不会真的触发），但逐点不同。
+ *
+ * 「逐点不同」是这条测试能证伪的关键：把 3 字节当 2 字节解、或把高低
+ * 半字节拼反，解出来的值都不会与窗口一致（全等的假数据抓不住这些错）。 */
+static uint16_t gen_distinct_low(uint32_t i)
+{
+    return (uint16_t)(i % 1500u);
+}
+
+static void case_read_buffer_pack12_roundtrip(void)
+{
+    GROUP("READ_BUFFER PACK12 往返");
+
+    reset_world();
+    acq_t a;
+    acq_init(&a, &MOCK);
+    proto_task_t pt;
+    proto_task_init(&pt, &MOCK, &a);
+
+    proto_frame_t got[8];
+
+    /* ── 1) 通过线格式配 5 点窗口并 ARM ── */
+    set_acq_req_t ar = {.mode = ACQ_MODE_SINGLE, .capture_samples = 5u,
+                        .format = FMT_RAW16, .decimation = 1u};
+    set_trigger_req_t tr = {.mode = TRIG_MODE_AUTO, .source = TRIG_SRC_CH1,
+                            .edge = TRIG_EDGE_RISING, .level_lsb = 2048u,
+                            .pre_samples = 0u, .holdoff_us = 1000u};
+    push_request(1, CMD_SET_ACQ, (const uint8_t *)&ar, sizeof(ar));
+    push_request(2, CMD_SET_TRIGGER, (const uint8_t *)&tr, sizeof(tr));
+    push_request(3, CMD_ARM, NULL, 0);
+    proto_task_poll(&pt);
+    uint32_t n = drain_tx(got, 8, NULL, 0);
+    CHECK(n == 3, "三条请求应当回三帧，实测 %u", n);
+    for (uint32_t i = 0; i < n && i < 3u; i++) {
+        CHECK((got[i].hdr.flags & PROTO_FLAG_ERROR) == 0,
+              "配置第 %u 条不该是错误：cmd=0x%04X", i, got[i].hdr.cmd);
+    }
+
+    /* ── 2) 完成一次采集 ──
+     *
+     * `proto_task_poll` 只跑链路；采集状态机由主循环里的 `acq_poll` 驱动，
+     * 完成事件再由 `proto_task_emit` 发出（见 App/main.c 的主循环）。
+     * auto 模式 + 200 ms 超时 = 不需要真的等到一个边沿。 */
+    publish_first_half(gen_distinct_low);
+    acq_out_t ev;
+    CHECK(acq_poll(&a, &ev) == ACQ_EV_NONE, "恒低于电平的信号不该触发");
+    g_ms += ACQ_AUTO_TIMEOUT_MS;
+    CHECK(acq_poll(&a, &ev) == ACQ_EV_TRIGGERED, "auto 超时应当强制完成");
+    if (acq_state(&a) != STATE_DONE) {
+        FAIL("采集没进 DONE，后面的断言没有意义");
+        return;
+    }
+
+    /* capture_id 只存在于 EVENT_TRIGGER 里 —— 主机就是从这拿的
+     * （host/crates/core/src/acquire.rs）。这里也走同一条路，
+     * 顺带验证事件里的 id 与 READ_BUFFER 认的是同一个。 */
+    g_tx_len = 0; /* 清掉上面的三帧应答，只解析事件帧 */
+    proto_task_emit(&pt, &ev);
+    n = drain_tx(got, 8, NULL, 0);
+    uint16_t cap_id = 0;
+    if (n == 1) {
+        /* payload 指向解析器的内部缓冲，下一次 feed 即失效 —— 先拷走 */
+        cap_id = (uint16_t)(got[0].payload[0] | ((uint16_t)got[0].payload[1] << 8));
+    }
+    CHECK(n == 1 && got[0].hdr.cmd == CMD_EVENT_TRIGGER,
+          "采集完成应当发一帧 EVENT_TRIGGER，实测 %u 帧", n);
+    if (n != 1) {
+        return;
+    }
+    CHECK(cap_id == a.capture_id, "事件里的 capture_id 应当是设备分配的那个");
+
+    /* ── 3) 请求 PACK12 分片：count=5，奇数，末样点与 0 凑对 ── */
+    read_buffer_req_t rb = {.capture_id = cap_id, .start_sample = 0u,
+                            .count = 5u, .format = FMT_PACK12, .ch = 0u};
+    g_tx_len = 0;
+    push_request(4, CMD_READ_BUFFER, (const uint8_t *)&rb, sizeof(rb));
+    proto_task_poll(&pt);
+
+    n = drain_tx(got, 8, NULL, 0);
+    CHECK(n == 1, "应当回一帧，实测 %u", n);
+    if (n != 1) {
+        return;
+    }
+    CHECK(got[0].hdr.cmd == CMD_READ_BUFFER, "命令码应当回显");
+    CHECK((got[0].hdr.flags & PROTO_FLAG_ERROR) == 0,
+          "不该是错误帧 —— 设备必须支持 PACK12（未实现时这里是 UNSUPPORTED）");
+    CHECK(got[0].hdr.len == (uint16_t)(12u + 9u),
+          "payload = 12 + ceil(5*3/2) = 21 字节，实测 %u", got[0].hdr.len);
+    if (got[0].hdr.len != 21u) {
+        return;
+    }
+
+    /* 解析器缓冲在下一次 feed 后就失效 —— 当场拷走再断言。 */
+    uint8_t payload[64];
+    memcpy(payload, got[0].payload, got[0].hdr.len);
+    chunk_header_t h;
+    memcpy(&h, payload, sizeof(h));
+    CHECK(h.format == FMT_PACK12, "分片头必须**如实回显**请求的格式，实测 %u", h.format);
+    CHECK(h.count == 5u, "count 应当是 5，实测 %u", h.count);
+    CHECK(h.start_sample == 0u, "start_sample 应当回显请求值，实测 %u", h.start_sample);
+    CHECK((h.flags & CHUNK_FLAG_LAST) != 0,
+          "这一片覆盖到窗口末尾，应当置 LAST（flags=0x%02X）", h.flags);
+
+    /* 每对解出来与窗口里的 acq_sample 逐点相等。第 5 个样点与 0 凑对，
+     * 解出的第 6 个值超出 count，忽略。 */
+    for (uint32_t i = 0; i < 5u; i += 2u) {
+        uint16_t s0 = 0, s1 = 0;
+        proto_unpack12_pair(&payload[PROTO_CHUNK_HEADER_LEN + (i / 2u) * 3u], &s0, &s1);
+        CHECK(s0 == acq_sample(&a, 0, i), "第 %u 点：PACK12 解出 %u，窗口里是 %u",
+              i, s0, acq_sample(&a, 0, i));
+        if (i + 1u < 5u) {
+            CHECK(s1 == acq_sample(&a, 0, i + 1u),
+                  "第 %u 点：PACK12 解出 %u，窗口里是 %u", i + 1u, s1,
+                  acq_sample(&a, 0, i + 1u));
+        }
+    }
+}
+
 static void case_no_reply_flag_is_honoured(void)
 {
     GROUP("免回复标志");
@@ -470,6 +610,7 @@ int main(void)
     case_state_machine_gate();
     case_unknown_command();
     case_read_buffer_rejects_stale_id();
+    case_read_buffer_pack12_roundtrip();
     case_no_reply_flag_is_honoured();
     case_measure_says_unsupported();
     case_set_channel_rejects_ch2();

@@ -64,6 +64,10 @@ const TRIG_MODE_NORMAL: u8 = 1;
 /// `SET_ACQ.mode` 的取值。
 const ACQ_SINGLE: u8 = 0;
 
+/// `READ_BUFFER.format` / 分片头的 `wf_format_t` 取值（见 `proto/protocol.h`）。
+const CHUNK_FMT_RAW16: u8 = 0;
+const CHUNK_FMT_PACK12: u8 = 1;
+
 /// 一次采集的参数。
 #[derive(Debug, Clone, Copy)]
 pub struct AcquireParams {
@@ -121,6 +125,56 @@ impl TriggerEvent {
             n_samples: u32::from_le_bytes([p[14], p[15], p[16], p[17]]),
         })
     }
+}
+
+/// `READ_BUFFER` 分片 payload（**不含** 12 B 分片头）→ 样点。
+///
+/// 按**设备回显**的 `format` 解码 —— 这是本函数的全部意义：主机请求
+/// PACK12，设备有权按自己的情况回别的格式（未来还可能回 MINMAX），
+/// 按请求值解就是把两种布局当成同一种读，出来的波形全是垃圾。
+///
+/// 只产出 `count` 个样点：PACK12 奇数时最后一对里有一个填充值，
+/// 超出 `count` 的部分必须丢掉。payload 装不下 `count` 个样点 → 报错
+/// （设备声明与实际不符），**不**静默返回半段数据。
+fn decode_chunk_samples(format: u8, payload: &[u8], count: u16) -> Result<Vec<u16>> {
+    let count = count as usize;
+    let mut samples = Vec::with_capacity(count);
+
+    match format {
+        CHUNK_FMT_RAW16 => {
+            for pair in payload.chunks_exact(2).take(count) {
+                samples.push(u16::from_le_bytes([pair[0], pair[1]]));
+            }
+        }
+        CHUNK_FMT_PACK12 => {
+            // 一对 3 字节解出 2 个；取到 count 需要的那一对为止。
+            // 奇数 count 时最后一对多出的第 count+1 个值由 truncate 丢掉。
+            for trio in payload.chunks_exact(3).take(count.div_ceil(2)) {
+                let (s0, s1) = scope_proto::unpack12_pair([trio[0], trio[1], trio[2]]);
+                samples.push(s0);
+                samples.push(s1);
+            }
+            samples.truncate(count);
+        }
+        other => {
+            return Err(ScopeError::Unsupported(format!(
+                "未知的分片格式 {other}（仅支持 RAW16=0 / PACK12=1）"
+            )));
+        }
+    }
+
+    if samples.len() < count {
+        return Err(ScopeError::InvalidParam {
+            field: "chunk.count",
+            value: count.to_string(),
+            reason: format!(
+                "分片只解出 {} 个样点（format={format}，payload {} 字节）",
+                samples.len(),
+                payload.len()
+            ),
+        });
+    }
+    Ok(samples)
 }
 
 /// 采集一次，不响应取消。
@@ -243,7 +297,11 @@ pub fn acquire_cancellable<P: DevicePort>(
             }
 
             let want = chunk.min((ev.n_samples - offset) as u16);
-            let payload = bus.read_buffer(ev.capture_id, offset, want, 0, ch as u8)?;
+            // 请求 PACK12：2 样点挤进 3 字节，省 25% 线路时间。
+            // 设备有权回别的格式（回显在 hdr.format）—— 解码一律按回显值，
+            // 绝不按这里的请求值（见 decode_chunk_samples）。
+            let payload =
+                bus.read_buffer(ev.capture_id, offset, want, CHUNK_FMT_PACK12, ch as u8)?;
 
             let hdr = crate::ChunkHeader::decode(&payload).ok_or_else(|| {
                 ScopeError::Unsupported(format!("分片头解析失败（payload {} 字节）", payload.len()))
@@ -253,9 +311,12 @@ pub fn acquire_cancellable<P: DevicePort>(
                 capture.overrun = true;
             }
 
-            for pair in payload[scope_proto::CHUNK_HEADER_LEN..].chunks_exact(2) {
-                capture.channels[ch].push(u16::from_le_bytes([pair[0], pair[1]]));
-            }
+            let samples = decode_chunk_samples(
+                hdr.format,
+                &payload[scope_proto::CHUNK_HEADER_LEN..],
+                hdr.count,
+            )?;
+            capture.channels[ch].extend_from_slice(&samples);
 
             offset += hdr.count as u32;
 
@@ -417,5 +478,63 @@ mod tests {
     fn short_payload_is_rejected_not_panicking() {
         let e = TriggerEvent::decode(&[0u8; 10]);
         assert!(e.is_err(), "过短的 payload 应报错而不是越界读");
+    }
+
+    #[test]
+    fn pack12_chunk_decodes_to_the_same_samples_as_raw16() {
+        // 同一批 7 个样点，按两种格式编码 → 解码必须逐点相等。
+        // 这条断言是可证伪的：把 3 字节按 2 字节解、或把高低半字节拼反，
+        // 解出来的值都不会等于原样点。
+        let samples: Vec<u16> = vec![0x000, 0xFFF, 0x123, 0xABC, 0x001, 0x800, 0x7FF];
+
+        let mut raw = Vec::new();
+        for s in &samples {
+            raw.extend_from_slice(&s.to_le_bytes());
+        }
+
+        // PACK12：奇数末样点与 0 凑对（与固件 cmd_read_buffer 的约定一致）
+        let mut packed = Vec::new();
+        for pair in samples.chunks(2) {
+            let s1 = pair.get(1).copied().unwrap_or(0);
+            packed.extend_from_slice(&scope_proto::pack12_pair(pair[0], s1));
+        }
+        assert_eq!(
+            packed.len(),
+            12,
+            "7 个样点应当打成 4 对 12 字节，实测 {}",
+            packed.len()
+        );
+
+        let got_raw = decode_chunk_samples(0, &raw, samples.len() as u16).unwrap();
+        let got_packed = decode_chunk_samples(1, &packed, samples.len() as u16).unwrap();
+
+        assert_eq!(got_raw, samples, "RAW16 解码往返");
+        assert_eq!(
+            got_packed, samples,
+            "PACK12 解码往返（第 7 点与 0 凑对，解出的第 8 个值必须截掉）"
+        );
+        assert_eq!(
+            got_packed.len(),
+            7,
+            "PACK12 解出的长度应当按 count 截断到 7"
+        );
+    }
+
+    #[test]
+    fn unsupported_chunk_format_is_an_error_not_garbage() {
+        // MINMAX(2) 的 payload 布局完全不同 —— 对未知格式硬解就是把两种
+        // 字节当同一种读，出来的「波形」全是垃圾。必须明确报错。
+        let e = decode_chunk_samples(2, &[0u8; 16], 4).unwrap_err();
+        assert!(
+            matches!(e, ScopeError::Unsupported(_)),
+            "未知格式必须是明确的错误，实测 {}",
+            e.summary()
+        );
+        // summary() 对 Unsupported 是固定文案（见 error.rs），细节在 hint() 里。
+        let hint = e.hint().expect("Unsupported 应当带说明");
+        assert!(
+            hint.contains("格式"),
+            "错误说明要指出是格式问题，实测 {hint}"
+        );
     }
 }

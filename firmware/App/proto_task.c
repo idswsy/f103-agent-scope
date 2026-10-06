@@ -294,9 +294,10 @@ static void cmd_read_buffer(proto_task_t *pt, uint16_t seq, const proto_frame_t 
         send_error(pt, seq, CMD_READ_BUFFER, ERR_NO_DATA, "capture id mismatch");
         return;
     }
-    if (req.format != FMT_RAW16) {
-        /* PACK12 / MINMAX 的打包还没做。明确说「不支持」，
-         * 而不是按 RAW16 回 —— 主机把 3 字节当 2 字节解，整段数据全错。 */
+    if (req.format != FMT_RAW16 && req.format != FMT_PACK12) {
+        /* MINMAX / DELTA 的打包还没做。明确说「不支持」，
+         * 而不是按 RAW16 回 —— 主机把 3 字节当 2 字节解，整段数据全错。
+         * （PACK12 已实现，见下面的编码分支。） */
         send_error(pt, seq, CMD_READ_BUFFER, ERR_UNSUPPORTED, "format not supported");
         return;
     }
@@ -309,7 +310,8 @@ static void cmd_read_buffer(proto_task_t *pt, uint16_t seq, const proto_frame_t 
                             .start_sample = start,
                             .count = 0,
                             .decimation = a->decimation,
-                            .format = FMT_RAW16,
+                            /* 如实回显请求的格式 —— 主机按它解码 */
+                            .format = req.format,
                             .flags = CHUNK_FLAG_LAST};
         send_frame(pt, PROTO_FLAG_RESP, seq, CMD_READ_BUFFER, (const uint8_t *)&h,
                    (uint16_t)sizeof(h));
@@ -344,12 +346,28 @@ static void cmd_read_buffer(proto_task_t *pt, uint16_t seq, const proto_frame_t 
                         .start_sample = start,
                         .count = (uint16_t)n,
                         .decimation = a->decimation,
-                        .format = FMT_RAW16,
+                        /* 如实回显请求的格式 —— 主机按它解码（不是按它请求的值） */
+                        .format = req.format,
                         /* 溢出的采集必须**如实标为无效** ——
                          * 主机靠这个标志判断这份数据能不能用。 */
                         .flags = (uint8_t)(((end >= a->window_len) ? CHUNK_FLAG_LAST : 0u) |
                                            (a->overrun ? CHUNK_FLAG_INVALID : 0u))};
     memcpy(buf, &h, sizeof(h));
+    if (req.format == FMT_PACK12) {
+        /* 2 样点 → 3 字节。n 为奇数时末样点与 0 凑对 —— 主机按 count
+         * 截断，解出的第 count+1 个值忽略（见 docs/03-protocol.md 6.4）。
+         * payload 比 RAW16 小（n×1.5 B），同一块 static buf 装得下。 */
+        uint32_t pairs = (n + 1u) / 2u;
+        for (uint32_t i = 0; i < pairs; i++) {
+            uint32_t j = i * 2u;
+            uint16_t s0 = acq_sample(a, 0, start + j);
+            uint16_t s1 = (j + 1u < n) ? acq_sample(a, 0, start + j + 1u) : 0u;
+            proto_pack12_pair(s0, s1, &buf[PROTO_CHUNK_HEADER_LEN + i * 3u]);
+        }
+        send_frame(pt, PROTO_FLAG_RESP, seq, CMD_READ_BUFFER, buf,
+                   (uint16_t)(PROTO_CHUNK_HEADER_LEN + pairs * 3u));
+        return;
+    }
     for (uint32_t i = 0; i < n; i++) {
         uint16_t v = acq_sample(a, 0, start + i);
         buf[PROTO_CHUNK_HEADER_LEN + i * 2u] = (uint8_t)(v & 0xFFu);
