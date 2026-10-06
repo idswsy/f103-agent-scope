@@ -463,6 +463,11 @@ static void case_read_buffer_pack12_roundtrip(void)
             CHECK(s1 == acq_sample(&a, 0, i + 1u),
                   "第 %u 点：PACK12 解出 %u，窗口里是 %u", i + 1u, s1,
                   acq_sample(&a, 0, i + 1u));
+        } else {
+            /* 末样点与 0 凑对 —— 这是协议约定（docs/03-protocol.md §6.4），
+             * 不是「随便填一个都行」：主机按 count 截断虽然会丢掉它，
+             * 但两条线（固件/主机）对填充值的约定必须一致且被钉住。 */
+            CHECK(s1 == 0u, "末样点应与 0 凑对，填充值实测 %u", s1);
         }
     }
 }

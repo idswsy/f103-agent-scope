@@ -163,6 +163,10 @@ pub struct SimDevice {
     /// 单槽 seq 去重缓存 —— 复刻设备的非幂等命令重试安全机制。
     dedup: Option<(u16, u16, Vec<u8>)>,
 
+    /// **测试专用**：READ_BUFFER 无论请求什么格式都按 RAW16 回。
+    /// 见 [`SimDevice::set_read_buffer_force_raw16`]。
+    force_raw16: bool,
+
     /// 故障注入设置。直接赋值即可：
     /// `dev.faults.drop_every_n_frames = 50;`
     pub faults: FaultInjection,
@@ -218,6 +222,7 @@ impl SimDevice {
             captured: None,
             next_capture_id: 1,
             dedup: None,
+            force_raw16: false,
             faults: FaultInjection::default(),
             frames_sent: 0,
             overrun_samples: 0,
@@ -247,6 +252,21 @@ impl SimDevice {
     pub fn set_seed(&mut self, seed: u64) {
         self.wave.set_seed(seed);
         self.captured = None;
+    }
+
+    /// **测试专用**：READ_BUFFER 无论主机请求什么格式都按 RAW16 回
+    /// （分片头 `format` 也如实回显 0）。
+    ///
+    /// 真机上设备完全有权按自己的情况回别的格式；主机侧的正确性要求是
+    /// 「按分片头**回显**的 format 解码」，**不是**「按自己请求的值解码」。
+    /// 这个开关用来在端到端测试里制造「请求 PACK12、回包 RAW16」，
+    /// 给那条属性一个红灯（见 scope-mcp 的
+    /// `capture_decodes_by_the_echoed_chunk_format_not_by_the_request`）。
+    ///
+    /// 刻意**不**放进 [`FaultInjection`]：这不是链路故障，而是合法的设备行为，
+    /// 也不该牵动 MCP `InjectArgs` 的 schema。
+    pub fn set_read_buffer_force_raw16(&mut self, on: bool) {
+        self.force_raw16 = on;
     }
 
     /// 设备报告的通道数。
@@ -625,7 +645,9 @@ impl SimDevice {
         let capture_id = u16::from_le_bytes([payload[0], payload[1]]);
         let start = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
         let count = u16::from_le_bytes([payload[6], payload[7]]);
-        let format = payload[8];
+        // 测试开关：模拟「设备按 RAW16 回，尽管主机请求的是 PACK12」。
+        // 真机上这是合法行为；主机必须按分片头回显的 format 解码。
+        let format = if self.force_raw16 { 0 } else { payload[8] };
         let ch = payload[9];
 
         let cap = match &self.captured {

@@ -56,13 +56,15 @@
 - CH340 系列（G/C/E）按数据手册支持至 2 Mbps
 - 上位机 `transport-serial` 的 `SerialDevice::open(port, baud, timeout)` 本就接受波特率参数，只需在常量表中增加一档
 
-### 3.2 PACK12 尚未实现，但协议层已具备
+### 3.2 PACK12 已实现（2026-10-06）
 
-设备在 `App/proto_task.c` 的 `DEV_CAPS` 中**宣称**支持 `CAP_FMT_PACK12` 与 `CAP_FMT_MINMAX`，而 `cmd_read_buffer` 对非 `FMT_RAW16` 一律回 `ERR_UNSUPPORTED`。
+PACK12 为每样点 1.5 B（2 样点 → 3 B），**载荷减少 25%**。编解码函数 `proto_pack12_pair` / `proto_unpack12_pair` 在 `proto/protocol.h`（两端跑同一份黄金向量）。
 
-> 该文件上方数行恰有一段注释要求「不要声明做不到的能力」（针对 `CAP_CH_DUAL` / `CAP_COUPLING_AC`）。**此处未守住自己定的纪律** —— 这是一个既有缺陷，须一并修复。
+- 设备：`cmd_read_buffer` 支持 `FMT_PACK12`，分片头的 `format` 如实回显请求值；奇数 `count` 时末样点与 `0` 凑对（约定见 `docs/03-protocol.md` §6.4）。
+- 主机：`scope-core` 的 `acquire` 请求 PACK12，并按**分片头回显的 `format`** 解码（不是按请求值）——设备有权回别的格式，按请求值解会把两种字节当同一种读。
+- 回归：`firmware/tests/test_proto_task.c` 的 PACK12 往返组（与 `acq_sample` 逐点相等）+ 主机端 `decode_chunk_samples` 单测 + scope-mcp 的「按回显格式解码」端到端测试。
 
-PACK12 为每样点 1.5 B（2 样点 → 3 B），**载荷减少 25%**。编解码函数 `proto_pack12_pair` / `proto_unpack12_pair` 已在 `proto/protocol.h` 声明。
+> **遗留缺陷（不在本次范围）**：`DEV_CAPS` 仍宣称 `CAP_FMT_MINMAX`，而 `cmd_read_buffer` 对 MINMAX 回 `ERR_UNSUPPORTED`。`App/proto_task.c` 上方数行恰有一段注释要求「不要声明做不到的能力」（针对 `CAP_CH_DUAL` / `CAP_COUPLING_AC`）——**此处仍未守住自己定的纪律**，须另行修复。
 
 ---
 
@@ -93,18 +95,18 @@ GUI 增加「连续刷新」开关。打开后 worker 循环执行「采集一�
 - 本步必须**单独验证**：它决定第三步是否值得做
 - 判据：`ping` 10/10；连续 `capture` 50 次；`status` 的 `rx_crc_err` 与 `rx_dropped` 全程为 0
 
-### 4.3 第三步：实现 PACK12
+### 4.3 第三步：实现 PACK12（已完成 2026-10-06）
 
-| 侧 | 改动 |
-|---|---|
-| 设备 | `cmd_read_buffer` 支持 `FMT_PACK12`；分片头的 `format` 字段如实填写 |
-| 上位机 | `scope-core` 解包 + `acquire` 请求该格式 |
-| 协议 | `docs/03-protocol.md` + 黄金向量 |
+| 侧 | 改动 | 状态 |
+|---|---|---|
+| 设备 | `cmd_read_buffer` 支持 `FMT_PACK12`；分片头的 `format` 字段如实填写 | ✅ |
+| 上位机 | `scope-core` 解包 + `acquire` 请求该格式 | ✅ |
+| 协议 | `docs/03-protocol.md`；黄金向量沿用既有 7 组（含 `0x000`/`0xFFF` 两端极值） | ✅ |
 
 本仓纪律：**改协议 = 改四处（文档 / `.h` / `.rs` / 向量）+ 一次提交**。
 
-- 预期 **32 fps**
-- 硬判据：**同一份采集，PACK12 解出的样点与 RAW16 逐点相同**
+- 预期 **32 fps**（帧率数字待真机 + 2 Mbps 实测）
+- 硬判据：**同一份采集，PACK12 解出的样点与 RAW16 逐点相同** —— 已由固件 PACK12 往返组、主机 `decode_chunk_samples` 单测、scope-mcp 端到端回归钉住
 
 ### 4.4 第四步：冻结屏幕代码
 

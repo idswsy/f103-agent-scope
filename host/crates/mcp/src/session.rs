@@ -1478,6 +1478,40 @@ mod tests {
     }
 
     #[test]
+    fn capture_decodes_by_the_echoed_chunk_format_not_by_the_request() {
+        // 回归：主机**无条件请求 PACK12**，但必须按分片头回显的 `format` 解码。
+        // 这里把模拟器切成「无论请求什么格式都按 RAW16 回」（分片头 format=0），
+        // 复刻真机完全有权这么做的情况。
+        //
+        // 一旦 `acquire` 的调用点改成按请求常量（PACK12）解码，两次采集的
+        // 样点就不再逐点相同 —— 这是那条属性唯一的红灯（这条测试别删）。
+        let mut plain = connected();
+        let mut forced = connected();
+        forced
+            .bus
+            .as_mut()
+            .expect("connected() 必然建立了总线")
+            .port_mut()
+            .sim_mut()
+            .expect("transport=sim 应当拿到 SimDevice")
+            .set_read_buffer_force_raw16(true);
+
+        let expect = plain.acquire_raw(2000).expect("正常采集应当成功");
+        let got = forced
+            .acquire_raw(2000)
+            .expect("设备回 RAW16 时采集也必须成功 —— 按回显格式解码就不会报错");
+
+        assert!(
+            !expect.channels.is_empty() && !expect.channels[0].is_empty(),
+            "采集不应为空，否则这条测试什么都没验证"
+        );
+        assert_eq!(
+            got.channels, expect.channels,
+            "同一份波形，RAW16 回包与 PACK12 回包解出的样点必须逐点相同"
+        );
+    }
+
+    #[test]
     fn capture_rejects_stream_mode_instead_of_silently_doing_one_shot() {
         // 回归：`mode` 从前在 schema 里声明了却**没人读** ——
         // 传 "stream" 会静默按单次跑，而 Agent 以为拿到的是流数据。
