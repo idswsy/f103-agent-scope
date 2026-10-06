@@ -496,7 +496,8 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
 
         Action::Status => {
             bus.connect()?;
-            let s = bus.get_status()?.state;
+            let st = bus.get_status()?;
+            let s = st.state;
             println!("状态: {} ({})", state_name(s), s as u8);
             if let Some(cfg) = &bus.config {
                 println!("采样率: {} Hz", cfg.rate_hz);
@@ -509,6 +510,20 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
                     cfg.trigger_mode, cfg.trigger_source, cfg.trigger_edge, cfg.trigger_level_lsb
                 );
             }
+            // 连通性闸门看的是这几个累计计数器（docs/09 §4.2：全 0 才算链路
+            // 干净）。从前这里只取 state，其余 32 字节一路都到不了命令行。
+            println!(
+                "链路: 溢出 {} · 收 CRC 错 {} · 收丢 {} · 发丢 {}",
+                st.overrun_samples, st.rx_crc_err, st.rx_dropped, st.tx_dropped
+            );
+            println!(
+                "链路判定: {}",
+                if st.link_is_clean() {
+                    "干净（溢出 / CRC 错 / 收丢均为 0）"
+                } else {
+                    "不干净（有溢出或链路错误，采集数据不可全信）"
+                }
+            );
             Ok(())
         }
 

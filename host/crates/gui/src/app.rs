@@ -597,6 +597,9 @@ impl App {
                 // 断开即复位开关 —— 否则迟到的 Acquired 回执会按开关
                 // 继续向一个已经不存在的连接发采集
                 self.continuous = false;
+                // 显式清零：该标志平时靠 worker 的「每个 Acquire 必得终态
+                // （Acquired / Failed）」不变量兜底，清零后该不变量不再承重。
+                self.acquire_in_flight = false;
                 self.simulated = false;
                 self.info = None;
                 self.config = None;
