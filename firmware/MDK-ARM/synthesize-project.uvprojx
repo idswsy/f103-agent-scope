@@ -471,11 +471,6 @@
               <FilePath>..\Hardware\src\hal_impl.c</FilePath>
             </File>
             <File>
-              <FileName>display.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Hardware\src\display.c</FilePath>
-            </File>
-            <File>
               <FileName>local_io.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Hardware\src\local_io.c</FilePath>

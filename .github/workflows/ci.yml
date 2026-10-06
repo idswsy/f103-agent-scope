@@ -287,6 +287,7 @@ jobs:
           for f in firmware/App/*.c firmware/Hardware/src/*.c; do
             b=$(basename "$f")
             [ "$b" = "scope_ui.c" ] && continue   # 上游存档，故意不编（ADR-014）
+            [ "$b" = "display.c" ] && continue    # 屏幕已冻结（docs/09 §4.4），代码保留不编
             if ! grep -q ">$b<" firmware/MDK-ARM/*.uvprojx; then
               echo "::error file=$f::$b 没有被加进 Keil 工程。"
               echo "后果是链接期一串 Undefined symbol，而不是编译错误 —— 很容易以为是代码写错。"

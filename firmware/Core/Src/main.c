@@ -45,7 +45,6 @@
 #include "usart.h"
 #include "tft.h"
 #include "tft_init.h"
-#include "display.h"
 #include "local_io.h"
 #include "local_policy.h"
 #include "local_freq.h"
@@ -133,12 +132,6 @@ int main(void)
     acq_init(&g_acq, hal);
     proto_task_init(&g_pt, hal, &g_acq);
 
-    /* 屏幕放在**最后**。它内部有约 420 ms 的阻塞延时（面板复位与寄存器
-     * 序列），放在 `HalImpl_Init()` 之前会让那 420 ms 里串口根本没在收；
-     * 放之后，主机的第一条命令会被 1 KB 的收包环接住，等主循环转起来再答。
-     * 屏幕是最慢、最可缺的一个外设，不该排在链路前面。 */
-    Display_Init();
-
     /* 本地按键 / 编码器 / LED。它要关掉 `gpio.c` 配的两组 EXTI ——
      * 理由见 `Hardware/inc/local_io.h` 的文件头。 */
     LocalIo_Init();
@@ -180,20 +173,15 @@ int main(void)
         }
         proto_task_emit(&g_pt, &out);
 
-        /* 采集完成 —— **当场**把采集窗压成一帧屏幕能画的东西。
-         * 挑这个时候是因为 `capture_ready` 此刻一定为真（DMA 已停、窗口已冻结），
-         * 而快照之后环再被怎么写、主机什么时候再 ARM，都与这一帧无关了。 */
         if (ev == ACQ_EV_TRIGGERED) {
-            Display_Capture(&g_acq);
-            /* LED2：每完成一次采集翻转一次 —— 一个「链路在动」的心跳。
-             * 没有它的话，一块静止的屏幕分不出「设备在待命」和「设备死了」。 */
+            /* LED2：每完成一次采集翻转一次 —— 设备活动的可见心跳。
+             * 屏幕已冻结（docs/09 §4.4），它是本地唯一能看出设备还在活动的指示。 */
             LocalIo_LedToggle(LOCAL_LED2);
         }
     }
 
-    /* 本地按键与编码器：只采样与分发，一轮几微秒。
-     *
-     * 排在屏幕**之前** —— 屏幕坏了不该挡住按键。 */
+    /* 本地按键与编码器：只采样与分发，一轮几微秒、不阻塞 ——
+     * 屏幕冻结（docs/09 §4.4）后，它不再需要抢在绘制之前跑。 */
     LocalIo_Poll();
     /* 排空事件。上限只为兜底：事件源（按键/编码器）本身就是稀疏的，
      * 而队列只有 4 深。 */
@@ -235,11 +223,6 @@ int main(void)
 
     /* LED1 常亮 = 采集进行中。 */
     LocalIo_LedSet(LOCAL_LED1, acq_state(&g_acq) == STATE_ARMED);
-
-    /* 屏幕绘制放**最后**。它一轮最多花几百微秒（见 `Hardware/src/display.c`
-     * 的预算常量），绝不能排到收包前面 —— 串口收包环只有 1 KB，
-     * 921600 波特率下约 11 ms 就满，满了直接丢字节。 */
-    Display_Poll(acq_state(&g_acq) == STATE_ARMED);
   /* USER CODE END 3 */
   }
 }
