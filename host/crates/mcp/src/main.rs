@@ -382,7 +382,7 @@ const TOOLS: &[ToolSpec] = &[
     ),
     tool!(
         "scope_measure",
-        "对指定采集做测量：频率/峰峰值/均值/RMS/占空比/上升时间。返回纯数字+单位",
+        "对指定采集做测量：频率/峰峰值/均值/RMS/占空比/上升与下降时间/过冲/下冲/脉宽/跃变数。返回纯数字+单位",
         "主机侧计算（精度最高）；流模式可走 MEASURE",
         "总是",
         ToolAnnotations::READ_ONLY,
@@ -1295,7 +1295,8 @@ mod tests {
         assert_eq!(label(&connect, "transport"), "serial|sim?");
         assert_eq!(
             label(&connect, "sim_scenario"),
-            "sine_1k_3v3|square_50k|pulse_glitch|noise|dc|am|i2c_100k|i2c_400k|i2c_nack?"
+            "sine_1k_3v3|square_50k|pulse_glitch|noise|dc|am|i2c_100k|i2c_400k|i2c_nack|\
+             pwm_1k_25|pwm_1k_75|pwm_1k_5|step_ring|rc_charge|uart_115k?"
         );
 
         // 可选数组、可选字符串

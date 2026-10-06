@@ -36,6 +36,55 @@ pub enum Scenario {
     /// `transaction()` 把应答位写死在每个字节后面。一条验收标准，
     /// 内容正好是它演示不了的那件事。
     I2cNack,
+    /// 1 kHz、**25% 占空比**的方波。
+    ///
+    /// 存在的理由：`Square50k` 的占空比写死在 50%，于是「占空比测准了没有」
+    /// 这件事在模拟器上**根本验证不了** —— 测出 50% 与测出「恒等于 50%」
+    /// 分不开。这一对（25 / 75）把占空比变成一个真正被观测的量。
+    Pwm1k25,
+    /// 1 kHz、**75% 占空比**的方波 —— `Pwm1k25` 的镜像。
+    ///
+    /// 两个方向都要有：只测窄脉冲的话，「占空比算成了 100−duty」这个变异体
+    /// 在 25% 上照样通过。
+    Pwm1k75,
+    /// 1 kHz、**5% 占空比**的窄脉冲。
+    ///
+    /// 这是双电平检测**最危险的退化情形**：高电平平台只占 5% 的样点
+    /// （4096 点里约 214 个），而两座平台的高度差着 19 倍。用全局均值初始化
+    /// 的聚类会把两个中心双双放进低电平那一侧，整个判定崩掉 ——
+    /// `signal::detect_levels` 用 Otsu 定初始分界就是为了它。
+    Pwm1k5,
+    /// **欠阻尼闭环的阶跃响应** —— 工业控制里调 PID 时示波器上看到的那种波形。
+    ///
+    /// 设定值是 500 Hz 的方波，输出是一个二阶欠阻尼系统的响应：每个跳变后
+    /// 过冲约 31%、随后以 12 kHz 衰减振铃。**两个电平上都有过冲与下冲**
+    /// （不是只有上升沿），因为设定值两个方向都在跳。
+    ///
+    /// ζ = 0.35 是刻意选的：过冲 `exp(-πζ/√(1-ζ²)) ≈ 30.9%` —— 大到一眼能
+    /// 看出来、又小到还在电路能实现的范围内。而可见的振铃圈数只由 ζ 决定
+    /// （约 2.7 圈），所以「想多要几圈振铃」就得同时接受更大的过冲，
+    /// 这是物理，不是实现偷懒。
+    StepRing,
+    /// **RC 充放电** —— 1 kHz 方波经一阶 RC（τ = 150 µs）之后的曲线。
+    ///
+    /// 指数曲线不是双电平信号（占用率只有 0.1 量级），所以它同时验证
+    /// 「不是方波就别硬叫方波」。上升时间 = 10%→90% 的理论值是 `2.2·τ`
+    /// = 330 µs，是个能算出来对账的数。
+    RcCharge,
+    /// **115200 baud 的串行数据**：三个字节循环，每帧后跟 2 位空闲。
+    ///
+    /// 一帧 10 位：起始位 0 + 8 位数据（**LSB 先**）+ 停止位 1，再加 2 位空闲
+    /// 高电平 —— 于是帧边界在波形上是**看得见**的（连续 3 位高电平）。
+    ///
+    /// ⚠ 内容**不能**只用 `0x55` 连发。那样每一位都翻转，线上就是一条
+    /// 干净的方波：帧边界无从辨认，帧长 10 位还是 20 位在波形上完全一样，
+    /// 「这是串行数据」这件事在数据里根本不存在。三个字节（`0x55` / `0x0F` /
+    /// `0xA5`）的位模式差别够大，波形上才看得出不同的脉宽。
+    ///
+    /// ⚠ 857142 Hz 采样下每位只有 **7.4 个样点** —— 波形看得见，但脉宽、
+    /// 边沿时间这类量都被采样分辨率卡住，读数只当相对量看。真机上更慢的
+    /// 波特率会好得多。
+    Uart115k,
 }
 
 impl Scenario {
@@ -47,7 +96,7 @@ impl Scenario {
     /// 从前 `parse` 与 `name` 是**两份各写一遍的 match** —— 给某个场景改名时
     /// 只改一处，`parse` 认的名字与 `name()` 报出的名字就会悄悄分家，
     /// 而两边都编译得过。现在 `parse` 是从 `name()` 反向推出来的，分不了家。
-    pub const ALL: [Scenario; 9] = [
+    pub const ALL: [Scenario; 15] = [
         Scenario::Sine1k3v3,
         Scenario::Square50k,
         Scenario::PulseGlitch,
@@ -57,6 +106,12 @@ impl Scenario {
         Scenario::I2c100k,
         Scenario::I2c400k,
         Scenario::I2cNack,
+        Scenario::Pwm1k25,
+        Scenario::Pwm1k75,
+        Scenario::Pwm1k5,
+        Scenario::StepRing,
+        Scenario::RcCharge,
+        Scenario::Uart115k,
     ];
 
     /// 从字符串解析（供 CLI / MCP 使用）。
@@ -80,6 +135,12 @@ impl Scenario {
             Scenario::I2c100k => "i2c_100k",
             Scenario::I2c400k => "i2c_400k",
             Scenario::I2cNack => "i2c_nack",
+            Scenario::Pwm1k25 => "pwm_1k_25",
+            Scenario::Pwm1k75 => "pwm_1k_75",
+            Scenario::Pwm1k5 => "pwm_1k_5",
+            Scenario::StepRing => "step_ring",
+            Scenario::RcCharge => "rc_charge",
+            Scenario::Uart115k => "uart_115k",
         }
     }
 
@@ -290,6 +351,21 @@ impl WaveformGen {
                 let envelope = 0.5 * (1.0 + (2.0 * std::f64::consts::PI * 200.0 * t).sin());
                 MID_LSB as f64 + 1500.0 * envelope * carrier
             }
+
+            Pwm1k25 => pwm_at(t, 0.25),
+            Pwm1k75 => pwm_at(t, 0.75),
+            Pwm1k5 => pwm_at(t, 0.05),
+
+            StepRing => step_ring_at(t),
+
+            RcCharge => rc_charge_at(t),
+
+            // 位序号用**整数**算：`sample_index × 波特率 / 采样率`。
+            // 走浮点（`t * BAUD`）会在位边界上累积出误差，而那种毛刺只在
+            // 某些采样率下出现 —— 属于最难查的一类。
+            Uart115k => level_to_lsb(uart_115k_bit(
+                self.sample_index.saturating_mul(UART_BAUD) / rate,
+            )),
 
             I2c100k | I2c400k | I2cNack => {
                 let (scl, sda) = self.i2c.levels_at_ns(t_ns);
@@ -573,6 +649,143 @@ fn level_to_lsb(high: bool) -> f64 {
     }
 }
 
+/// 1 kHz 梯形方波，`duty` 是高电平占整周期的比例。
+///
+/// 边沿占周期的 1%（**上升与下降各占一半**）—— 1 kHz 下上升沿单独只有 5 µs，
+/// 10%→90% 是 4 µs，857 kHz 采样下约 3.4 个样点。
+/// **刻意不让边沿垂直**：数学上垂直的边沿采样之后与「一个采样步跨完全部」
+/// 无法区分，`rise_ns` 会永远报一个采样周期，而那个数说明不了任何事。
+///
+/// 摆幅与 `Square50k` 一致（中点 ±1800），两个方波场景的测量值可以直接对比。
+fn pwm_at(t: f64, duty: f64) -> f64 {
+    /// 边沿占整周期的比例（两侧各一半）。
+    const EDGE: f64 = 0.01;
+    /// 重复频率。
+    const HZ: f64 = 1000.0;
+
+    let phase = (HZ * t) % 1.0;
+    let half = EDGE / 2.0;
+    let frac = if phase < half {
+        phase / half
+    } else if phase < duty - half {
+        1.0
+    } else if phase < duty + half {
+        (duty + half - phase) / EDGE
+    } else {
+        0.0
+    };
+    MID_LSB as f64 - 1800.0 + 3600.0 * frac.clamp(0.0, 1.0)
+}
+
+/// 500 Hz 方波设定值经**二阶欠阻尼**系统之后的输出 —— 调 PID 时示波器上的样子。
+///
+/// 阻尼比 ζ = 0.35，过冲 `exp(-πζ/√(1-ζ²)) ≈ 30.9%`；无阻尼振荡频率 12 kHz。
+///
+/// # 为什么可以不记历史
+///
+/// 半周期 1 ms，而振铃在约 230 µs 内就衰减到 1 LSB 以下 —— 到下一次跳变时
+/// 系统早已稳定在前一个电平上，所以每个跳变都可以当成「从稳态出发的新阶跃」，
+/// 直接解析求值，不需要逐样点递推。**这个前提靠参数保证**：把 ζ 调小或把
+/// 频率调低到振铃跨不过半周期，这条就失效了。
+fn step_ring_at(t: f64) -> f64 {
+    /// 阻尼比。可见的振铃圈数**只由它决定**（约 2.7 圈）—— 想过冲更小又
+    /// 振铃更多，物理上做不到。
+    const ZETA: f64 = 0.35;
+    /// 无阻尼振荡频率（Hz）。
+    const FD_HZ: f64 = 12_000.0;
+    /// 设定方波的周期（s）。2 ms 比 4096 点的采集窗（约 4.78 ms）短，
+    /// 于是**每个采集窗里都保证有跳变**，不会出现「采到纯基线」的空场景。
+    const PERIOD: f64 = 2.0e-3;
+    /// 两个稳态电平。摆幅 2000 LSB，过冲后最高约 3418、下冲最低约 181，
+    /// 都留在 0..4095 之内 —— 削顶会把这个场景最要紧的那个数毁掉。
+    const LO: f64 = 800.0;
+    const HI: f64 = 2800.0;
+
+    let phase = (t % PERIOD) / PERIOD;
+    let (v0, v1, s) = if phase < 0.5 {
+        (LO, HI, phase * PERIOD)
+    } else {
+        (HI, LO, (phase - 0.5) * PERIOD)
+    };
+
+    let root = (1.0 - ZETA * ZETA).sqrt();
+    let wd = 2.0 * std::f64::consts::PI * FD_HZ;
+    let wn = wd / root;
+    let decay = (-ZETA * wn * s).exp();
+    let osc = (wd * s).cos() + (ZETA / root) * (wd * s).sin();
+    v1 + (v0 - v1) * decay * osc
+}
+
+/// 1 kHz 方波经一阶 RC（τ = 150 µs）之后的充放电曲线。
+///
+/// 半周期只有 500 µs = 3.3τ，所以**充不到满、也放不到底** —— 这正是真实 RC
+/// 的样子，而它同时是「指数曲线不是双电平信号」的样本：双电平检测会因占用率
+/// 不足拒绝它，分类落到 Unknown。
+///
+/// 上升时间 10%→90% 的理论值是 `2.2·τ` = 330 µs，是个能算出来对账的数。
+fn rc_charge_at(t: f64) -> f64 {
+    /// 驱动方波的周期。
+    const PERIOD: f64 = 1.0e-3;
+    /// 时间常数。
+    const TAU: f64 = 150.0e-6;
+    const LO: f64 = 800.0;
+    const HI: f64 = 2800.0;
+
+    let phase = (t % PERIOD) / PERIOD;
+    if phase < 0.5 {
+        let s = phase * PERIOD;
+        LO + (HI - LO) * (1.0 - (-s / TAU).exp())
+    } else {
+        // 放电从一个半周期结束时**实际**到达的电平开始，不是从 HI 开始 ——
+        // 从 HI 开始会让曲线在跳变处凭空跳一下，那就不是 RC 了。
+        let v_top = LO + (HI - LO) * (1.0 - (-(PERIOD / 2.0) / TAU).exp());
+        let s = (phase - 0.5) * PERIOD;
+        LO + (v_top - LO) * (-s / TAU).exp()
+    }
+}
+
+/// 循环发送的字节序列。
+///
+/// 三个值刻意选得**位模式差别大**：`0x55` 全交替、`0x0F` 半边、`0xA5` 混合。
+/// 线上因此有不同的脉宽 —— 看起来才像在传数据，而不是一条时钟。
+const UART_BYTES: [u8; 3] = [0x55, 0x0F, 0xA5];
+
+/// 每帧之后的空闲位数（高电平）。**帧边界靠它才看得见**。
+const UART_IDLE_BITS: usize = 2;
+
+/// 一帧占的位数：起始 1 + 数据 8 + 停止 1 + 空闲 2。
+const UART_FRAME_BITS: usize = 10 + UART_IDLE_BITS;
+
+/// 波特率。
+const UART_BAUD: u64 = 115_200;
+
+/// 第 `bit_index` 个位时隙上的线上电平。
+///
+/// 取**整数位序号**而不是浮点时间：`t * BAUD` 在浮点域里会累积误差，
+/// 落在位边界上就是一个样点的毛刺，而且它**只在某些采样率下出现**。
+///
+/// UART **LSB 先**发，所以数据位 `within - 1` 对应字节的第 `within - 1` 位。
+fn uart_115k_bit(bit_index: u64) -> bool {
+    let pattern_bits = (UART_BYTES.len() * UART_FRAME_BITS) as u64;
+    let pos = (bit_index % pattern_bits) as usize;
+    let frame = pos / UART_FRAME_BITS;
+    let within = pos % UART_FRAME_BITS;
+
+    if within >= 10 {
+        // 空闲位。⚠ 它与下面的停止位**取值相同**（都是高电平），所以这两个
+        // 分支在行为上可以合并 —— 但**不要合并**：它们是两个不同的协议位置，
+        // 合并之后读代码的人就看不出「帧边界由空闲位标出」这件事了。
+        // 也正因如此，这两条分支互相之间是等价变异体，杀不掉，不是测试的问题。
+        return true;
+    }
+    match within {
+        0 => false, // 起始位
+        9 => true,  // 停止位（与空闲位同为高，见上）
+        // 数据位 0..7
+        d => (UART_BYTES[frame] >> (d - 1)) & 1 == 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,12 +834,12 @@ mod tests {
     fn every_variant_is_listed_in_all() {
         // `ALL` 是 `all_names()` 与 MCP schema enum 的依据。加变体却忘了
         // 往 `ALL` 里加，`name()` 那边编译得过（穷尽 match 只管名字），
-        // 于是新场景对 MCP 与 CLI **完全不可见** —— 这个测试就是防这个。
+        // 于是新场景对 MCP 与 CLI **完全不可见**。
         //
         // 数量写死是有意的：它逼你在加变体时回来把数字和 `ALL` 一起改。
         assert_eq!(
             Scenario::ALL.len(),
-            9,
+            15,
             "场景数变了 —— 请同步更新 Scenario::ALL 和这个数字"
         );
 
@@ -639,6 +852,22 @@ mod tests {
             );
         }
         assert_eq!(Scenario::all_names().count(), Scenario::ALL.len());
+
+        // ⚠ **上面三条查不出「ALL 里少列了一个变体、同时把另一个列了两遍」** ——
+        // 长度照样是 15，往返与计数断言全绿，而漏掉的那个变体对
+        // CLI / MCP / GUI 完全不可见。下面这条补上那个洞。
+        //
+        // （这不是假想：`ALL` 是手写字面量数组，漏一个再重复一个是最自然的
+        // 手误，而本仓库确实出过「新场景静默不可见」的缺陷。）
+        let mut names: Vec<&str> = Scenario::all_names().collect();
+        names.sort_unstable();
+        let n = names.len();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            n,
+            "ALL 里有重复的场景 —— 那意味着另一个变体没能进来"
+        );
     }
 
     #[test]
@@ -955,5 +1184,238 @@ mod tests {
         assert!(scl_a && scl_b, "START 期间 SCL 必须保持高");
         assert!(sda_a, "START 前半段 SDA 应为高");
         assert!(!sda_b, "START 后半段 SDA 应变低");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // 2026-10-06 新增的六个场景：内容断言
+    // ══════════════════════════════════════════════════════════════
+    //
+    // 这一组**不是「不 panic」**，而是「生成出来的波形确实是它文档里宣称的那个」：
+    // 每个场景的注释都写了一个具体数字（占空比 25%、过冲 30.9%、τ = 150 µs…），
+    // 这里就用**真正的测量代码**把它量回来。场景文档与实现分家时，这一组会红。
+
+    /// 采样率取设备上限，与真机一致。
+    const RATE: u32 = 857_142;
+
+    fn capture_of(sc: Scenario, n: usize) -> scope_core::Capture {
+        let mut g = WaveformGen::new(sc, 1);
+        let s = g.generate(0, n, RATE);
+        let mut cap = scope_core::Capture::new(1, RATE, 1, n as u32);
+        cap.channels[0] = s;
+        cap
+    }
+
+    fn measured(sc: Scenario, n: usize) -> scope_core::Measurements {
+        let cap = capture_of(sc, n);
+        scope_core::measure(&cap, 0, &scope_core::ChannelScale::default())
+            .expect("单通道捕获必须测得出")
+    }
+
+    /// 三个 PWM 场景的占空比，量出来必须就是它们名字里那个数。
+    ///
+    /// 变异：把 `pwm_at` 的 `duty` 参数与臂绑错（25 与 75 互换）→ 这条红。
+    /// 变异：上升下降沿的判定取反（高电平占比变成 1−duty）→ 这条红。
+    #[test]
+    fn the_pwm_scenarios_measure_at_the_duty_they_are_named_after() {
+        for (sc, expect) in [
+            (Scenario::Pwm1k25, 25.0),
+            (Scenario::Pwm1k75, 75.0),
+            (Scenario::Pwm1k5, 5.0),
+        ] {
+            let m = measured(sc, 4096);
+            let d = m.duty_pct.expect("占空比必须测得出");
+            assert!(
+                (d - expect).abs() < 1.5,
+                "{}：占空比实测 {d:.2}%，名字里写的是 {expect}%",
+                sc.name()
+            );
+            let f = m.freq_hz.expect("频率必须测得出");
+            assert!(
+                (f - 1000.0).abs() < 5.0,
+                "{}：频率实测 {f:.1} Hz，应为 1000 Hz",
+                sc.name()
+            );
+        }
+    }
+
+    /// PWM 的边沿要**慢到能测**。
+    ///
+    /// 边沿占整周期的 1%，上升与下降各占一半 —— 所以**上升沿单独只有 5 µs**，
+    /// 10%→90% 是 4 µs。
+    ///
+    /// 断言下限取 2 个采样周期：数学上垂直的边沿采样之后与「一步跨完」
+    /// 不可区分，`rise_ns` 会永远等于 1 个采样周期 —— 那个数说明不了任何事，
+    /// 而它看起来还挺像回事，正是最该避免的那种输出。
+    ///
+    /// 变异：`EDGE` 从 0.01 改成 0（垂直边沿）→ 上升时间掉到一个采样周期，红。
+    #[test]
+    fn the_pwm_edges_are_slow_enough_to_measure() {
+        let m = measured(Scenario::Pwm1k25, 4096);
+        let r = m.rise_ns.expect("上升时间");
+        let dt_ns = 1e9 / RATE as f64;
+        assert!(
+            r > 2.0 * dt_ns,
+            "上升时间 {r:.0} ns 只有 {} 个采样周期 —— 边沿太陡，测出来的是量化噪声",
+            r / dt_ns
+        );
+        assert!(
+            (r - 4000.0).abs() < 800.0,
+            "上升时间实测 {r:.0} ns；上升沿 5 µs 的 10%→90% 应为 4 µs"
+        );
+    }
+
+    /// **5% 窄脉冲必须仍被判成双电平。**
+    ///
+    /// 这是这个场景存在的全部理由：两座平台的样点数差着 19 倍（3891 : 205），
+    /// 用全局均值初始化的聚类会把两个中心双双放进低电平那一侧。
+    ///
+    /// 变异：`detect_levels` 的 Otsu 换回均值初始化 —— 这条红（在 core 的测试里也会红，
+    /// 但这条是**跨模块**的：它证明模拟器真的造出了那个退化情形）。
+    #[test]
+    fn the_five_percent_scenario_is_actually_the_hard_case_it_claims_to_be() {
+        let cap = capture_of(Scenario::Pwm1k5, 4096);
+        let l = scope_core::detect_levels(&cap.channels[0]);
+        assert!(
+            l.is_two_level(),
+            "5% 窄脉冲必须仍判成双电平，实测 {:?}",
+            l.verdict
+        );
+        assert!(
+            (l.minority_frac - 0.05).abs() < 0.02,
+            "少数派平台占比 {:?}，场景名里的 5% 对不上",
+            l.minority_frac
+        );
+        // 而且两座平台要真的分得开
+        assert!(
+            l.sep_lsb > 3000.0,
+            "平台间隔只有 {:?} LSB —— 摆幅没拉开，退化情形就没造出来",
+            l.sep_lsb
+        );
+    }
+
+    /// 阶跃响应的过冲是**解析值**：`exp(-πζ/√(1-ζ²))`。
+    ///
+    /// ζ = 0.35 → 30.9%。这个数不是从实现里抄的，是从 ζ 算出来的 ——
+    /// 所以它能同时钉住阻尼比、振荡频率与电平摆幅三件事。
+    ///
+    /// 变异：ζ 改成 0.5（过冲变 16.3%）→ 这条红。
+    /// 变异：只对上升沿做振铃、下降沿直接跳 → 下冲断言红。
+    #[test]
+    fn the_step_response_overshoots_by_the_analytic_amount() {
+        let m = measured(Scenario::StepRing, 4096);
+        let over = m.overshoot_pct.expect("过冲必须给得出");
+        let under = m.undershoot_pct.expect("下冲必须给得出");
+        let expect = 30.9;
+        assert!(
+            (over - expect).abs() < 3.0,
+            "过冲实测 {over:.1}%，ζ=0.35 的解析值是 {expect}%"
+        );
+        assert!(
+            (under - expect).abs() < 3.0,
+            "下冲实测 {under:.1}% —— 设定值两个方向都在跳，两个电平上都要有过冲"
+        );
+        // 而且它真的是个周期性激励（500 Hz），不是一次性的孤立事件
+        let f = m.freq_hz.expect("频率必须测得出");
+        assert!(
+            (f - 500.0).abs() < 5.0,
+            "频率实测 {f:.1} Hz，设定方波应为 500 Hz"
+        );
+    }
+
+    /// **任何起点截出来的采集窗里都得有跳变。**
+    ///
+    /// 场景注释里写死了这条：周期 2 ms 短于 4096 点的窗（4.78 ms）。
+    /// 一旦有人把周期调长过窗宽，用户点一次「采集」就有相当概率看到一条
+    /// 平线 —— 那会让人以为工具坏了。
+    ///
+    /// 变异：`PERIOD` 改成 20e-3（20 ms）→ 这条红。
+    #[test]
+    fn every_capture_window_of_the_step_scenario_contains_a_transition() {
+        for skip in [0usize, 700, 1500, 2400, 3300] {
+            let mut g = WaveformGen::new(Scenario::StepRing, 1);
+            let _ = g.generate(0, skip, RATE); // 先空跑，错开相位
+            let s = g.generate(0, 4096, RATE);
+            let lo = *s.iter().min().unwrap();
+            let hi = *s.iter().max().unwrap();
+            assert!(
+                hi - lo > 1500,
+                "跳过 {skip} 个样点后，窗内的峰峰值只有 {} —— 没采到跳变",
+                hi - lo
+            );
+        }
+    }
+
+    /// RC 的上升时间是 `2.2·τ` 的**可推算**变体：门限取的是**观测到**的
+    /// 最低/最高样点，而不是 0 与 HI，所以不是教科书上那个 2.2τ。
+    ///
+    /// 推导（A = HI − LO = 2000）：
+    /// - 充电半个周期（500 µs = 3.33τ）后到达 `LO + (1−e^−3.33)A = LO + 0.96433A`
+    /// - 放电半个周期后落到 `LO + 0.96433·e^−3.33·A = LO + 0.03440A`
+    /// - 观测跨度 `= 0.92993A`；于是 t10 在 `LO + 0.12739A`、t90 在 `LO + 0.87134A`
+    /// - 在充电曲线上：`s10 = 0.13625τ`、`s90 = 2.04987τ`
+    /// - ⇒ 上升时间 `= 1.9136τ = 287.0 µs`
+    ///
+    /// 变异：`TAU` 改成 300 µs → 这条红。
+    #[test]
+    fn the_rc_curve_has_the_time_constant_it_advertises() {
+        let m = measured(Scenario::RcCharge, 4096);
+        let r = m.rise_ns.expect("上升时间必须测得出");
+        assert!(
+            (r - 287_000.0).abs() < 20_000.0,
+            "上升时间实测 {r:.0} ns，按 τ=150 µs 推出的解析值是 287 000 ns"
+        );
+        let f = m.freq_hz.expect("驱动频率");
+        assert!(
+            (f - 1000.0).abs() < 5.0,
+            "驱动方波应为 1 kHz，实测 {f:.1} Hz"
+        );
+    }
+
+    /// **把 UART 波形按协议解回字节序列。**
+    ///
+    /// 这是这一组里最强的一条：它不检查「像不像」，而是按 115200 baud 的
+    /// 位时隙去采电平、还原成字节，再对着预期的序列比。**一次同时钉住**
+    /// 波特率、LSB 先的位序、起始/停止位、帧长（10 位）、空闲位数（2 位）
+    /// 与字节循环顺序 —— 任何一处错了，解出来的序列就变样。
+    ///
+    /// 变异：数据位反过来（MSB 先）→ 解出 0xAA/0xF0/0xA5，红；
+    ///       帧长写成 11 或 12 → 位时隙错位，红；
+    ///       起始位写成高 → 第一个字节的起始位断言红；
+    ///       波特率改成 57600 → 采样点全部错位，红。
+    #[test]
+    fn the_uart_scenario_decodes_back_to_the_byte_sequence() {
+        let cap = capture_of(Scenario::Uart115k, 4096);
+        let s = &cap.channels[0];
+        let mid = FULL_SCALE_LSB / 2;
+
+        // 每位的样点数（857142 / 115200 = 7.44）。测试里**自己算**这个数，
+        // 不用实现里的常量 —— 否则波特率写错时两边一起错，测试照样绿。
+        let bit_samples = RATE as f64 / 115_200.0;
+        // 取位中心采样，避开边沿
+        let at = |bit: usize| s[((bit as f64 + 0.5) * bit_samples) as usize];
+
+        // 解 6 帧 —— 两个完整循环，顺带钉住字节的排列顺序
+        let mut got = Vec::new();
+        for f in 0..6 {
+            let base = f * 12; // 一帧 10 位 + 2 位空闲
+            assert!(at(base) < mid, "第 {f} 帧的起始位必须是低电平");
+            assert!(at(base + 9) > mid, "第 {f} 帧的停止位必须是高电平");
+            assert!(
+                at(base + 10) > mid && at(base + 11) > mid,
+                "第 {f} 帧之后必须有两个空闲位的高电平 —— 帧边界靠它才看得见"
+            );
+            let mut byte: u8 = 0;
+            for i in 0..8 {
+                if at(base + 1 + i) > mid {
+                    byte |= 1 << i; // UART 是 LSB 先
+                }
+            }
+            got.push(byte);
+        }
+        assert_eq!(
+            got,
+            vec![0x55, 0x0F, 0xA5, 0x55, 0x0F, 0xA5],
+            "解出来的字节序列不对"
+        );
     }
 }

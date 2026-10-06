@@ -200,7 +200,7 @@ enum Action {
     /// 链路自检：PING 往返 + 吞吐
     Ping,
 
-    /// 测量统计：采一次，按通道给出 Vpp / 频率 / 占空比 / 上升时间
+    /// 测量统计：采一次，按通道给出 Vpp / 频率 / 占空比 / 上升与下降时间 / 过冲 / 脉宽 / 跃变数
     Measure {
         /// 波形场景（**仅模拟器有效**；接真机时忽略）
         #[arg(long, value_enum, default_value_t = ScenarioArg::Sine1k3v3)]
@@ -265,6 +265,24 @@ enum ScenarioArg {
     /// 地址被应答、但随后的一笔写被 NACK —— 用来演示「为什么 NACK」
     #[value(name = "i2c_nack")]
     I2cNack,
+    /// 1 kHz、25% 占空比方波
+    #[value(name = "pwm_1k_25")]
+    Pwm1k25,
+    /// 1 kHz、75% 占空比方波
+    #[value(name = "pwm_1k_75")]
+    Pwm1k75,
+    /// 1 kHz、5% 占空比窄脉冲 —— 双电平检测最危险的退化情形
+    #[value(name = "pwm_1k_5")]
+    Pwm1k5,
+    /// 欠阻尼闭环的阶跃响应（过冲约 31%、12 kHz 衰减振铃）
+    #[value(name = "step_ring")]
+    StepRing,
+    /// 一阶 RC 充放电（τ = 150 µs）
+    #[value(name = "rc_charge")]
+    RcCharge,
+    /// 115200 baud 串行数据，0x55 连发
+    #[value(name = "uart_115k")]
+    Uart115k,
 }
 
 impl From<ScenarioArg> for Scenario {
@@ -279,6 +297,12 @@ impl From<ScenarioArg> for Scenario {
             ScenarioArg::I2c100k => Scenario::I2c100k,
             ScenarioArg::I2c400k => Scenario::I2c400k,
             ScenarioArg::I2cNack => Scenario::I2cNack,
+            ScenarioArg::Pwm1k25 => Scenario::Pwm1k25,
+            ScenarioArg::Pwm1k75 => Scenario::Pwm1k75,
+            ScenarioArg::Pwm1k5 => Scenario::Pwm1k5,
+            ScenarioArg::StepRing => Scenario::StepRing,
+            ScenarioArg::RcCharge => Scenario::RcCharge,
+            ScenarioArg::Uart115k => Scenario::Uart115k,
         }
     }
 }
@@ -826,7 +850,27 @@ fn run<P: DevicePort>(port: &mut P, action: Action) -> Result<()> {
                     Some(r) => format!("{r:.1} ns"),
                     None => "测不出（没有干净的边沿）".to_string(),
                 };
+                let fall = match m.fall_ns {
+                    Some(f) => format!("{f:.1} ns"),
+                    None => "测不出（没有干净的边沿）".to_string(),
+                };
+                let over = match m.overshoot_pct {
+                    Some(p) => format!("{p:.1} %"),
+                    None => "测不出（无双电平参考）".to_string(),
+                };
+                let under = match m.undershoot_pct {
+                    Some(p) => format!("{p:.1} %"),
+                    None => "测不出（无双电平参考）".to_string(),
+                };
+                let high = match m.high_ns {
+                    Some(h) => format!("{h:.1} ns"),
+                    None => "测不出（没有高电平段）".to_string(),
+                };
                 println!("    频率={freq}  占空比={duty}  上升时间={rise}");
+                println!(
+                    "    下降时间={fall}  过冲/下冲={over}/{under}  高电平脉宽={high}  跃变数={}",
+                    m.edges
+                );
             }
 
             println!();
