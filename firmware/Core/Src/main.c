@@ -139,6 +139,10 @@ int main(void)
     /* 函数发生器（TIM2_CH3 → PA2）。上电是**关**的。 */
     LocalGen_Init();
 
+    /* LED2 常亮 = 函数发生器开着。上电默认关（`LocalGen_Init` 的语义），
+     * 这里把指示同步到初始状态。 */
+    LocalIo_LedSet(LOCAL_LED2, false);
+
     /* TIM3 输入捕获测频（比较器 → PA6）。
      *
      * ⚠ 它内部会把 TIM3 的中断优先级从 1 降到 6 —— `tim.c` 配的 1 高于
@@ -172,12 +176,6 @@ int main(void)
             break;
         }
         proto_task_emit(&g_pt, &out);
-
-        if (ev == ACQ_EV_TRIGGERED) {
-            /* LED2：每完成一次采集翻转一次 —— 设备活动的可见心跳。
-             * 屏幕已冻结（docs/09 §4.4），它是本地唯一能看出设备还在活动的指示。 */
-            LocalIo_LedToggle(LOCAL_LED2);
-        }
     }
 
     /* 本地按键与编码器：只采样与分发，一轮几微秒、不阻塞 ——
@@ -209,6 +207,9 @@ int main(void)
             break;
         case LOCAL_ACT_GEN_TOGGLE:
             LocalGen_SetEnabled(!LocalGen_IsEnabled());
+            /* LED2 常亮 = 函数发生器开着 —— 按 KEY3 立刻有反馈。
+             * 屏幕已冻结（docs/09 §4.4），这是发生器状态唯一的本地指示。 */
+            LocalIo_LedSet(LOCAL_LED2, LocalGen_IsEnabled());
             break;
         case LOCAL_ACT_GEN_FASTER:
         case LOCAL_ACT_GEN_SLOWER:
@@ -221,7 +222,8 @@ int main(void)
         }
     }
 
-    /* LED1 常亮 = 采集进行中。 */
+    /* LED 语义：LED1 常亮 = 采集进行中；LED2 常亮 = 函数发生器开着
+     * （见 LOCAL_ACT_GEN_TOGGLE 分支）。屏幕冻结后这是仅有的两块本地指示。 */
     LocalIo_LedSet(LOCAL_LED1, acq_state(&g_acq) == STATE_ARMED);
   /* USER CODE END 3 */
   }
